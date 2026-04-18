@@ -81,6 +81,9 @@ try {
     db.pragma('cache_size = -20000')
     db.pragma('wal_autocheckpoint = 1000')
     db.pragma('busy_timeout = 5000')
+    
+    setInterval(() => { try { if (db.open) db.pragma('wal_checkpoint(TRUNCATE)') } catch {} }, 300_000).unref();
+    
     db.exec(`
         CREATE TABLE IF NOT EXISTS mod_logs (
             id INTEGER PRIMARY KEY AUTOINCREMENT,

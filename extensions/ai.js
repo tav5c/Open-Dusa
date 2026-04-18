@@ -176,10 +176,10 @@ class DBPool {
             conn.pragma('wal_autocheckpoint = 5000')
             conn.pragma('busy_timeout = 5000')
 
-            // PASSIVE avoids blocking concurrent readers (RESTART briefly blocks them)
+            // TRUNCATE truncates the WAL file to zero bytes, freeing disk space (fixes SQLITE_FULL on Pterodactyl)
             conn._checkpointInterval = setInterval(() => {
                 try { 
-                    if (conn.open) conn.pragma('wal_checkpoint(PASSIVE)'); 
+                    if (conn.open) conn.pragma('wal_checkpoint(TRUNCATE)'); 
                     else clearInterval(conn._checkpointInterval);
                 } catch {}
             }, 300_000).unref();
