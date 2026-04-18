@@ -287,11 +287,10 @@ const dbPool = new DBPool()
         if (!this.db._stub) {
             this._stmts = {
                 updateUser: this.db.prepare(`
-                    INSERT INTO users (user_id, username, display_name, avatar_url, conversation_count, last_interaction, updated_at)
-                    VALUES (?,?,?,?,COALESCE((SELECT conversation_count FROM users WHERE user_id=?),0)+1,CURRENT_TIMESTAMP,CURRENT_TIMESTAMP)
+                    INSERT INTO users (user_id, username, display_name, conversation_count, last_interaction, updated_at)
+                    VALUES (?,?,?,COALESCE((SELECT conversation_count FROM users WHERE user_id=?),0)+1,CURRENT_TIMESTAMP,CURRENT_TIMESTAMP)
                     ON CONFLICT(user_id) DO UPDATE SET
                         username=excluded.username, display_name=excluded.display_name,
-                        avatar_url=excluded.avatar_url,
                         conversation_count=conversation_count+1,
                         last_interaction=CURRENT_TIMESTAMP, updated_at=CURRENT_TIMESTAMP
                 `),
@@ -321,19 +320,18 @@ const dbPool = new DBPool()
         }
     }
 
-    updateUser(userId, username, displayName, avatarUrl) {
+    updateUser(userId, username, displayName) {
         // Execute immediately to prevent read-after-write race conditions for new users
         try {
-            if (this._stmts) this._stmts.updateUser.run(userId, username, displayName, avatarUrl, userId)
+            if (this._stmts) this._stmts.updateUser.run(userId, username, displayName, userId)
             else this.db.prepare(`
-                INSERT INTO users (user_id, username, display_name, avatar_url, conversation_count, last_interaction, updated_at)
-                VALUES (?,?,?,?,COALESCE((SELECT conversation_count FROM users WHERE user_id=?),0)+1,CURRENT_TIMESTAMP,CURRENT_TIMESTAMP)
+                INSERT INTO users (user_id, username, display_name, conversation_count, last_interaction, updated_at)
+                VALUES (?,?,?,COALESCE((SELECT conversation_count FROM users WHERE user_id=?),0)+1,CURRENT_TIMESTAMP,CURRENT_TIMESTAMP)
                 ON CONFLICT(user_id) DO UPDATE SET
                     username=excluded.username, display_name=excluded.display_name,
-                    avatar_url=excluded.avatar_url,
                     conversation_count=conversation_count+1,
                     last_interaction=CURRENT_TIMESTAMP, updated_at=CURRENT_TIMESTAMP
-            `).run(userId, username, displayName, avatarUrl, userId)
+            `).run(userId, username, displayName, userId)
         } catch (e) { console.error('[DB] updateUser error:', e) }
     }
 
@@ -674,7 +672,7 @@ class AIChatManager {
         this.deadKeys      = new Set()
         this.keyFailures   = {}
         this.maxFailures   = 2
-        this._rotating     = false
+        this._pendingConfirms = new Map()
         this._loadDeadKeys()
         this._groq         = null
         this._initGroq()
@@ -845,9 +843,9 @@ class AIChatManager {
 
     // Key rotation 
     async rotateKey(errorMsg = '') {
-        if (this._rotating) return false
-        this._rotating = true
-        try {
+        if (this._rotatePromise) return this._rotatePromise;
+        
+        this._rotatePromise = (async () => {
             const n = this.aiTokens.length
             if (!n) return false
             const old = this.currentKeyIdx
@@ -869,7 +867,13 @@ class AIChatManager {
             }
             console.warn(`[AI] All keys exhausted (${this.deadKeys.size} dead)`)
             return false
-        } finally { this._rotating = false }
+        })();
+
+        try {
+            return await this._rotatePromise;
+        } finally {
+            this._rotatePromise = null;
+        }
     }
 
     _isRateError(e)     { const s = String(e).toLowerCase(); return ['rate limit','quota exceeded','too many requests','limit exceeded','billing','insufficient credits','expired','invalid api key','authentication failed','unauthorized','restricted','organization has been','account suspended','access denied','401','403','429','413','529'].some(x => s.includes(x)) }
@@ -902,10 +906,11 @@ async _groqCall(messages, model, maxTokens, temp) {
         this.keyFailures[this.currentKeyIdx] = (this.keyFailures[this.currentKeyIdx] ?? 0) + 1
         
         if (this._isRateError(err) || this.keyFailures[this.currentKeyIdx] >= this.maxFailures) {
+            // Check if we have multiple keys to rotate through. If only 1 key, we must respect retry-after.
             const retryAfterSec = e?.headers?.['retry-after'] ?? e?.response?.headers?.['retry-after']
-            if (retryAfterSec && !this._isDeadKeyError(err)) {
+            if (this.aiTokens.length <= 1 && retryAfterSec && !this._isDeadKeyError(err)) {
                 const waitMs = Math.min(parseFloat(retryAfterSec) * 1000, 30_000)
-                console.log(`[AI] 429 retry-after: waiting ${waitMs}ms before rotating`)
+                console.log(`[AI] 429 retry-after: waiting ${waitMs}ms (only 1 key available)`)
                 await new Promise(r => setTimeout(r, waitMs))
             }
             if (await this.rotateKey(err)) {
@@ -1170,13 +1175,13 @@ async _groqCall(messages, model, maxTokens, temp) {
                 // Destructive commands require explicit confirmation before firing
                 const DESTRUCTIVE = new Set(['ban', 'kick', 'mute', 'mpurge', 'clear', 'purge', 'fpurge', 'delchan'])
                 if (DESTRUCTIVE.has(cmdName) && MOD_CMDS.has(cmdName)) {
-                    if (!this._pendingConfirms) this._pendingConfirms = new Map()
-                    const confirmKey = `${message.author.id}:${cmdName}:${argsStr}`
+                    const targetArg = args[0] ? args[0].replace(/[<@!>]/g, '').toLowerCase() : 'none';
+                    const confirmKey = `${message.author.id}:${cmdName}:${targetArg}`;
                     const existing = this._pendingConfirms.get(confirmKey)
                     const now = Date.now()
-                    if (!existing || now - existing.ts > 30_000) {
-                        // Not yet confirmed — store pending and inject confirmation prompt
-                        this._pendingConfirms.set(confirmKey, { ts: now })
+                    if (!existing || now - existing.ts > 30_000 || now - existing.ts < 2000) {
+                        // Not yet confirmed — store pending with full args so they survive the round-trip
+                        this._pendingConfirms.set(confirmKey, { ts: now, args: argsStr })
                         setTimeout(() => this._pendingConfirms.delete(confirmKey), 35_000)
                         const target = (args[0] && /^\d{15,20}$/.test(args[0])) ? `<@${args[0]}>` : args[0] ?? ''
                         const reason = args.slice(1).join(' ')
@@ -1607,7 +1612,7 @@ async _groqCall(messages, model, maxTokens, temp) {
             const isMod = message.member?.permissions?.has('ModerateMembers') ? 'Yes' : 'No'
             parts.push(displayName !== message.author.username ? `USER: ${displayName} (@${message.author.username})` : `USER: @${message.author.username}`)
             parts.push(`USER ID: <@${message.author.id}> | Is Moderator? ${isMod}`)
-            parts.push(`USER AVATAR URL: ${message.author.displayAvatarURL()}`)
+
         }
 
         // Live channel buffer — recent messages from others in this channel
@@ -1635,7 +1640,7 @@ async _groqCall(messages, model, maxTokens, temp) {
         if (message?.mentions?.users?.size) {
             parts.push('MENTIONED USERS IN MESSAGE:')
             for (const [id, user] of message.mentions.users) {
-                parts.push(`- ${user.username} (To ping use: <@${id}>) | Avatar URL: ${user.displayAvatarURL()}`)
+                parts.push(`- ${user.username} (To ping use: <@${id}>)`)
             }
         }
 
@@ -1662,7 +1667,8 @@ async _groqCall(messages, model, maxTokens, temp) {
 
         if (message?.reference?.resolved) {
             const ref = message.reference.resolved
-            const preview = ref.content.slice(0, 150) + (ref.content.length > 150 ? '...' : '')
+            const refText = ref.content ?? ''
+            const preview = refText.slice(0, 150) + (refText.length > 150 ? '...' : '')
             parts.push(ref.author.id === this.client.user.id
                 ? `REPLYING TO BOT: "${preview}"`
                 : `REPLYING TO ${ref.member?.displayName ?? ref.author.username}: "${preview}"`)
@@ -1870,7 +1876,7 @@ async _groqCall(messages, model, maxTokens, temp) {
             }
         }
 
-        mem.updateUser(userId, username, displayName, message.author.displayAvatarURL())
+        mem.updateUser(userId, username, displayName)
         mem.analyzePersonality(userId, content)
         mem.updateInterests(userId, content)
 
@@ -1996,21 +2002,21 @@ async _groqCall(messages, model, maxTokens, temp) {
         const mentionAlt = `<@!${this.client.user.id}>`
 
         // Confirmation replies 
-        if (this._pendingConfirms?.size && lower === 'yes') {
+        if (this._pendingConfirms.size && lower === 'yes') {
             const now = Date.now()
             for (const [key, val] of this._pendingConfirms) {
                 if (now - val.ts > 30_000) { this._pendingConfirms.delete(key); continue }
                 if (!key.startsWith(`${message.author.id}:`)) continue
                 this._pendingConfirms.delete(key)
-                const [, cmdName, ...argParts] = key.split(':')
-                const argsStr = argParts.join(':')
-                const args = argsStr.split(/\s+/).filter(Boolean)
+                const [, cmdName] = key.split(':')
+                // Full args are stored in the value, not the key (key is sanitized for lookup)
+                const args = (val.args ?? '').split(/\s+/).filter(Boolean)
                 const handler = this.client.commands?.get(cmdName)
                 if (handler) {
                     try {
                         await handler(message, args)
                         await message.react('✅').catch(() => {})
-                        console.log(`[AI] Confirmed and executed '${cmdName}' args='${argsStr}' by ${message.author.id}`)
+                        console.log(`[AI] Confirmed and executed '${cmdName}' args='${val.args}' by ${message.author.id}`)
                     } catch (e) { console.error('[AI] Confirmed exec error:', e) }
                 }
                 return
@@ -2321,8 +2327,8 @@ export async function registerAI(client, db, config) {
                         dst.exec(`
                             INSERT OR IGNORE INTO conversations (user_id, channel_id, message_content, ai_response, timestamp)
                                 SELECT user_id, channel_id, message_content, ai_response, timestamp FROM src.conversations;
-                            INSERT OR IGNORE INTO users (user_id, username, display_name, avatar_url, conversation_count, last_interaction, created_at, updated_at)
-                                SELECT user_id, username, display_name, avatar_url, conversation_count, last_interaction, created_at, updated_at FROM src.users
+                            INSERT OR IGNORE INTO users (user_id, username, display_name, conversation_count, last_interaction, created_at, updated_at)
+                                SELECT user_id, username, display_name, conversation_count, last_interaction, created_at, updated_at FROM src.users
                                 WHERE user_id NOT IN (SELECT user_id FROM users);
                             INSERT OR IGNORE INTO interests (user_id, topic, frequency, last_mentioned)
                                 SELECT user_id, topic, frequency, last_mentioned FROM src.interests;
@@ -2356,7 +2362,7 @@ export async function registerAI(client, db, config) {
 client.on('guildMemberAdd', member => {
     if (!member.guild) return
     const mem = ai.getMem(member.guild)
-    mem.updateUser(member.id, member.user.username, member.displayName, member.user.displayAvatarURL())
+    mem.updateUser(member.id, member.user.username, member.displayName)
 })
 
 client.on('messageCreate', msg => {
