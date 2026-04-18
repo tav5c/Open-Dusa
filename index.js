@@ -72,11 +72,12 @@ try {
     const { default: Database } = await import('better-sqlite3')
     mkdirSync('Logs', { recursive: true })
     db = new Database('Logs/medusa.db')
-    db.pragma('journal_mode = WAL')
+    db.pragma('locking_mode = EXCLUSIVE')
+    try { db.pragma('journal_mode = WAL') } catch (e) { console.warn(`[DB] WAL mode fallback: ${e.message}`) }
     db.pragma('synchronous = NORMAL')
     db.pragma('temp_store = MEMORY')
     db.pragma('journal_size_limit = 4096000')
-    db.pragma('mmap_size = 67108864')
+    try { db.pragma('mmap_size = 67108864') } catch {}
     db.pragma('cache_size = -20000')
     db.pragma('wal_autocheckpoint = 1000')
     db.pragma('busy_timeout = 5000')

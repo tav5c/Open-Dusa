@@ -165,11 +165,13 @@ class DBPool {
             const { default: Database } = globalThis._sqlite3
             mkdirSync(dirname(path) || '.', { recursive: true })
             const conn = new Database(path)
-            conn.pragma('journal_mode = WAL')
+            // EXCLUSIVE locking avoids the need for a -shm file in WAL mode (fixes SQLITE_IOERR_SHMSIZE on cheap hosts)
+            conn.pragma('locking_mode = EXCLUSIVE')
+            try { conn.pragma('journal_mode = WAL') } catch (e) { console.warn(`[DB] WAL mode fallback: ${e.message}`) }
             conn.pragma('synchronous = NORMAL')
             conn.pragma('temp_store = MEMORY')
             conn.pragma('journal_size_limit = 4096000')
-            conn.pragma('mmap_size = 67108864')
+            try { conn.pragma('mmap_size = 67108864') } catch {}
             conn.pragma('cache_size = -20000')
             conn.pragma('wal_autocheckpoint = 5000')
             conn.pragma('busy_timeout = 5000')
