@@ -1,0 +1,23 @@
+# Dependencies
+node_modules/
+package-lock.json
+
+# Environment / Secrets
+.env
+
+# Medusa Database & AI Memory
+Logs/
+Ai Database/
+*.db
+*.db-wal
+*.db-shm
+
+# Cache & Temporary Files
+.slash_hash
+*.log
+
+# OS generated files
+.DS_Store
+Thumbs.db
+extensions/private.js
+priv.json
