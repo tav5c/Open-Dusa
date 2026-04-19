@@ -105,28 +105,22 @@ const DANGEROUS_TERMS = new Set([
     "find someone's address", 'buy illegal weapons',
 ])
 
-const CAPABILITIES_NOTE = `\n\nCAPABILITIES & BEHAVIOR:\n` +
-`• PERSISTENCE OF DUTY (STRICT): You MUST execute the requested <<RUN_CMD>> tag EVERY TIME a user asks, even if you just did it. NEVER say "look above" or "I already did that" as an excuse to skip the tag.\n` +
-`• AMBIGUITY RESOLUTION: Map user requests directly: "my avatar" -> <<RUN_CMD: av [ID]>>, "server banner" -> <<RUN_CMD: mbn [ID]>>. Do NOT ask for clarification if a likely tool match exists.\n` +
-`• STRICT AGENT SCOPE: You may ONLY emit <<RUN_CMD>> tags for the commands explicitly listed below. NEVER invent, guess, or approximate command names. If no listed command fits the request, respond in text only — do NOT emit a tag.\n` +
-`• AGENTIC LOGIC: Your personality is your skin; your tools are your bones. You may be sassy or playful in text, but you MUST provide the result.\n` +
-`• PINGS: ALWAYS ping using the <@123456789> format. NEVER use plaintext @username.\n` +
-`• SERVER AGENT POWERS: ALWAYS reply conversationally to the user FIRST, and then silently drop the execution tag in your text. NEVER output raw terminal commands! Output exactly (verify permissions!):\n` +
+const CAPABILITIES_NOTE = `\n\n[AGENT CAPABILITIES & STRICT BEHAVIOR]\n` +
+`• FIRM RULE: DO NOT emit a <<RUN_CMD>> tag unprompted! Only emit a tag if the user EXPLICITLY asks for an action that matches one of the commands below. For casual chat, reply in plain text ONLY.\n` +
+`• PERSISTENCE: If the user DOES ask for a command below, you MUST execute the matching <<RUN_CMD>> tag. NEVER say "I already did that" as an excuse to skip it.\n` +
+`• NO INVENTING: You may ONLY use the exact commands listed below. NEVER invent, guess, or approximate command names.\n` +
+`• AGENT POWERS (use ONLY when requested!):\n` +
 `   - Fetch Avatars/Banners: <<RUN_CMD: av 123456789>> | <<RUN_CMD: mav 123456789>> | <<RUN_CMD: bn 123456789>> | <<RUN_CMD: mbn 123456789>>\n` +
-`   - Mute (Include duration): <<RUN_CMD: mute 123456789 1h reason>>\n` +
-`   - Warn/Clear Warns: <<RUN_CMD: warn 123456789 reason>> | <<RUN_CMD: clearwarns 123456789>>\n` +
+`   - Moderation (Include duration): <<RUN_CMD: mute 123456789 1h reason>> | <<RUN_CMD: warn 123456789 reason>> | <<RUN_CMD: clearwarns 123456789>>\n` +
 `   - Delete Messages: <<RUN_CMD: mpurge 123456789>> | <<RUN_CMD: clear 10>>\n` +
-`   - Create/Delete Channel: <<RUN_CMD: createchan text channel-name>> | <<RUN_CMD: delchan 123456789>>\n` +
+`   - Manage Server: <<RUN_CMD: createchan text channel-name>> | <<RUN_CMD: delchan 123456789>> | <<RUN_CMD: lockchannel>> | <<RUN_CMD: unlockchannel>> | <<RUN_CMD: auditlogs>>\n` +
 `   - Roles: <<RUN_CMD: addrole 123456789 987654321>> | <<RUN_CMD: removerole 123456789 987654321>> | <<RUN_CMD: listroles>>\n` +
-`   - Server/Self: <<RUN_CMD: setnickname name>> | <<RUN_CMD: renameserver name>> | <<RUN_CMD: addemoji name URL>> | <<RUN_CMD: lockchannel>> | <<RUN_CMD: unlockchannel>> | <<RUN_CMD: auditlogs>>\n` +
-`   - Extended Actions: <<RUN_CMD: poll "Question?" "Ans1" "Ans2">> | <<RUN_CMD: thread Name>> | <<RUN_CMD: react 👍>> | <<RUN_CMD: pin ID>> | <<RUN_CMD: unpin ID>> | <<RUN_CMD: slowmode 5>> | <<RUN_CMD: topic new topic>> | <<RUN_CMD: announce CHAN_ID message>> | <<RUN_CMD: movevc USER_ID CHAN_ID>> | <<RUN_CMD: dm USER_ID message (owner only)>>\n` +
-`• GENERATION RULE: Talk organically as your persona. Insert the <<RUN_CMD>> quietly into your fluent thought. Do NOT write plaintext bot commands.`;
+`   - Self: <<RUN_CMD: setnickname name>> | <<RUN_CMD: renameserver name>> | <<RUN_CMD: addemoji name URL>>\n` +
+`   - Extended: <<RUN_CMD: poll "Question?" "Ans1" "Ans2">> | <<RUN_CMD: thread Name>> | <<RUN_CMD: react 👍>> | <<RUN_CMD: pin ID>> | <<RUN_CMD: unpin ID>> | <<RUN_CMD: slowmode 5>> | <<RUN_CMD: topic new topic>> | <<RUN_CMD: announce CHAN_ID message>> | <<RUN_CMD: movevc USER_ID CHAN_ID>> | <<RUN_CMD: dm USER_ID message>>\n` +
+`• EXECUTION FORMAT: If an action is requested, talk organically FIRST, then cleanly append the <<RUN_CMD>> tag. NEVER write raw prefix commands.\n` +
+`• PINGS: ALWAYS ping using the <@123456789> format. NEVER use plaintext @username.`;
 
-const SEARCH_EMOJIS = [
-    '<a:search5:1475637391762128977>', '<a:search4:1475637389753061487>',
-    '<:search1:1475637387735339019>', '<a:search2:1475637386250817678>',
-    '<:search3:1475637384107266199>',
-]
+const SEARCH_EMOJIS =['🌐', '📖', '🔍'];
 
 class RingSet {
     constructor(maxSize) {
