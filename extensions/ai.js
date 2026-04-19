@@ -318,6 +318,7 @@ const dbPool = new DBPool()
                 getChannelCtx: this.db.prepare('SELECT user_id, message_content, timestamp FROM conversations WHERE channel_id=? AND user_id!=? ORDER BY timestamp DESC LIMIT ?'),
                 getInterests: this.db.prepare('SELECT topic, frequency, last_mentioned FROM interests WHERE user_id=? ORDER BY frequency DESC, last_mentioned DESC LIMIT ?'),
                 getPersonality: this.db.prepare('SELECT * FROM personality WHERE user_id=?'),
+                getRelationships: this.db.prepare('SELECT related_user_id, strength FROM relationships WHERE user_id=? ORDER BY strength DESC LIMIT 3'),
             }
         }
     }
@@ -369,7 +370,7 @@ const dbPool = new DBPool()
         if (this._interestsThrottle.size > 2000) {
             for (const [k, v] of this._interestsThrottle) if (now - v > 120_000) this._interestsThrottle.delete(k)
         }
-        const stop = new Set(['that','this','with','have','they','will','been','from','were','said','each','what','just','like','more','about','time','very','when','come','could','know','into','over','think','also','back','after','first','well','good','where','much','some','only','make','work','still','should','your','want','because','through','being','before','here','then','than','any','may','say','use','all','there','which','their','has','had','two','go','way'])
+        const stop = new Set(['that','this','with','have','they','will','been','from','were','said','each','what','just','like','more','about','time','very','when','come','could','know','into','over','think','also','back','after','first','well','good','where','much','some','only','make','work','still','should','your','want','because','through','being','before','here','then','than','any','may','say','use','all','there','which','their','has','had','two','go','way','user','replying','message','channel','activity','recent','server','context','said','content','system','replyed','replied','response'])
         const kw = (messageContent.toLowerCase().match(/\b[a-zA-Z]{4,}\b/g) ?? [])
             .filter(w => !stop.has(w)).slice(0, 3)
         if (!kw.length) return
@@ -472,7 +473,7 @@ const history = this.getHistory(userId, 8)
 
         // Relationships — who this user talks to most
         try {
-            const rels = this.db.prepare('SELECT related_user_id, strength FROM relationships WHERE user_id=? ORDER BY strength DESC LIMIT 3').all(userId)
+            const rels = (this._stmts?.getRelationships ?? this.db.prepare('SELECT related_user_id, strength FROM relationships WHERE user_id=? ORDER BY strength DESC LIMIT 3')).all(userId)
             if (rels.length) {
                 const relStrs = rels.map(r => {
                     const u = this.getUser(r.related_user_id)
@@ -688,7 +689,7 @@ class AIChatManager {
             maxSize: 20 * 1024 * 1024,
             sizeCalculation: (value) => typeof value === 'string' ? value.length : 1024,
         })
-        this.userCache      = new LRUCache({ max: 500, ttl: 600_000 })
+        this.userCache      = new LRUCache({ max: 500, ttl: 120_000 })
         this.summarizeCDs   = new Map()
 
         // Runtime state 
@@ -707,6 +708,7 @@ class AIChatManager {
         this.convTimeout        = 100_000
         this.paused             = false
         this.ignoreUsers        = new Set((config.ignore_users ?? []).map(String))
+        this.pingMode = config.ping_mode ?? true
         this._config = config
         // Memory managers 
         this.globalMem     = new AIMemoryManager()
@@ -728,7 +730,6 @@ class AIChatManager {
         // Background tasks 
         setInterval(() => this._periodicCleanup(), 600_000)
         if (this.funChannels.size) {
-            if (this.startupMsg) setTimeout(() => this.sendRandomMessage(), 10_000)
             setInterval(() => {
                 if (Date.now() - this.lastRandomMsg >= this.FunMsgInterval && !this.paused)
                     this.sendRandomMessage()
@@ -890,7 +891,7 @@ async _groqCall(messages, model, maxTokens, temp) {
             messages: messages,
             temperature: temp ?? this.temperature,
             top_p: this.topP,
-            max_completion_tokens: maxTokens ?? this.maxTokens,
+            max_completion_tokens: maxTokens ?? this.chatTokens,
             stop: null
         };
 
@@ -926,7 +927,7 @@ async _groqCall(messages, model, maxTokens, temp) {
     }
 }
 
-    async _groqCallWithFallbacks(messages, model, maxTokens = 2500, temp = 1.0) {
+    async _groqCallWithFallbacks(messages, model, maxTokens = 2500, temp = this.temperature) {
         const result = await this._groqCall(messages, model, maxTokens, temp)
         if (result && !result.capacityError) return result
         for (const fb of this.capacityFallbacks) {
@@ -1181,8 +1182,26 @@ async _groqCall(messages, model, maxTokens, temp) {
                     const confirmKey = `${message.author.id}:${cmdName}:${targetArg}`;
                     const existing = this._pendingConfirms.get(confirmKey)
                     const now = Date.now()
-                    if (!existing || now - existing.ts > 30_000 || now - existing.ts < 2000) {
-                        // Not yet confirmed — store pending with full args so they survive the round-trip
+                    if (existing && now - existing.ts <= 30_000) {
+                    // Already waiting on confirmation, don't spam another one
+                    finalResponse = ''
+                    continue
+                             }
+                        if (existing && now - existing.ts <= 30_000) {
+                    // Still waiting on previous confirm — suppress duplicate
+                    finalResponse = ''
+                    continue
+                }
+                    if (!existing || now - existing.ts > 30_000) {
+                        // Pre-check: can the bot actually moderate this target?
+                        if (cmdName === 'mute') {
+                            const rawId = args[0]?.replace(/[<@!>]/g, '')
+                            const targetMember = rawId ? message.guild?.members.cache.get(rawId) : null
+                            if (targetMember && !targetMember.moderatable) {
+                                finalResponse = `❌ I can't mute <@${rawId}> — they're above me in the hierarchy.`
+                                continue
+                            }
+                        }
                         this._pendingConfirms.set(confirmKey, { ts: now, args: argsStr })
                         setTimeout(() => this._pendingConfirms.delete(confirmKey), 35_000)
                         const target = (args[0] && /^\d{15,20}$/.test(args[0])) ? `<@${args[0]}>` : args[0] ?? ''
@@ -1193,7 +1212,7 @@ async _groqCall(messages, model, maxTokens, temp) {
                     }
                     // Has confirmed within 30s — clear and proceed
                     this._pendingConfirms.delete(confirmKey)
-                }
+                    }
 
                 const handler = this.client.commands?.get(cmdName)
 
@@ -1669,11 +1688,21 @@ async _groqCall(messages, model, maxTokens, temp) {
 
         if (message?.reference?.resolved) {
             const ref = message.reference.resolved
-            const refText = ref.content ?? ''
+            const refText = (ref.content ?? '')
+                .replace(/<@!?(\d+)>/g, (_, id) => {
+                    const u = this.client.users.cache.get(id)
+                    return u ? `@${u.username}` : ''
+                })
+                .trim()
             const preview = refText.slice(0, 150) + (refText.length > 150 ? '...' : '')
-            parts.push(ref.author.id === this.client.user.id
-                ? `REPLYING TO BOT: "${preview}"`
-                : `REPLYING TO ${ref.member?.displayName ?? ref.author.username}: "${preview}"`)
+            if (ref.author.id === this.client.user.id) {
+                // Only inject if the original message wasn't addressed to a different user
+                const mentionedIds = [...(ref.content ?? '').matchAll(/<@!?(\d+)>/g)].map(m => m[1])
+                const wasForSomeoneElse = mentionedIds.some(id => id !== message.author.id && id !== this.client.user.id)
+                if (!wasForSomeoneElse) parts.push(`REPLYING TO BOT: "${preview}"`)
+            } else {
+                parts.push(`REPLYING TO ${ref.member?.displayName ?? ref.author.username}: "${preview}"`)
+            }
         }
 
         if (ctx) parts.push(ctx, '\nRespond naturally using this context.')
@@ -1749,23 +1778,23 @@ async _groqCall(messages, model, maxTokens, temp) {
     async ResearchResponse({ prompt, history, userId, username, displayName, message, systemPrompt }) {
         // Profile visual fast-path — bypass LLM, guarantee command execution ────
         const visualCmd = this._matchProfileVisual(prompt, userId, message)
-        if (visualCmd) return { response: visualCmd, handled: false }
+        if (visualCmd) return { response: visualCmd }
 
         const bareQuestion = prompt.match(/\nUser's message:\s*([\s\S]+)$/)?.[1]?.trim()
             ?? message.content.replace(new RegExp(`^<@!?${this.client.user.id}>\\s*`), '').trim()
         const routing = await this.needsResearch(bareQuestion)
 
-        if (routing === 'nsfw') return { response: "Oh sweetie, that's not something Mama's gonna go hunting for 🙅‍♀️💜 I keep things clean around here — you know the vibe. Ask me literally anything else and I got you!", handled: false }
-        if (routing === 'dangerous') return { response: "Hmm, hard pass babe 🚫 Not built for that kind of research. You good? Lmk if there's something else on your mind 💜", handled: false }
+        if (routing === 'nsfw') return { response: "Oh sweetie, that's not something Mama's gonna go hunting for 🙅‍♀️💜 I keep things clean around here — you know the vibe. Ask me literally anything else and I got you!" }
+        if (routing === 'dangerous') return { response: "Hmm, hard pass babe 🚫 Not built for that kind of research. You good? Lmk if there's something else on your mind 💜" }
 
         if (routing === 'nosearch') {
             let clean = prompt
             for (const sig of NO_SEARCH_SIGNALS) clean = clean.replace(new RegExp(sig, 'gi'), '').trim()
-            return { response: await this.generateResponse({ prompt: clean || prompt, history, userId, username, displayName, message, systemPrompt }), handled: false }
+            return { response: await this.generateResponse({ prompt: clean || prompt, history, userId, username, displayName, message, systemPrompt }) }
         }
 
         if (routing === 'direct') {
-            return { response: await this.generateResponse({ prompt, history, userId, username, displayName, message, systemPrompt }), handled: false }
+            return { response: await this.generateResponse({ prompt, history, userId, username, displayName, message, systemPrompt }) }
         }
 
         // Research path 
@@ -1807,7 +1836,7 @@ async _groqCall(messages, model, maxTokens, temp) {
             try { await researchMsg.delete() } catch {}
         }
         
-        return { response: responsePayload, handled: false }
+        return { response: responsePayload }
     }
 
     // Message handling 
@@ -1881,9 +1910,15 @@ async _groqCall(messages, model, maxTokens, temp) {
         mem.updateUser(userId, username, displayName)
         mem.analyzePersonality(userId, content)
         mem.updateInterests(userId, content)
+        if (message.mentions?.users?.size) {
+            for (const [mentionedId] of message.mentions.users) {
+                if (mentionedId !== this.client.user.id) mem.updateRelationship(userId, mentionedId)
+            }
+        }
 
-        const aliasMatch = content.toLowerCase().match(/(?:call me|i'm|my name is|refer to me as)\s+(\w+)/)
-        if (aliasMatch) mem.setAlias(userId, aliasMatch[1], userId)
+        const aliasMatch = content.toLowerCase().match(/(?:call me|my name is|refer to me as)\s+([a-z][a-z0-9_-]{2,19})\b/)
+        const ALIAS_BLACKLIST = new Set(['just','not','also','here','back','okay','fine','done','sorry','actually','literally','basically','probably'])
+        if (aliasMatch && !ALIAS_BLACKLIST.has(aliasMatch[1])) mem.setAlias(userId, aliasMatch[1], userId)
 
         const key = `${userId}-${message.channel.id}`
         if (!this.messageHistory.has(key)) this.messageHistory.set(key, [])
@@ -1891,7 +1926,7 @@ async _groqCall(messages, model, maxTokens, temp) {
                 let { url: imageUrl, isGif, label: imgLabel } = this._getImageFromMessage(message)
         if (!imageUrl && message.reference?.messageId) {
             const rr = await this._resolveReplyContext(message)
-            if (rr?.hasImage) ;({ url: imageUrl, isGif, label: imgLabel } = rr.imgData)
+            if (rr?.hasImage) ({ url: imageUrl, isGif, label: imgLabel } = rr.imgData)
         }
         if (imageUrl) {
             const vSys = this.getUserPrompt(userId) || this.instructions || ''
@@ -1911,27 +1946,25 @@ async _groqCall(messages, model, maxTokens, temp) {
         const textFiles = await this._processTextAttachments(message)
         if (textFiles) finalContent += textFiles
 
-        let { response, handled } = await this.ResearchResponse({
+            let { response } = await this.ResearchResponse({
                     prompt: finalContent, history, userId, username, displayName, message, systemPrompt: proactiveSys
                 })
                 if (!response) return
-                
+
                 let execResult = await this._executeParsedCommands(response, message)
                 response = execResult.text
-                const extraEmbeds = execResult.embeds ||[]
+                const extraEmbeds = execResult.embeds || []
 
-                if (!response && handled && !extraEmbeds.length) return
+                if (!response && !extraEmbeds.length) return
 
                 mem.addConversation(userId, message.channel.id, finalContent, response || '*(silently executed system tool)*')
                 let hist = this.messageHistory.get(key)
-                if (!hist) { 
+                if (!hist) {
                     hist = []
-                    this.messageHistory.set(key, hist) 
+                    this.messageHistory.set(key, hist)
                 }
-                hist.push({ role: 'assistant', content: response || '*(silently executed system tool)*' })
-
-                if (handled && !response && !extraEmbeds.length) return
-                
+                hist.push({ role: 'user', content: finalContent })
+                hist.push({ role: 'assistant', content: response || '*(silently executed system tool)*' })                
                 const media  = await this._pickExpressiveMedia(response, message)
                 const chunks = this.splitResponse(response || '')
                 if (!chunks.length || (chunks.length === 1 && !chunks[0])) {
@@ -2004,12 +2037,16 @@ async _groqCall(messages, model, maxTokens, temp) {
         const mentionAlt = `<@!${this.client.user.id}>`
 
         // Confirmation replies 
-        if (this._pendingConfirms.size && lower === 'yes') {
+        if (this._pendingConfirms.size && (lower === 'yes' || lower === 'no')) {
             const now = Date.now()
             for (const [key, val] of this._pendingConfirms) {
                 if (now - val.ts > 30_000) { this._pendingConfirms.delete(key); continue }
                 if (!key.startsWith(`${message.author.id}:`)) continue
                 this._pendingConfirms.delete(key)
+                if (lower === 'no') {
+                    await message.react('❌').catch(() => {})
+                    return
+                }
                 const [, cmdName] = key.split(':')
                 // Full args are stored in the value, not the key (key is sanitized for lookup)
                 const args = (val.args ?? '').split(/\s+/).filter(Boolean)

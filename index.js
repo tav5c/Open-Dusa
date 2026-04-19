@@ -138,7 +138,7 @@ const client = new Client({
         ...Options.DefaultSweeperSettings,
         messages:     { interval: 300, lifetime: 900 },
         guildMembers: { interval: 600, filter: () => (m) => !m.voice?.channelId && m.id !== client.user?.id },
-        users:        { interval: 1800, filter: () => true },
+        users:        { interval: 1800, filter: () => u => u.id !== client.user?.id },
         threads:      { interval: 600, lifetime: 1800 },
     },
     rest: { timeout: 15000, retries: 3, globalRequestsPerSecond: 50 },
