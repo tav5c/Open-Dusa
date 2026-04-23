@@ -3,17 +3,27 @@
   "owner_id": "YOUR_DISCORD_ID",
   "owner_name": "YourName",
 
-  "llm_base_url": "https://api.groq.com/openai/v1",
+  "llm_base_url": "https://integrate.api.nvidia.com/v1",
   "llm_keys": [
-    "YOUR_API_KEY_1",
-    "YOUR_API_KEY_2"
+    "nvapi-YOUR_KEY_HERE"
   ],
 
-  "aiModel": "openai/gpt-oss-120b",
-  "research_model": "groq/compound-mini",
-  "vision_model": "meta-llama/llama-4-scout-17b-16e-instruct",
-  "classifier_model": "llama-3.1-8b-instant",
-  "fallback_models": ["llama-3.3-70b-versatile", "qwen/qwen3-32b", "llama-3.1-8b-instant"],
+  "research_base_url": "https://api.groq.com/openai/v1",
+  "research_key": [
+    "gsk_YOUR_GROQ_KEY_HERE"
+  ],
+  "serper_key": "YOUR_SERPER_KEY_HERE",
+
+  "aiModel": "mistralai/mistral-small-4-119b-2603",
+  "research_model": "nvidia/nemotron-3-super-120b-a12b",
+  "vision_model": "google/gemma-3-27b-it",
+  "classifier_model": "meta/llama-3.1-8b-instruct",
+  "fallback_models": [
+    "stepfun-ai/step-3.5-flash",
+    "nvidia/nemotron-3-super-120b-a12b",
+    "mistralai/mistral-small-4-119b-2603",
+    "meta/llama-3.1-8b-instruct"
+  ],
 
   "temperature": 0.9,
   "topP": 1.0,

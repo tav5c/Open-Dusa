@@ -116,11 +116,19 @@ npm run dev      # development (auto-restart on file changes)
   "owner_name": "YourName",              // How the AI refers to you in her lore
 
   // ─── LLM Provider ───────────────────────────────────────────────────────────
-  "llm_base_url": "https://api.groq.com/openai/v1",  // Any OpenAI-compatible endpoint
+  // Any OpenAI-compatible endpoint — Groq, NVIDIA NIM, OpenRouter, etc.
+  "llm_base_url": "https://integrate.api.nvidia.com/v1",
   "llm_keys": [                           // Rotated automatically on rate limits
-    "gsk_YOUR_KEY_1",
-    "gsk_YOUR_KEY_2"
+    "nvapi-YOUR_KEY_1"
   ],
+
+  // ─── Research Provider (optional) ───────────────────────────────────────────
+  // Set these to use a DIFFERENT provider for web-search research calls only.
+  // Useful when your main model has no built-in web search (e.g. NVIDIA NIM)
+  // but you want to keep Groq compound-mini for live research.
+  // If omitted, research uses the same provider as the main client.
+  "research_base_url": "https://api.groq.com/openai/v1",
+  "research_key":      "gsk_YOUR_GROQ_KEY_HERE",
 
   // ─── Model Stack ────────────────────────────────────────────────────────────
   // Recommended Groq models (free tier available):
@@ -169,6 +177,12 @@ npm run dev      # development (auto-restart on file changes)
 > [!NOTE]
 > `research_model` is intended for research-only use and is not suitable as the main chat model on the free tier.
 > **Critical model note:** `research_model` (`groq/compound-mini`) has a hard limit of 250 requests/day on Groq's free tier. If you set it as `aiModel`, the bot will exhaust its quota in hours. Keep it research-only.
+
+> [!TIP]
+> **Recommended stack:** NVIDIA NIM for chat (`mistralai/mistral-small-4-119b-2603`) + Groq compound-mini for research + Serper.dev for live web search results. Get a free Serper key at [serper.dev](https://serper.dev) (2500 searches/month, no card needed). If you only have one provider, omit `research_base_url` and it falls back gracefully.
+
+> [!TIP]
+> **Multi-provider setup:** You can run your main chat on one provider (e.g. NVIDIA NIM or OpenRouter) and keep Groq *only* for research. Set `research_base_url` and `research_key` in your config — the bot handles routing automatically. If you only have one provider, just omit those fields and everything falls back gracefully.
 
 ---
 

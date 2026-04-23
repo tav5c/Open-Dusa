@@ -626,6 +626,7 @@ class AIChatManager {
 
     // Config 
         this.config           = config
+        this._config          = config
         this.aiModel          = config.aiModel        ?? 'openai/gpt-oss-120b'
         this.researchModel    = config.research_model   ?? 'groq/compound-mini'
         this.visionModel      = config.vision_model     ?? 'meta-llama/llama-4-scout-17b-16e-instruct'
@@ -665,9 +666,13 @@ class AIChatManager {
         this.llmBaseUrl    = config.llm_base_url || 'https://api.groq.com/openai/v1';
         this.ownerId       = config.owner_id;
         this.ownerName     = config.owner_name || 'My Developer';
-        this.currentKeyIdx = 0
-        this.deadKeys      = new Set()
-        this.keyFailures   = {}
+        this.currentKeyIdx         = 0
+        this.deadKeys              = new Set()
+        this.keyFailures           = {}
+        this.researchKeys          = Array.isArray(config.research_key)
+            ? config.research_key.filter(k => typeof k === 'string' && k.length > 20)
+            : (config.research_key ? [config.research_key] : [])
+        this.currentResearchKeyIdx = 0
         this.maxFailures   = 2
         this._pendingConfirms = new Map()
         this._loadDeadKeys()
@@ -766,10 +771,23 @@ class AIChatManager {
         try {
             this._groq = new OpenAI({ apiKey: key, baseURL: this.llmBaseUrl, timeout: 12_000, maxRetries: 0 })
             this._groqResearch = new OpenAI({ apiKey: key, baseURL: this.llmBaseUrl, timeout: 45_000, maxRetries: 0 })
+
+            // Separate research client — supports a different provider (e.g. Groq compound-mini)
+            // while the main client uses another (e.g. NVIDIA NIM or any OpenAI-compatible endpoint).
+            // If research_base_url is not set, falls back to the same provider seamlessly.
+            const researchUrl = (this._config ?? this.config).research_base_url
+            const researchKey = this.researchKeys?.length
+                ? this.researchKeys[this.currentResearchKeyIdx ?? 0]
+                : key
+            this._researchClient = researchUrl
+                ? new OpenAI({ apiKey: researchKey, baseURL: researchUrl, timeout: 60_000, maxRetries: 1 })
+                : this._groqResearch
+
         } catch (e) {
             console.error('[AI] LLM client init failed:', e)
             this._groq = null
             this._groqResearch = null
+            this._researchClient = null
         }
     }
     _loadDeadKeys() {
@@ -935,25 +953,108 @@ async _groqCall(messages, model, maxTokens, temp) {
     }
 
     // Research pipeline 
-    async _callResearch(prompt) {
-        if (!this._groqResearch) return null
-        // compound-mini does a live server-side web search — do NOT route through
-        // _groqCallWithFallbacks: its fallbacks are plain LLMs with no web access,
-        // which produces confident hallucinations indistinguishable from real research.
-        // If compound-mini fails, fail cleanly and let researchResponse fall back.
+async _callResearch(prompt) {
+        if (!this._researchClient) return null
+
+        const serperKey = (this._config ?? this.config).serper_key
+        const tavilyKey = (this._config ?? this.config).tavily_key
+        const searchTool = {
+            type: 'function',
+            function: {
+                name: 'web_search',
+                description: 'Search the web for current information, news, prices, weather, or anything that requires up-to-date data.',
+                parameters: {
+                    type: 'object',
+                    properties: {
+                        query: {
+                            type: 'string',
+                            description: 'The search query to look up'
+                        }
+                    },
+                    required: ['query']
+                }
+            }
+        }
+
         const messages = [
-            { role: 'system', content: 'Precise research assistant. Facts, numbers, context only. No greetings.\nEnd with: SOURCES: [Name](url) | [Name2](url2) — max 3 real URLs. Omit if none.' },
-            { role: 'user', content: prompt.slice(0, 400) },
+            { role: 'system', content: 'You are a precise research assistant. Use the web_search tool to find current information when needed. Synthesize results factually. End with: SOURCES: [Name](url) — max 3 real URLs. Omit if none.' },
+            { role: 'user', content: prompt.slice(0, 800) },
         ]
+
         try {
-            const r = await this._groqResearch.chat.completions.create({
-                model:       this.researchModel,
+            const r1 = await this._researchClient.chat.completions.create({
+                model:                 this.researchModel,
                 messages,
+                tools:                 (serperKey || tavilyKey) ? [searchTool] : undefined,
+                tool_choice:           (serperKey || tavilyKey) ? 'auto' : undefined,
                 max_completion_tokens: this.searchTokens,
-                temperature: this.researchTemp,
-                top_p: this.topP,
+                temperature:           this.researchTemp,
+                top_p:                 this.topP,
             })
-            return r.choices[0]?.message?.content ?? null
+
+            const msg = r1.choices[0].message
+
+            if (!msg.tool_calls?.length) {
+                return msg.content ?? null
+            }
+
+            // Execute all tool calls NVIDIA requested
+            const toolResults = await Promise.all(msg.tool_calls.map(async (tc) => {
+                let result = 'No results found.'
+                try {
+                    const args = JSON.parse(tc.function.arguments)
+                    const query = args.query
+
+                    if (serperKey) {
+                        const res = await fetch('https://google.serper.dev/search', {
+                            method: 'POST',
+                            headers: { 'X-API-KEY': serperKey, 'Content-Type': 'application/json' },
+                            body: JSON.stringify({ q: query, num: 5 }),
+                            signal: AbortSignal.timeout(8000),
+                        })
+                        const data = await res.json()
+                        const organic = data.organic ?? []
+                        const snippets = organic
+                            .map((r, i) => `[${i+1}] ${r.title}\n${r.snippet}\nURL: ${r.link}`)
+                            .join('\n\n')
+                        const answer = data.answerBox?.answer ?? data.answerBox?.snippet ?? ''
+                        result = answer ? `Quick answer: ${answer}\n\n${snippets}` : snippets || 'No results.'
+
+                    } else if (this._tavily) {
+                        const tr = await this._tavily.search(query, {
+                            maxResults: 5, searchDepth: 'basic', includeAnswer: true,
+                        })
+                        const snippets = tr.results
+                            .map((r, i) => `[${i+1}] ${r.title}\n${r.content?.slice(0, 400)}\nURL: ${r.url}`)
+                            .join('\n\n')
+                        result = tr.answer ? `Quick answer: ${tr.answer}\n\n${snippets}` : snippets
+                    }
+                } catch (e) {
+                    result = `Search failed: ${String(e).slice(0, 100)}`
+                }
+
+                return {
+                    role: 'tool',
+                    tool_call_id: tc.id,
+                    content: result,
+                }
+            }))
+
+            // Round 2 — feed search results back, get final answer
+            const r2 = await this._researchClient.chat.completions.create({
+                model: this.researchModel,
+                messages: [
+                    ...messages,
+                    { role: 'assistant', content: msg.content ?? '', tool_calls: msg.tool_calls },
+                    ...toolResults,
+                ],
+                max_completion_tokens: this.searchTokens,
+                temperature:           this.researchTemp,
+                top_p:                 this.topP,
+            })
+
+            return r2.choices[0]?.message?.content ?? null
+
         } catch (e) {
             console.error('[AI] _callResearch failed:', String(e).slice(0, 300))
             return null
@@ -971,17 +1072,20 @@ async _groqCall(messages, model, maxTokens, temp) {
 
     _extractSearchQuery(prompt) {
         let q = prompt.trim()
+        // Strip leading greetings and filler words
+        q = q.replace(/^(?:hi+|hey+|yo+|sup|hello|oi|ok|okay)[,!\s]+/i, '').trim()
+        const you = '(?:you|u|ya)'
         const prefixes = [
-            /^(?:can you\s+|could you\s+)?(?:please\s+)?(?:make a\s+|do a\s+|make\s+|do\s+)?research\s+(?:about|on|for)\s+/i,
-            /^(?:can you\s+|could you\s+)?(?:please\s+)?search(?:\s+up|\s+for)?\s+/i,
-            /^(?:can you\s+|could you\s+)?(?:please\s+)?look\s+up\s+/i,
-            /^(?:can you\s+|could you\s+)?(?:please\s+)?lookup\s+/i,
-            /^(?:can you\s+|could you\s+)?(?:please\s+)?find(?:\s+me)?\s+/i,
-            /^(?:can you\s+|could you\s+)?(?:please\s+)?tell me about\s+/i,
-            /^(?:can you\s+|could you\s+)?(?:please\s+)?what(?:'s| is)\s+/i,
-            /^(?:can you\s+|could you\s+)?(?:please\s+)?who(?:'s| is)\s+/i,
-            /^(?:can you\s+|could you\s+)?(?:please\s+)?google\s+/i,
-            /^(?:can you\s+|could you\s+)?(?:please\s+)?show me\s+/i,
+            new RegExp(`^(?:can ${you}\\s+|could ${you}\\s+)?(?:please\\s+)?(?:make a\\s+|do a\\s+|make\\s+|do\\s+)?research\\s+(?:about|on|for)\\s+`, 'i'),
+            new RegExp(`^(?:can ${you}\\s+|could ${you}\\s+)?(?:please\\s+)?search(?:\\s+up|\\s+for)?\\s+`, 'i'),
+            new RegExp(`^(?:can ${you}\\s+|could ${you}\\s+)?(?:please\\s+)?look\\s+up\\s+`, 'i'),
+            new RegExp(`^(?:can ${you}\\s+|could ${you}\\s+)?(?:please\\s+)?lookup\\s+`, 'i'),
+            new RegExp(`^(?:can ${you}\\s+|could ${you}\\s+)?(?:please\\s+)?find(?:\\s+me)?\\s+`, 'i'),
+            new RegExp(`^(?:can ${you}\\s+|could ${you}\\s+)?(?:please\\s+)?tell me about\\s+`, 'i'),
+            new RegExp(`^(?:can ${you}\\s+|could ${you}\\s+)?(?:please\\s+)?what(?:'s| is)\\s+`, 'i'),
+            new RegExp(`^(?:can ${you}\\s+|could ${you}\\s+)?(?:please\\s+)?who(?:'s| is)\\s+`, 'i'),
+            new RegExp(`^(?:can ${you}\\s+|could ${you}\\s+)?(?:please\\s+)?google\\s+`, 'i'),
+            new RegExp(`^(?:can ${you}\\s+|could ${you}\\s+)?(?:please\\s+)?show me\\s+`, 'i'),
             /^research\s+/i,
         ]
         for (const p of prefixes) q = q.replace(p, '').trim()
@@ -1010,6 +1114,14 @@ async _groqCall(messages, model, maxTokens, temp) {
 
         // Text content (full, not truncated)
         if (ref.content?.trim()) parts.push(ref.content.trim())
+
+        // Forwarded message snapshots (Discord message forwards have no content, only snapshots)
+        if (!ref.content?.trim() && ref.messageSnapshots?.size) {
+            for (const snapshot of ref.messageSnapshots.values()) {
+                const snapText = snapshot.message?.content?.trim()
+                if (snapText) parts.push(`[Forwarded message]\n${snapText.slice(0, 1200)}`)
+            }
+        }
 
         // Attachments that aren't images (images handled separately via vision)
         for (const att of ref.attachments.values()) {
@@ -1176,17 +1288,12 @@ async _groqCall(messages, model, maxTokens, temp) {
                     const confirmKey = `${message.author.id}:${cmdName}:${targetArg}`;
                     const existing = this._pendingConfirms.get(confirmKey)
                     const now = Date.now()
-                    if (existing && now - existing.ts <= 30_000) {
-                    // Already waiting on confirmation, don't spam another one
-                    finalResponse = ''
-                    continue
-                             }
-                        if (existing && now - existing.ts <= 30_000) {
-                    // Still waiting on previous confirm — suppress duplicate
+                if (existing && now - existing.ts <= 30_000) {
+                    // Already waiting on confirmation — suppress duplicate
                     finalResponse = ''
                     continue
                 }
-                    if (!existing || now - existing.ts > 30_000) {
+                if (!existing || now - existing.ts > 30_000) {
                         // Pre-check: can the bot actually moderate this target?
                         if (cmdName === 'mute') {
                             const rawId = args[0]?.replace(/[<@!>]/g, '')
@@ -1322,14 +1429,17 @@ async _groqCall(messages, model, maxTokens, temp) {
 
     _getImageFromMessage(message) {
         const IMAGE_TYPES = new Set(['image/png', 'image/jpeg', 'image/jpg', 'image/webp', 'image/gif'])
+        // Collect ALL images, not just the first
+        const images = []
         for (const att of message.attachments.values()) {
             const ct = (att.contentType ?? '').split(';')[0].trim().toLowerCase()
             if (!IMAGE_TYPES.has(ct)) continue
             const isGif = ct === 'image/gif' || att.name?.toLowerCase().endsWith('.gif')
             let url     = att.proxyURL ?? att.url
             if (isGif && url) url += (url.includes('?') ? '&' : '?') + 'format=webp&width=960'
-            return { url, isGif, label: 'attached file' }
+            images.push({ url, isGif, label: `image ${images.length + 1}` })
         }
+        if (images.length > 0) return { ...images[0], allImages: images }
 
         for (const embed of message.embeds) {
             if (embed.data.type === 'gifv') {
@@ -1366,17 +1476,53 @@ async _groqCall(messages, model, maxTokens, temp) {
         return { url: null, isGif: false, label: null }
     }
 
-    async _callVision(prompt, imageUrl, isGif, systemPrompt, userId = null) {
+    async _callVision(prompt, imageUrl, isGif, systemPrompt, userId = null, allImages = null) {
         if (!this._groq) return null
         const gifNote = isGif ? '\n\nNote: This is an animated GIF. You can only see the first frame. Describe what you see clearly and precisely — vibe, subject, colours, action. Be honest that it\'s one frame if movement is implied.' : ''
         const visionSys = 'You are a precise image description assistant. Describe exactly what you see — subjects, actions, text, mood, colours, context. Be detailed and factual. No greetings, no fluff. Just the visual content.' + gifNote
-        const userText  = (prompt?.trim() || (isGif ? 'Describe this GIF frame in detail.' : 'Describe this image in detail.')).slice(0, 2000)
+        const imageCount = allImages?.length ?? 1
+        const userText  = (prompt?.trim() || (imageCount > 1 ? `Describe all ${imageCount} images in detail.` : isGif ? 'Describe this GIF frame in detail.' : 'Describe this image in detail.')).slice(0, 2000)
+
+        // Download image to base64 so servers don't need to fetch Discord CDN URLs
+        let imageContent
+        try {
+            const imgRes = await fetch(imageUrl, { signal: AbortSignal.timeout(10_000) })
+            if (!imgRes.ok) throw new Error(`HTTP ${imgRes.status}`)
+            const contentType = imgRes.headers.get('content-type')?.split(';')[0]?.trim() ?? 'image/jpeg'
+            const buffer = await imgRes.arrayBuffer()
+            const base64 = Buffer.from(buffer).toString('base64')
+            imageContent = { type: 'base64', media_type: contentType, data: base64 }
+        } catch (e) {
+            console.warn('[AI] Image fetch failed, falling back to URL:', String(e).slice(0, 100))
+            imageContent = null
+        }
+
+        const imageBlock = imageContent
+            ? { type: 'image_url', image_url: { url: `data:${imageContent.media_type};base64,${imageContent.data}` } }
+            : { type: 'image_url', image_url: { url: imageUrl } }
+
+        // Build content array with all images if multiple were sent
+        const imageBlocks = allImages && allImages.length > 1
+            ? await Promise.all(allImages.slice(0, 4).map(async (img) => {
+                // Download each image to base64
+                try {
+                    const imgRes = await fetch(img.url, { signal: AbortSignal.timeout(10_000) })
+                    if (!imgRes.ok) throw new Error(`HTTP ${imgRes.status}`)
+                    const ct = imgRes.headers.get('content-type')?.split(';')[0]?.trim() ?? 'image/jpeg'
+                    const buf = await imgRes.arrayBuffer()
+                    const b64 = Buffer.from(buf).toString('base64')
+                    return { type: 'image_url', image_url: { url: `data:${ct};base64,${b64}` } }
+                } catch {
+                    return { type: 'image_url', image_url: { url: img.url } }
+                }
+            }))
+            : [imageBlock]
 
         const s1msgs = [
             { role: 'system', content: visionSys },
             { role: 'user', content: [
-                { type: 'image_url', image_url: { url: imageUrl } },
-                { type: 'text', text: userText },
+                ...imageBlocks,
+                { type: 'text', text: imageBlocks.length > 1 ? `There are ${imageBlocks.length} images above. ${userText}` : userText },
             ]},
         ]
         let raw = null
@@ -1405,9 +1551,12 @@ async _groqCall(messages, model, maxTokens, temp) {
             }
         }
 
-        if (errType === 'expired') return "that image link seems to have expired or isn't loading for me 😅 if it's an old message, try sending the image directly and i'll check it out!"
-        if (errType === 'format')  return "hmm i couldn't process that image format 🤔 if it's a GIF, try screenshotting a frame and sending that — animated files are tricky for me!"
-        if (!raw) return null
+            if (errType === 'expired') return "that image link seems to have expired or isn't loading for me 😅"
+            if (errType === 'format')  return "hmm i couldn't process that image format 🤔"
+            if (!raw) {
+                // Vision failed but we got a prompt — answer without the image
+                return await this.generateResponse({ prompt: prompt?.trim() || 'Describe what you see.', userId })
+            }
 
         // Stage 2 — rewrite
         const mediaLabel  = isGif ? 'GIF (first frame)' : 'image'
@@ -1924,7 +2073,8 @@ async _groqCall(messages, model, maxTokens, temp) {
         }
         if (imageUrl) {
             const vSys = this.getUserPrompt(userId) || this.instructions || ''
-            const vRes = await this._callVision(content, imageUrl, isGif, vSys, userId)
+            const { allImages } = this._getImageFromMessage(message)
+            const vRes = await this._callVision(content, imageUrl, isGif, vSys, userId, allImages)
             if (vRes) {
                 mem.addConversation(userId, message.channel.id, content, vRes)
                 const hist = this.messageHistory.get(key)
@@ -1951,14 +2101,19 @@ async _groqCall(messages, model, maxTokens, temp) {
 
                 if (!response && !extraEmbeds.length) return
 
-                mem.addConversation(userId, message.channel.id, finalContent, response || '*(silently executed system tool)*')
+                // Never store confirmation prompts — they poison future context
+                if (!response.startsWith('⚠️ Confirm')) {
+                    mem.addConversation(userId, message.channel.id, finalContent, response || '*(silently executed system tool)*')
+                }
                 let hist = this.messageHistory.get(key)
                 if (!hist) {
                     hist = []
                     this.messageHistory.set(key, hist)
                 }
                 hist.push({ role: 'user', content: finalContent })
-                hist.push({ role: 'assistant', content: response || '*(silently executed system tool)*' })                
+                if (!response.startsWith('⚠️ Confirm')) {
+                    hist.push({ role: 'assistant', content: response || '*(silently executed system tool)*' })
+                }                
                 const media  = await this._pickExpressiveMedia(response, message)
                 const chunks = this.splitResponse(response || '')
                 if (!chunks.length || (chunks.length === 1 && !chunks[0])) {
@@ -1995,6 +2150,9 @@ async _groqCall(messages, model, maxTokens, temp) {
         const userId = message.author.id
         const now    = Date.now()
 
+        // Block new AI responses while a destructive confirmation is pending for this user
+        if ([...this._pendingConfirms.keys()].some(k => k.startsWith(`${userId}:`))) return
+
         // Spam protection
         let counts = this.userMsgCounts.get(userId) ?? []
         counts = counts.filter(t => now - t < this.spamWindow)
@@ -2030,12 +2188,13 @@ async _groqCall(messages, model, maxTokens, temp) {
         const mention = `<@${this.client.user.id}>`
         const mentionAlt = `<@!${this.client.user.id}>`
 
-        // Confirmation replies 
-        if (this._pendingConfirms.size && (lower === 'yes' || lower === 'no')) {
+        // Confirmation replies (non-reply-to-bot path — bare "yes"/"no" in channel)
+        const userHasPending = [...this._pendingConfirms.keys()].some(k => k.startsWith(`${message.author.id}:`))
+        if (userHasPending && (lower === 'yes' || lower === 'no')) {
             const now = Date.now()
             for (const [key, val] of this._pendingConfirms) {
                 if (now - val.ts > 30_000) { this._pendingConfirms.delete(key); continue }
-                if (!key.startsWith(`${message.author.id}:`)) continue
+                if (!key.startsWith(`${userId_forConfirm}:`)) continue
                 this._pendingConfirms.delete(key)
                 if (lower === 'no') {
                     await message.react('❌').catch(() => {})
@@ -2054,6 +2213,8 @@ async _groqCall(messages, model, maxTokens, temp) {
                 }
                 return
             }
+            // User had a pending confirm but it expired — absorb yes/no, don't send to AI
+            return
         }
 
         const hasTrig    = this._triggerRegexes.some(rx => rx.test(lower))
@@ -2062,12 +2223,37 @@ async _groqCall(messages, model, maxTokens, temp) {
 
         const replyResolved = await this._resolveReplyContext(message)
         const repliedTo     = replyResolved?.ref?.author ?? null
-        let   replyCtx      = null
+        const isReplyToBot  = repliedTo?.id === this.client.user.id
+
+        // If replying to a bot message with yes/no, always treat as a confirmation attempt.
+        // If no active confirm found, absorb silently — never send to AI.
+        if (isReplyToBot && (lower === 'yes' || lower === 'no')) {
+            const now = Date.now()
+            for (const [key, val] of this._pendingConfirms) {
+                if (now - val.ts > 30_000) { this._pendingConfirms.delete(key); continue }
+                if (!key.startsWith(`${message.author.id}:`)) continue
+                this._pendingConfirms.delete(key)
+                if (lower === 'no') { await message.react('❌').catch(() => {}); return }
+                const [, cmdName] = key.split(':')
+                const args = (val.args ?? '').split(/\s+/).filter(Boolean)
+                const handler = this.client.commands?.get(cmdName)
+                if (handler) {
+                    try {
+                        await handler(message, args)
+                        await message.react('✅').catch(() => {})
+                        console.log(`[AI] Confirmed and executed '${cmdName}' args='${val.args}' by ${message.author.id}`)
+                    } catch (e) { console.error('[AI] Confirmed exec error:', e) }
+                }
+                return
+            }
+            return // Reply-to-bot yes/no with no active confirm — absorb, don't send to AI
+        }
+        let replyCtx      = null
         if (replyResolved) {
             const { label, textContext, hasText } = replyResolved
             replyCtx = hasText
-                ? `User is replying to ${label}:\n"""\n${textContext}\n"""`
-                : `User is replying to ${label} (no text content)`
+                ? `<reply_context from="${label}">${textContext.slice(0, 400)}</reply_context>`
+                : `<reply_context from="${label}" empty="true"/>`
         }
 
         const isReplyToMe = repliedTo?.id === this.client.user.id
@@ -2077,15 +2263,17 @@ async _groqCall(messages, model, maxTokens, temp) {
 
         if (isAlways && (isMention || isReplyToMe || hasTrig)) {
             trigger = true
-            if (replyCtx) prompt = `${replyCtx}\n\nUser's message: ${raw}`
+            if (replyCtx) prompt = `${replyCtx}\n\n${raw}`
         } else if (raw.startsWith(mention) || raw.startsWith(mentionAlt)) {
             const cleaned = raw.replace(new RegExp(`^<@!?${this.client.user.id}>\\s*`), '').trim()
-            if (cleaned) { trigger = true; prompt = replyCtx ? `${replyCtx}\n\nUser's message: ${cleaned}` : cleaned }
+            if (cleaned) { trigger = true; prompt = replyCtx ? `${replyCtx}\n\n${cleaned}` : cleaned }
         }
 
         if (trigger) {
             const guildId = message.guild?.id ?? '0'
             if (guildId !== '0' && !this.aiAllowedGuilds.has(guildId)) return
+
+            if ([...this._pendingConfirms.keys()].some(k => k.startsWith(`${message.author.id}:`))) return
 
             this.triggeredMsgs.add(message.id)
             this.processedMsgIds.add(message.id)
