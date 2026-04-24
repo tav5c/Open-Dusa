@@ -7,6 +7,7 @@ import {
 import { mkdirSync, readdirSync, readFileSync, writeFileSync } from 'fs'
 import http from 'http'
 import os from 'os'
+import { existsSync } from 'fs'
 import { performance } from 'perf_hooks'
 import { setGlobalDispatcher } from 'undici'
 import { _undiciAgent, buildAISlashCommands } from './extensions/ai.js'
@@ -58,8 +59,32 @@ const CONFIG_PATH = 'config.json'
 function loadConfig() {
     try {const raw = readFileSync(CONFIG_PATH, 'utf8')
         return JSON.parse(raw.replace(/(?<=:\s*|\[\s*|,\s*)\b(\d{15,})\b(?=\s*[,}\]])/g, '"$1"'))} catch { return {} }}
-function saveConfig(data) {try { writeFileSync(CONFIG_PATH, JSON.stringify(data, null, 2), 'utf8') } catch (e) { console.error('[Config] save error:', e) }}
+function saveConfig(data) {
+    try { 
+        const runtimePath = 'runtime.json'
+        const existing = existsSync(runtimePath) ? JSON.parse(readFileSync(runtimePath, 'utf8')) : {}
+        // Only merge specific mutable fields, never overwrite base config
+        const mutable = ['aiModel', 'ping_mode', 'ignore_users', 'isolated_servers']
+        for (const key of mutable) {
+            if (data[key] !== undefined) existing[key] = data[key]
+        }
+        writeFileSync(runtimePath, JSON.stringify(existing, null, 2), 'utf8')
+    } catch (e) { console.error('[Config] runtime save error:', e) }
+}
 const config = loadConfig()
+
+const RUNTIME_PATH = 'runtime.json'
+if (existsSync(RUNTIME_PATH)) {
+    try {
+        const runtime = JSON.parse(readFileSync(RUNTIME_PATH, 'utf8'))
+        // Only override specific mutable fields
+        const mutable = ['aiModel', 'ping_mode', 'ignore_users', 'isolated_servers', 'temperature', 'topP']
+        for (const key of mutable) {
+            if (runtime[key] !== undefined) config[key] = runtime[key]
+        }
+        console.log('[Config] Loaded runtime overrides')
+    } catch (e) { console.warn('[Config] Failed to load runtime.json:', e.message) }
+}
 
 // Constants 
 const BOT_OWNER_ID    = config.owner_id ? BigInt(config.owner_id) : 0n;
@@ -82,7 +107,20 @@ try {
     db.pragma('wal_autocheckpoint = 1000')
     db.pragma('busy_timeout = 5000')
     
-    setInterval(() => { try { if (db.open) db.pragma('wal_checkpoint(TRUNCATE)') } catch {} }, 300_000).unref();
+    setInterval(() => { 
+        try { 
+            if (db.open) {
+                db.pragma('wal_checkpoint(TRUNCATE)')
+                // Prune old mod logs and resolved warnings monthly
+                const cutoff = new Date(Date.now() - 180 * 86400000).toISOString().slice(0, 10)
+                db.prepare('DELETE FROM mod_logs WHERE timestamp < ?').run(cutoff)
+                db.prepare('DELETE FROM warnings WHERE active = FALSE AND timestamp < ?').run(cutoff)
+                db.prepare('DELETE FROM server_data WHERE guild_id NOT IN (SELECT DISTINCT guild_id FROM mod_logs UNION SELECT DISTINCT guild_id FROM warnings)').run()
+                // Compact DB after major deletion
+                db.prepare('VACUUM').run()
+            }
+        } catch {} 
+    }, 300_000).unref();
     
     db.exec(`
         CREATE TABLE IF NOT EXISTS mod_logs (
@@ -106,6 +144,7 @@ try {
         CREATE TABLE IF NOT EXISTS reaction_roles (
             id INTEGER PRIMARY KEY AUTOINCREMENT,
             guild_id INTEGER, message_id INTEGER, emoji TEXT, role_id INTEGER,
+            created_at DATETIME DEFAULT CURRENT_TIMESTAMP,
             UNIQUE(message_id, emoji)
         );
         CREATE INDEX IF NOT EXISTS idx_warnings_gu ON warnings(guild_id, user_id);
@@ -350,7 +389,8 @@ async function cmdMenu(ctx) {
         new ButtonBuilder().setCustomId('mn_next').setLabel('▶️').setStyle(ButtonStyle.Primary).setDisabled(p >= pages.length - 1),
         new ButtonBuilder().setCustomId('mn_close').setLabel('❌').setStyle(ButtonStyle.Danger),
     )
-    const send = await ctx.reply({ embeds: [mkEmbed(0)], components: [mkRow(0)], fetchReply: true })
+    const resp = await ctx.reply({ embeds: [mkEmbed(0)], components: [mkRow(0)], withResponse: true })
+    const send = resp.resource?.message ?? await ctx.fetchReply().catch(() => null)
     const auth = ctx.user ?? ctx.author
     const col  = send.createMessageComponentCollector({ componentType: ComponentType.Button, time: 60_000 })
     col.on('collect', async i => {
@@ -501,8 +541,7 @@ addCmd('listroles', async (msg) => {
     await msg.reply(`🎭 **Server Roles:**\n${roles.join(', ')}`)
 })
 
-// Ready 
-client.once('clientReady', async () => {
+    client.once('clientReady', async () => {
     try {
         await client.application.fetch();
         // Check if it's a team or a single user
@@ -512,19 +551,6 @@ client.once('clientReady', async () => {
         console.error('[System] Failed to fetch application info:', e);
     }
     console.clear()
-// --- WARMUP ROUTINE ---
-    console.log('[Cache] Warming up... fetching all guilds, channels, and members.');
-    let memberCount = 0;
-    for (const guild of client.guilds.cache.values()) {
-        try {
-            await guild.channels.fetch(); // Fetch all channels
-            const members = await guild.members.fetch(); // Fetch all members
-            memberCount += members.size;
-        } catch (e) {
-            console.warn(`[Cache] Could not fetch data for ${guild.name}`);
-        }
-    }
-    console.log(`[Cache] Warmup complete. Cached ${memberCount} members across ${client.guilds.cache.size} servers.`);
     const allCmds =[...SLASH_CMDS, ...buildAISlashCommands()]
     
     // Dynamically inject Slash Commands from Extensions

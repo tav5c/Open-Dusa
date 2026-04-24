@@ -20,6 +20,8 @@ export function canModerate(author, target, guild) {
     const authorPos = author.roles?.highest?.position ?? 0
     const targetPos = target.roles?.highest?.position ?? 0
     if (guild.ownerId === String(author.id ?? author.user?.id)) return true
+    // Administrator permission bypasses role hierarchy (except server owner, handled above)
+    if (author.permissions?.has(PermissionFlagsBits.Administrator)) return true
     return authorPos > targetPos
 }
 

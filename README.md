@@ -352,7 +352,24 @@ Servers added to `isolated_servers` get their own memory database, so she mainta
 
 ---
 
-## Environment Variables
+## Deployment & Hosting
+
+Open-Dusa is built to survive on cheap shared hosts, VPS boxes, and container platforms. Here is what you need to know for each environment.
+
+### Shared Hosting / Pterodactyl / Ephemeral Storage
+- **SQLite WAL mode** is enabled by default. The `-wal` and `-shm` files are normal and required while the bot is running.
+- If your host wipes the working directory on restart, place `Ai Database/` and `Logs/` on a persistent mount (e.g., `/home/container/persist/`). Change the paths in `config.json` if your host requires it.
+- The bot auto-checks disk space. If you see `[Heart] DISK ALMOST FULL`, clear old logs or reduce `journal_size_limit`.
+
+### Docker
+```dockerfile
+FROM node:20-alpine
+RUN apk add --no-cache python3 make g++  # for better-sqlite3 native builds
+WORKDIR /app
+COPY package*.json ./
+RUN npm install
+COPY . .
+CMD ["npm", "start"]
 
 Config is file-based (`config.json`) but the bot token can also be passed as an environment variable:
 
@@ -366,10 +383,43 @@ The health server port can be overridden:
 HEALTH_PORT=3000 npm start
 ```
 
+## Database Maintenance
+
+Open-Dusa uses SQLite with WAL mode. Over months of heavy use, the database files can fragment. Here's how to keep them lean:
+
+| Task | Command | When |
+|---|---|---|
+| Manual compact | `npm run db:compact` | Monthly or when `.db` files exceed 500MB |
+| Check size | `ls -lh Ai Database/ Logs/` | Weekly |
+| WAL cleanup | Automatic every 5 minutes | Always running |
+| Auto-prune | Automatic every 10 minutes | Deletes conversations/interests older than 90 days |
+
+**What gets pruned automatically:**
+- Conversations, interests, personality, aliases, relationships: 90 days of inactivity
+- Mod logs, resolved warnings: 180 days (configurable in `index.js`)
+- Reaction roles: 90 days
+- Orphaned guild data: when no logs/warnings reference the guild
+
+**What grows forever (intentionally):**
+- Active warnings (`active = TRUE`) — must be cleared via `/clearwarns`
+- Server lore (`/lore`) — manual management only
+- Custom prompts & user modes — per-user files, negligible size
+
+## Troubleshooting
+
+| Symptom | Cause | Fix |
+|---|---|---|
+| `SQLITE_IOERR_SHMSIZE` on start | Host doesn't allow shared-memory files | Already handled — the bot forces `locking_mode = EXCLUSIVE` to avoid `-shm` |
+| `SQLITE_FULL` errors | Disk quota exceeded on host | The bot auto-truncates WAL every 5 min. Free up disk or move DB to a larger partition. |
+| Bot starts but doesn't respond to mentions | `Message Content Intent` disabled | Enable it in the [Discord Developer Portal](https://discord.com/developers/applications) → Bot → Privileged Gateway Intents |
+| High memory usage over time | Normal — LRU caches grow to their limits | The bot auto-cleans every 10 min. If RSS exceeds ~400MB, check `[Heart] MEMORY LEAK` warnings. |
+| `better-sqlite3` install fails | Missing build tools | Run `npm install --build-from-source` or install `python3`, `make`, and `g++` |
+| `npm start` crashes immediately | Node 24+ with `better-sqlite3@11` | Downgrade to Node 20–23, or upgrade `better-sqlite3` to 12.x |
+
 ---
 
 ## License
-> [!NOTE]
-> MIT — fork it, modify it, ship it. A credit back would be appreciated but isn't required.
+&gt; [!NOTE]
+&gt; MIT — fork it, modify it, ship it. A credit back would be appreciated but isn't required.
 
 Built by [Tav](https://tav5c.github.io/) · Open-sourced as Open-Dusa

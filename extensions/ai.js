@@ -524,9 +524,19 @@ const history = this.getHistory(userId, 8)
 
     cleanupOld(days = 90) {
         const safeDays = Math.max(1, Math.floor(Number(days) || 90))
-        this.db.prepare(`DELETE FROM conversations WHERE timestamp < datetime('now', ? || ' days')`).run(`-${safeDays}`)
-        this.db.prepare(`DELETE FROM interests WHERE last_mentioned < datetime('now', ? || ' days') AND frequency < 3`).run(`-${safeDays}`)
+        const cutoff = `-${safeDays}`
+        this.db.prepare(`DELETE FROM conversations WHERE timestamp < datetime('now', ? || ' days')`).run(cutoff)
+        this.db.prepare(`DELETE FROM interests WHERE last_mentioned < datetime('now', ? || ' days') AND frequency < 3`).run(cutoff)
+        // Orphaned aliases: user has no conversations in last N days
+        this.db.prepare(`DELETE FROM user_aliases WHERE user_id NOT IN (SELECT DISTINCT user_id FROM conversations WHERE timestamp > datetime('now', ? || ' days'))`).run(cutoff)
+        // Orphaned relationships: both users inactive
+        this.db.prepare(`DELETE FROM relationships WHERE user_id NOT IN (SELECT DISTINCT user_id FROM conversations WHERE timestamp > datetime('now', ? || ' days'))`).run(cutoff)
+        this.db.prepare(`DELETE FROM relationships WHERE related_user_id NOT IN (SELECT DISTINCT user_id FROM conversations WHERE timestamp > datetime('now', ? || ' days'))`).run(cutoff)
+        // Stale personality profiles
+        this.db.prepare(`DELETE FROM personality WHERE user_id NOT IN (SELECT DISTINCT user_id FROM conversations WHERE timestamp > datetime('now', ? || ' days'))`).run(cutoff)
         this.cleanupLore()
+        // Compact after bulk delete
+        try { this.db.prepare('VACUUM').run() } catch {}
     }
 
     // Server lore 
@@ -768,19 +778,38 @@ class AIChatManager {
     _initGroq() {
         const key = this.aiTokens[this.currentKeyIdx]
         if (!key) { console.error('[AI] No API key found in config'); return }
-        try {
-            this._groq = new OpenAI({ apiKey: key, baseURL: this.llmBaseUrl, timeout: 12_000, maxRetries: 0 })
-            this._groqResearch = new OpenAI({ apiKey: key, baseURL: this.llmBaseUrl, timeout: 45_000, maxRetries: 0 })
+        
+        const createClient = (baseURL, apiKey, timeout, retries) => {
+            const opts = { apiKey, baseURL, timeout, maxRetries: retries }
+            // NVIDIA NIM uses api-key header instead of Bearer
+            if (baseURL?.includes('nvidia.com') || baseURL?.includes('integrate.api.nvidia')) {
+                opts.defaultHeaders = { 'Authorization': `Bearer ${apiKey}` }
+            }
+            // OpenRouter needs extra headers for routing
+            if (baseURL?.includes('openrouter.ai')) {
+                opts.defaultHeaders = {
+                    'Authorization': `Bearer ${apiKey}`,
+                    'HTTP-Referer': this._config?.site_url || 'https://medusa.bot',
+                    'X-Title': 'Medusa'
+                }
+            }
+            // Anthropic via OpenAI compatibility layer
+            if (baseURL?.includes('anthropic')) {
+                opts.defaultHeaders = { 'anthropic-version': '2023-06-01' }
+            }
+            return new OpenAI(opts)
+        }
 
-            // Separate research client — supports a different provider (e.g. Groq compound-mini)
-            // while the main client uses another (e.g. NVIDIA NIM or any OpenAI-compatible endpoint).
-            // If research_base_url is not set, falls back to the same provider seamlessly.
+        try {
+            this._groq = createClient(this.llmBaseUrl, key, 12_000, 0)
+            this._groqResearch = createClient(this.llmBaseUrl, key, 45_000, 0)
+
             const researchUrl = (this._config ?? this.config).research_base_url
             const researchKey = this.researchKeys?.length
                 ? this.researchKeys[this.currentResearchKeyIdx ?? 0]
                 : key
             this._researchClient = researchUrl
-                ? new OpenAI({ apiKey: researchKey, baseURL: researchUrl, timeout: 60_000, maxRetries: 1 })
+                ? createClient(researchUrl, researchKey, 60_000, 1)
                 : this._groqResearch
 
         } catch (e) {
@@ -895,22 +924,57 @@ class AIChatManager {
     _isDeadKeyError(e)  { const s = String(e).toLowerCase(); return ['organization has been restricted','account has been disabled','has been restricted','has been suspended','org has been'].some(x => s.includes(x)) }
     _isCapacityError(e) { const s = String(e).toLowerCase(); return (s.includes('503') || s.includes('498')) && (s.includes('over capacity') || s.includes('service unavailable') || s.includes('currently unavailable') || s.includes('capacity')) }
 
-async _groqCall(messages, model, maxTokens, temp) {
-        if (!this._groq) return null
-
+    _buildPayload(model, messages, maxTokens, temp) {
         const payload = {
             model: model,
             messages: messages,
             temperature: temp ?? this.temperature,
             top_p: this.topP,
-            max_completion_tokens: maxTokens ?? this.chatTokens,
-            stop: null
-        };
+        }
 
-    // Minimal reasoning for chat — 'medium' caused severe latency on casual messages
-    if (model.includes('gpt-oss')) {
-        payload.reasoning_effort = "low";
+        // Provider-specific parameter naming
+        const baseURL = this.llmBaseUrl || ''
+        const isNvidia = baseURL.includes('nvidia.com') || baseURL.includes('integrate.api.nvidia')
+        const isAnthropic = baseURL.includes('anthropic')
+        const isGoogle = baseURL.includes('google') || model.includes('gemini')
+        const isMistral = baseURL.includes('mistral')
+
+        if (isAnthropic) {
+            // Anthropic uses max_tokens, not max_completion_tokens
+            payload.max_tokens = maxTokens ?? this.chatTokens
+            delete payload.top_p // Anthropic doesn't support top_p with some models
+        } else if (isGoogle) {
+            // Gemini uses candidate_count, maxOutputTokens
+            payload.maxOutputTokens = maxTokens ?? this.chatTokens
+            delete payload.temperature // Some Gemini versions use different param names
+            payload.temperature = Math.min(temp ?? this.temperature, 0.9) // Gemini caps at 1.0
+        } else {
+            // OpenAI/Groq/NVIDIA standard
+            payload.max_completion_tokens = maxTokens ?? this.chatTokens
+        }
+
+        // Reasoning models (OpenAI o1/o3, DeepSeek, etc.)
+        if (model.includes('o1') || model.includes('o3') || model.includes('deepseek-r') || model.includes('gpt-oss')) {
+            payload.reasoning_effort = "low"
+            // Reasoning models often don't support temperature/top_p
+            if (!model.includes('gpt-oss')) {
+                delete payload.temperature
+                delete payload.top_p
+            }
+        }
+
+        // Stop sequences — only add if not empty
+        if (this._config?.stop_sequences?.length) {
+            payload.stop = this._config.stop_sequences
+        }
+
+        return payload
     }
+
+    async _groqCall(messages, model, maxTokens, temp) {
+        if (!this._groq) return null
+
+        const payload = this._buildPayload(model, messages, maxTokens, temp)
     try {
         const r = await this._groq.chat.completions.create(payload)
         this.keyFailures[this.currentKeyIdx] = 0
@@ -1186,7 +1250,7 @@ async _callResearch(prompt) {
     async _executeParsedCommands(response, message) {
         // Outer <{1,3} / >{1,3} tolerates <<< >>> variants the LLM occasionally emits.
         // Inner \s* before/after args absorbs any extra whitespace the LLM pads in.
-        const CMD_PATTERN = /<{2,3}RUN_CMD:\s*([a-zA-Z0-9_]+)\s*([\s\S]*?)>{2,3}/g;
+        const CMD_PATTERN = /<{2,3}\s*RUN_CMD:\s*([a-zA-Z][a-zA-Z0-9_]*)\s*([\s\S]*?)>{2,3}/g;
         const matches = [...response.matchAll(CMD_PATTERN)];
         let finalResponse = response;
         let capturedEmbeds = [];
@@ -1205,7 +1269,7 @@ async _callResearch(prompt) {
             'iso', 'uniso', 'pm',
             'snake',
             'userinfo',
-            'ban', 'kick',
+            'ban', 'kick', 'eval', 'exec', 'shell', 'run', 'system', 'child_process', 'require', 'import',
         ])
         const MOD_CMDS = new Set(['ban', 'kick', 'mute', 'unmute', 'warn', 'clearwarns', 'clear', 'purge', 'fpurge', 'mpurge', 'filter_purge', 'createchan', 'delchan', 'lockchannel', 'unlockchannel', 'renameserver', 'addemoji', 'setnickname', 'addrole', 'removerole']);
         // Per-command permission map — prevents blanket ModerateMembers from granting ban/purge
@@ -1274,9 +1338,13 @@ async _callResearch(prompt) {
                 }
 
                 const argsStr = match[2].trim();
-                // Sanitize: block shell/code injection chars but allow unicode (for nicknames, server names)
-                if (/[`$;|\\{}<>]/.test(argsStr)) {
-                    console.warn(`[AI] Blocked RUN_CMD '${cmdName}' — suspicious args: ${argsStr}`);
+                if (/[`$;|\\{}<>]/.test(argsStr) || /\\x00/.test(argsStr) || /\.\.\//.test(argsStr) || /%00/.test(argsStr)) {
+                    console.warn(`[AI] Blocked RUN_CMD '${cmdName}' — suspicious args: ${argsStr.slice(0, 100)}`);
+                    continue;
+                }
+                // Max args length to prevent prompt injection via huge payloads
+                if (argsStr.length > 500) {
+                    console.warn(`[AI] Blocked RUN_CMD '${cmdName}' — args too long (${argsStr.length})`);
                     continue;
                 }
                 const args = argsStr.split(/\s+/).filter(Boolean);
@@ -1285,7 +1353,8 @@ async _callResearch(prompt) {
                 const DESTRUCTIVE = new Set(['ban', 'kick', 'mute', 'mpurge', 'clear', 'purge', 'fpurge', 'delchan'])
                 if (DESTRUCTIVE.has(cmdName) && MOD_CMDS.has(cmdName)) {
                     const targetArg = args[0] ? args[0].replace(/[<@!>]/g, '').toLowerCase() : 'none';
-                    const confirmKey = `${message.author.id}:${cmdName}:${targetArg}`;
+                    const confirmKey = `${message.author.id}:${cmdName}:${targetArg}:${Date.now()}`;
+                // Store full state including original message reference for reply context
                     const existing = this._pendingConfirms.get(confirmKey)
                     const now = Date.now()
                 if (existing && now - existing.ts <= 30_000) {
@@ -1294,6 +1363,11 @@ async _callResearch(prompt) {
                     continue
                 }
                 if (!existing || now - existing.ts > 30_000) {
+                    for (const [k] of this._pendingConfirms) {
+                        if (k.startsWith(`${message.author.id}:${cmdName}:`) && now - this._pendingConfirms.get(k).ts > 30_000) {
+                            this._pendingConfirms.delete(k)
+                        }
+                    }
                         // Pre-check: can the bot actually moderate this target?
                         if (cmdName === 'mute') {
                             const rawId = args[0]?.replace(/[<@!>]/g, '')
@@ -2735,7 +2809,11 @@ setInterval(() => {
                 for (const k of [...ai.messageHistory.keys()]) if (k.startsWith(`${userId}-`)) ai.messageHistory.delete(k)
                 if (ai.customPrompts[userId]) {
                     delete ai.customPrompts[userId]
-                    ai._saveJSON('Ai Database/custom_prompts.json', ai.customPrompts)
+                    if (ai._promptSaveTimer) clearTimeout(ai._promptSaveTimer)
+            ai._promptSaveTimer = setTimeout(() => {
+            ai._saveJSON('Ai Database/custom_prompts.json', ai.customPrompts)
+            ai._promptSaveTimer = null
+        }, 500)
                 }
                 await i.update({ content: '✅ Done — Medusa has forgotten everything about you. Fresh start 🌸', embeds: [], components: [] })
             })
@@ -2837,8 +2915,16 @@ setInterval(() => {
                 }
             }
             ai.aiModel = model
-            config.aiModel = model
-            try { writeFileSync('config.json', JSON.stringify(config, null, 2)) } catch {}
+            // Runtime state lives in memory never mutate source config
+            try { 
+                const runtimePath = 'runtime.json'
+                let runtime = {}
+                if (existsSync(runtimePath)) {
+                    runtime = JSON.parse(readFileSync(runtimePath, 'utf8'))
+                }
+                runtime.aiModel = model
+                writeFileSync(runtimePath, JSON.stringify(runtime, null, 2))
+            } catch (e) { console.error('[AI] Failed to persist runtime state:', e) }
             return interaction.reply({ content: `Model set to: \`${model}\``, flags: MessageFlags.Ephemeral })
         }
         if (commandName === 'iso') {
@@ -2884,7 +2970,11 @@ setInterval(() => {
         if (!text) return msg.reply('Please provide a prompt.')
         const uid = String(msg.author.id)
         ai.customPrompts[uid] = text + ' + You are Medusa. Respond as yourself in first person, a Discord bot and chatbot.'
-        ai._saveJSON('Ai Database/custom_prompts.json', ai.customPrompts)
+        if (ai._promptSaveTimer) clearTimeout(ai._promptSaveTimer)
+        ai._promptSaveTimer = setTimeout(() => {
+            ai._saveJSON('Ai Database/custom_prompts.json', ai.customPrompts)
+            ai._promptSaveTimer = null
+        }, 500)
         await msg.reply(`✅ Custom prompt set for ${msg.author.displayName}`)
     })
     client.commands.set('prompt', client.commands.get('p'))
@@ -2900,9 +2990,19 @@ setInterval(() => {
             const cur = ai.userModes[uid] ?? 0
             return msg.reply(`Your current mode: **${cur === 1 ? 'focused' : 'normal'}** (${cur}). Use \`${PREFIX}mode focused\` or \`${PREFIX}mode normal\`.`)
         }
-        if (['focused', '1'].includes(input)) { ai.userModes[uid] = 1; ai._saveJSON('Ai Database/user_modes.json', ai.userModes); return msg.reply('✅ Switched to **focused mode**') }
-        if (['normal', '0'].includes(input))  { ai.userModes[uid] = 0; ai._saveJSON('Ai Database/user_modes.json', ai.userModes); return msg.reply('✅ Switched to **normal mode**') }
-        await msg.reply('❌ Invalid mode. Use `focused`/`1` or `normal`/`0`')
+        let newMode = null
+        if (['focused', '1'].includes(input)) newMode = 1
+        else if (['normal', '0'].includes(input)) newMode = 0
+        else return msg.reply('❌ Invalid mode. Use `focused`/`1` or `normal`/`0`')
+        
+        ai.userModes[uid] = newMode
+        // Async save with debounce to prevent disk thrashing
+        if (ai._modeSaveTimer) clearTimeout(ai._modeSaveTimer)
+        ai._modeSaveTimer = setTimeout(() => {
+            ai._saveJSON('Ai Database/user_modes.json', ai.userModes)
+            ai._modeSaveTimer = null
+        }, 500)
+        return msg.reply(`✅ Switched to **${newMode === 1 ? 'focused' : 'normal'} mode**`)
     })
 
     client.commands.set('aipause',   ownerOnly(async (msg) => { ai.paused = !ai.paused; await msg.reply(`AI ${ai.paused ? 'paused' : 'unpaused'}`) }))

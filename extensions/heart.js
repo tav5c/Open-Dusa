@@ -90,10 +90,11 @@ export class MedusaHeart {
         this.rateLimiter  = new GlobalRateLimiter()
         this.retrier      = new SmartRetrier()
 
-        this.monitor      = { mem: 0, cpu: 0, last: 0, peakMem: 0, loopLag: 0 }
+        this.monitor      = { mem: 0, heap: 0, cpu: 0, last: 0, peakMem: 0, loopLag: 0, diskUsed: 0, diskTotal: 0, uptime: 0 }
         this._latency     =[]
         this.wsLatencyAvg = 0
         this.wsLatencySpike = false
+        this._memHistory  = []
 
         this.loopHistogram = monitorEventLoopDelay({ resolution: 20 })
         this.loopHistogram.enable()
@@ -103,12 +104,22 @@ export class MedusaHeart {
         this._registerExitHandlers()
     }
 
-    fire(promise, name = 'task') {
+    fire(promise, name = 'task', timeout = 300_000) {
         this._stats.firedTasks++
-        const p = (promise instanceof Promise ? promise : Promise.resolve().then(promise))
+        let p = (promise instanceof Promise ? promise : Promise.resolve().then(promise))
             .catch(e => console.error(`[Heart] Task '${name}' error:`, e))
+        
+        // auto-expunge hung tasks so they don't leak in the set forever
+        const timer = setTimeout(() => {
+            console.warn(`[Heart] Task '${name}' timed out after ${timeout}ms — forcing cleanup`)
+            this._tasks.delete(p)
+        }, timeout).unref()
+        
+        p.finally(() => {
+            clearTimeout(timer)
+            this._tasks.delete(p)
+        })
         this._tasks.add(p)
-        p.finally(() => this._tasks.delete(p))
         return p
     }
 
@@ -120,29 +131,68 @@ export class MedusaHeart {
     }
 
     _startMonitor() {
+        let histResetCount = 0
         const tick = async () => {
             if (this._closed) return
             const mem = process.memoryUsage()
             const mb  = mem.rss / 1024 / 1024
+            const heapMb = mem.heapUsed / 1024 / 1024
             this.monitor.mem     = mb
+            this.monitor.heap    = heapMb
             this.monitor.peakMem = Math.max(this.monitor.peakMem, mb)
             this.monitor.last    = Date.now()
+            this.monitor.uptime  = Math.floor(process.uptime())
 
-            this.monitor.loopLag = this.loopHistogram.mean / 1e6 // Convert nanoseconds to milliseconds
+            this._memHistory.push({ ts: Date.now(), rss: mb })
+            if (this._memHistory.length > 30) this._memHistory.shift()
+            if (this._memHistory.length >= 10) {
+                const first = this._memHistory[0]
+                const last  = this._memHistory[this._memHistory.length - 1]
+                const mins  = (last.ts - first.ts) / 60000
+                if (mins > 2) {
+                    const growth = (last.rss - first.rss) / mins
+                    if (growth > 30 && mb > 400) {
+                        console.warn(`[Heart] MEMORY LEAK: RSS +${growth.toFixed(1)}MB/min (now ${mb.toFixed(0)}MB)`)
+                    }
+                }
+            }
+
+            // Reset event loop histogram every 5 min so mean stays relevant
+            histResetCount++
+            if (histResetCount >= 30) {
+                histResetCount = 0
+                try { this.loopHistogram.disable() } catch {}
+                this.loopHistogram = monitorEventLoopDelay({ resolution: 20 })
+                this.loopHistogram.enable()
+            }
+            this.monitor.loopLag = this.loopHistogram.mean / 1e6
+            if (this.monitor.loopLag > 500) {
+                console.warn(`[Heart] EVENT LOOP LAG: ${this.monitor.loopLag.toFixed(0)}ms — possible blocking operation`)
+            }
+
+            // Disk check (critical for Pterodactyl/ephemeral hosts)
             try {
-                const load       = await si.currentLoad()
+                const fsData = await si.fsSize()
+                const main = fsData?.find(f => f.fs === '/' || f.mount === '/') || fsData?.[0]
+                if (main) {
+                    this.monitor.diskUsed  = main.used / 1024 / 1024 / 1024
+                    this.monitor.diskTotal = main.size / 1024 / 1024 / 1024
+                    if (main.use > 90) console.warn(`[Heart] DISK ALMOST FULL: ${main.use.toFixed(0)}%`)
+                }
+            } catch { /* fsSize fails in some containers — ignore */ }
+
+            // CPU: prefer systeminformation, fallback to last-known (non-blocking)
+            try {
+                const load = await si.currentLoad()
                 this.monitor.cpu = load.currentLoad ?? 0
             } catch {
-                const before = os.cpus().map(c => ({ idle: c.times.idle, total: Object.values(c.times).reduce((a, b) => a + b, 0) }))
-                await new Promise(r => setTimeout(r, 100))
-                const after  = os.cpus().map(c => ({ idle: c.times.idle, total: Object.values(c.times).reduce((a, b) => a + b, 0) }))
-                const deltas  = before.map((b, i) => ({ idle: after[i].idle - b.idle, total: after[i].total - b.total }))
-                const avgIdle = deltas.reduce((s, d) => s + (d.idle / (d.total || 1)), 0) / deltas.length
-                this.monitor.cpu = (1 - avgIdle) * 100
+                // Container/restricted env: keep last known, don't block 100ms
+                this.monitor.cpu = this.monitor.cpu || 0
             }
 
             if (this.client?.ws) {
-                this.recordLatency(this.client.ws.ping)
+                const ping = this.client.ws.ping
+                if (ping >= 0) this.recordLatency(ping)
             }
         }
         tick()
@@ -150,8 +200,20 @@ export class MedusaHeart {
     }
 
     _startCleanup() {
-            this._cleanupInterval = setInterval(() => {
+        this._cleanupInterval = setInterval(() => {
             this.rateLimiter.cleanup()
+            // Prune dead guilds from heart cache to prevent memory leak on server leaves
+            const now = Date.now()
+            for (const [gid, data] of this.guildCache) {
+                if (data.lastAccess && now - data.lastAccess > 7 * 86400000) {
+                    this.guildCache.delete(gid)
+                }
+            }
+            for (const [gid, data] of this.automodCache) {
+                if (data.lastAccess && now - data.lastAccess > 7 * 86400000) {
+                    this.automodCache.delete(gid)
+                }
+            }
         }, 60_000).unref()
     }
 
@@ -175,11 +237,14 @@ export class MedusaHeart {
             }
             if (this._tasks.size) await Promise.allSettled([...this._tasks])
         }
-        process.once('SIGINT',  () => shutdown('SIGINT').then(() => process.exit(0)))
-        process.once('SIGTERM', () => shutdown('SIGTERM').then(() => process.exit(0)))
+        process.once('SIGINT',  () => shutdown('SIGINT').then(() => { process.exitCode = 0 }))
+        process.once('SIGTERM', () => shutdown('SIGTERM').then(() => { process.exitCode = 0 }))
         process.on('uncaughtException', e => { 
-        console.error('[Heart] FATAL Uncaught:', e); 
-        process.exit(1); })
+            console.error('[Heart] FATAL Uncaught:', e)
+            // Allow async cleanup (DB flush, WAL checkpoint) before exit
+            process.exitCode = 1
+            setTimeout(() => process.exit(1), 2000).unref()
+        })
         process.on('unhandledRejection', (r) => { console.error('[Heart] Unhandled rejection:', r); this._stats.errors++ })
     }
 
@@ -187,6 +252,10 @@ export class MedusaHeart {
         this._closed = true
         clearInterval(this._monitorInterval)
         clearInterval(this._cleanupInterval)
+        if (this.loopHistogram) {
+            try { this.loopHistogram.disable() } catch {}
+            this.loopHistogram = null
+        }
     }
 }
 

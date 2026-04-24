@@ -1,18 +1,22 @@
 {
-  "name": "medusa",
-  "version": "1.0.0",
-  "description": "AI-powered Discord Agent",
+  "name": "open-dusa",
+  "version": "1.1.0",
+  "description": "Agentic AI Resident for Discord",
   "type": "module",
   "main": "index.js",
   "scripts": {
     "start": "cross-env UV_THREADPOOL_SIZE=12 node index.js",
-    "dev": "cross-env UV_THREADPOOL_SIZE=12 node --watch --expose-gc index.js"
+    "dev": "cross-env UV_THREADPOOL_SIZE=12 node --watch --expose-gc index.js",
+    "db:compact": "node -e \"const Database = require('better-sqlite3'); ['Logs/medusa.db', ...require('fs').readdirSync('Ai Database', {recursive:true}).filter(f=>f.endsWith('.db')).map(f=>'Ai Database/'+f)].forEach(p=>{try{const d=new Database(p);d.prepare('VACUUM').run();d.close();console.log('VACUUM',p)}catch(e){console.log('SKIP',p,e.message)}})\""
+  },
+  "engines": {
+    "node": ">=20.0.0"
   },
   "dependencies": {
     "@discordjs/voice": "^0.17.0",
-    "better-sqlite3": "^11.10.0",
+    "better-sqlite3": "^12.0.0",
     "cross-env": "^7.0.3",
-    "discord.js": "^14.26.2",
+    "discord.js": "^14.26.3",
     "libsodium-wrappers": "^0.7.16",
     "lru-cache": "^11.2.7",
     "openai": "^6.34.0",

@@ -50,9 +50,19 @@ export function registerAutomod(client, db, heart) {
             }
         }
 
+        if (settings.max_mentions && message.mentions.users.size > settings.max_mentions) {
+            try { await message.delete() } catch {}
+            await message.channel.send({ content: `${message.author}, too many mentions in one message!` })
+                .then(m => setTimeout(() => m.delete().catch(() => {}), 5000))
+            return
+        }
+
         if (settings.anti_links) {
-            const LINK_WHITELIST = /(?:cdn\.discordapp\.com|media\.discordapp\.net|discord\.gg|tenor\.com|giphy\.com)/i
-            if (/https?:\/\/|www\.|\.com|\.net|\.org/i.test(message.content) && !LINK_WHITELIST.test(message.content)) {
+            const LINK_WHITELIST = /(?:cdn\.discordapp\.com|media\.discordapp\.net|discord\.gg|tenor\.com|giphy\.com|discord\.com\/channels)/i
+            const URL_REGEX = /(?:https?:\/\/|www\.)[^\s<>\"{}|\\^`\[\]]+/i
+            // Also catch obfuscated links
+            const OBFUSCATED_REGEX = /(?:dot|\.)\s*(?:com|net|org|gg|io|dev|app)\b/i
+            if ((URL_REGEX.test(message.content) || OBFUSCATED_REGEX.test(message.content.toLowerCase())) && !LINK_WHITELIST.test(message.content)) {
                 try { await message.delete() } catch {}
                 await message.channel.send({ content: `${message.author}, links are not allowed!` })
                     .then(m => setTimeout(() => m.delete().catch(() => {}), 5000))
