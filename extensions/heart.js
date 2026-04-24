@@ -110,13 +110,14 @@ export class MedusaHeart {
             .catch(e => console.error(`[Heart] Task '${name}' error:`, e))
         
         // auto-expunge hung tasks so they don't leak in the set forever
-        const timer = setTimeout(() => {
+        // timeout <= 0 means daemon loop — never expire
+        const timer = timeout > 0 ? setTimeout(() => {
             console.warn(`[Heart] Task '${name}' timed out after ${timeout}ms — forcing cleanup`)
             this._tasks.delete(p)
-        }, timeout).unref()
+        }, timeout).unref() : null
         
         p.finally(() => {
-            clearTimeout(timer)
+            if (timer) clearTimeout(timer)
             this._tasks.delete(p)
         })
         this._tasks.add(p)
