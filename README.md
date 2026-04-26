@@ -419,7 +419,7 @@ Open-Dusa uses SQLite with WAL mode. Over months of heavy use, the database file
 ---
 
 ## License
-&gt; [!NOTE]
-&gt; MIT — fork it, modify it, ship it. A credit back would be appreciated but isn't required.
+> [!NOTE]
+> MIT — fork it, modify it, ship it. A credit back would be appreciated but isn't required.
 
 Built by [Tav](https://tav5c.github.io/) · Open-sourced as Open-Dusa
