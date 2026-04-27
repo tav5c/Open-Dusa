@@ -567,9 +567,16 @@ const history = this.getHistory(userId, 8)
     }
 
     cleanupLore() {
-        try { this.db.prepare(`DELETE FROM server_lore WHERE source='auto' AND last_seen < datetime('now', '-30 days')`).run() } catch {}
+        try {
+            this.db.prepare(`DELETE FROM server_lore WHERE source='auto' AND last_seen < datetime('now', '-30 days')`).run()
+            // Purge URL-fragment lore that slipped through before the filter was added
+            this.db.prepare(`DELETE FROM server_lore WHERE source='auto' AND (
+                fact LIKE '%https%' OR fact LIKE '%http%' OR fact LIKE '%tenor%'
+                OR fact LIKE '%giphy%' OR fact LIKE '% com %' OR fact LIKE '%discord%'
+                OR fact LIKE '%youtube%' OR fact LIKE '%twitch%' OR fact LIKE '%tiktok%'
+            )`).run()
+        } catch {}
     }
-
     autoExtractLore(entries) {
         if (!entries || entries.length < 4) return
         const LORE_SIGNALS = /\b(our thing|server rule|inside joke|we always|we call|everyone knows|classic|tradition|always happens|server lore)\b/i
@@ -585,8 +592,10 @@ const history = this.getHistory(userId, 8)
                 phraseUsers.get(phrase).add(e.userId)
             }
         }
+        // Skip URL fragments, domain names, and generic web noise — these pollute context badly
+        const LORE_URL_JUNK = /https?|www\b|\.com|\.net|\.org|\.gg|tenor|giphy|imgur|discord|youtube|twitch|twitter|tiktok/i
         for (const [phrase, users] of phraseUsers) {
-            if (users.size >= 3) this.addLore(`"${phrase}" is a recurring phrase here`, 'auto')
+            if (users.size >= 3 && !LORE_URL_JUNK.test(phrase)) this.addLore(`"${phrase}" is a recurring phrase here`, 'auto')
         }
     }
 }
@@ -1752,9 +1761,11 @@ async _callResearch(prompt) {
     }
 
     // Security / formatting 
-    finalSecurityCheck(text) {
+        finalSecurityCheck(text) {
             if (text === undefined || text === null) return "";
             let out = text.replace(/@(?:[\u200B\u200C\u200D\uFEFF]*)?(everyone|here)/gi, '🪼')
+            // Strip malformed <@username> where LLM wrote a name instead of a numeric ID — leaves valid <@123456789> untouched
+            out = out.replace(/<@!?([^0-9>\s][^>]{0,50})>/g, (_, name) => `@${name.trim()}`)
             if (this.pingMode) {
                 out = out.replace(/<@&(\d+)>/g, '@role-$1')
             } else {
@@ -1848,8 +1859,8 @@ async _callResearch(prompt) {
         if (message?.author) {
             const displayName = message.member?.displayName ?? message.author.username
             const isMod = message.member?.permissions?.has('ModerateMembers') ? 'Yes' : 'No'
-            parts.push(displayName !== message.author.username ? `USER: ${displayName} (@${message.author.username})` : `USER: @${message.author.username}`)
-            parts.push(`USER ID: <@${message.author.id}> | Is Moderator? ${isMod}`)
+            parts.push(`▶ ACTIVE USER — the person replying to you RIGHT NOW (do NOT attribute things from RECENT CHANNEL ACTIVITY to them):`)
+            parts.push(displayName !== message.author.username ? `  ${displayName} (@${message.author.username}) | ID: <@${message.author.id}> | Moderator: ${isMod}` : `  @${message.author.username} | ID: <@${message.author.id}> | Moderator: ${isMod}`)
 
         }
 
@@ -1864,7 +1875,7 @@ async _callResearch(prompt) {
                 e.ts > cutoff
             ).slice(-8)   // at most 8 entries
             if (recentOthers.length) {
-                parts.push('RECENT CHANNEL ACTIVITY (last 10 min):')
+                parts.push('RECENT CHANNEL ACTIVITY — OTHER USERS (these are NOT the person talking to you, do not attribute their messages to the current speaker):')
                 for (const e of recentOthers) {
                     parts.push(`  ${e.displayName} (<@${e.userId}>): ${e.content}`)
                 }
@@ -2365,6 +2376,17 @@ async _callResearch(prompt) {
         }
     }
 
+    // Resolve :emojiName: shortcodes → full <:name:ID> Discord format
+    // LLMs habitually write :name: even when given the full format — handle it here instead of trusting the prompt
+    _resolveCustomEmojis(text, guild) {
+        if (!guild?.emojis?.cache?.size || !text) return text
+        return text.replace(/:([a-zA-Z0-9_]{2,32}):/g, (match, name) => {
+            const emoji = guild.emojis.cache.find(e => e.name === name)
+            if (!emoji) return match
+            return `<${emoji.animated ? 'a' : ''}:${emoji.name}:${emoji.id}>`
+        })
+    }
+
     // Expressive media — stickers, server emojis, GIFs 
     // Called after response is finalized. Returns { sticker, gif } or null.
     // Never fires on serious/mod/research-heavy responses.
@@ -2504,6 +2526,14 @@ async _callResearch(prompt) {
                 AND message_content NOT LIKE '%what%'
                 AND message_content NOT LIKE '%when%'
                 AND message_content NOT LIKE '%where%'
+                AND message_content NOT LIKE '%http%'
+                AND message_content NOT LIKE '%discord.gg%'
+                AND message_content NOT LIKE '%discord.com/invite%'
+                AND message_content NOT LIKE '%tenor.com%'
+                AND message_content NOT LIKE '%cdn.discord%'
+                AND message_content NOT LIKE '%bit.ly%'
+                AND message_content NOT LIKE '%.com/%'
+                AND message_content NOT LIKE '%.gg/%'
                 ORDER BY RANDOM() LIMIT 1
             `).get()
             if (!row) return null
@@ -2517,7 +2547,11 @@ async _callResearch(prompt) {
                 systemPrompt: 'You are Medusa with a sharp wit. Generate clever, funny roasts and commentary. Be sarcastic and humorous but not genuinely mean or hurtful.',
             })
             if (!roast) return null
-            return `**${displayName}**: "${quote.slice(0, 150)}${quote.length > 150 ? '...' : ''}"\n\n${roast}`
+            // Strip any URLs the LLM hallucinated from the quote context — prevents invite/link injection
+            const safeRoast = roast.replace(/https?:\/\/\S+/gi, '').replace(/discord\.gg\/\S+/gi, '').replace(/\s{2,}/g, ' ').trim()
+            const safeQuote = quote.replace(/https?:\/\/\S+/gi, '[link]').slice(0, 150)
+            if (!safeRoast) return null
+            return `**${displayName}**: "${safeQuote}${quote.length > 150 ? '...' : ''}"\n\n${safeRoast}`
         } catch (e) { console.error('[AI] generateRoast error:', e) }
         return null
     }
