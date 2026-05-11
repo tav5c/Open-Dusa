@@ -1,0 +1,8 @@
+node_modules
+Logs
+Ai Database
+runtime.json
+config.json
+*.db
+*.db-wal
+*.db-shm

@@ -12,7 +12,7 @@
 [![SQLite](https://img.shields.io/badge/SQLite-WAL-lightgrey?logo=sqlite&logoColor=white)](#)
 [![License](https://img.shields.io/badge/License-MIT-green)](#)
 
-*A Discord bot that doesn't just respond — it listens, remembers, and lives in your server.*
+_A Discord bot that doesn't just respond — it listens, remembers, and lives in your server._
 
 </div>
 
@@ -90,12 +90,13 @@ cp config.json config.json.bak   # optional backup
 
 ### 4. Enable Privileged Intents
 
-In the [Discord Developer Portal](https://discord.com/developers/applications), go to your bot (or create application) → **Bot** tab → 
+In the [Discord Developer Portal](https://discord.com/developers/applications), go to your bot (or create application) → **Bot** tab →
+
 - Token > copy > paste in config.json,
-go to **Installation** tab →
-- Select **Guild** method then setup the install link with administrator permission then add to your server via the generated link. 
-> [!IMPORTANT]
-> Enable Message Content Intent and Server Members Intent in the Discord Developer Portal before running the bot.
+  go to **Installation** tab →
+- Select **Guild** method then setup the install link with administrator permission then add to your server via the generated link.
+    > [!IMPORTANT]
+    > Enable Message Content Intent and Server Members Intent in the Discord Developer Portal before running the bot.
 
 ### 5. Run
 
@@ -110,70 +111,83 @@ npm run dev      # development (auto-restart on file changes)
 
 ```jsonc
 {
-  // ─── Bot Identity ───────────────────────────────────────────────────────────
-  "token": "YOUR_BOT_TOKEN_HERE",        // Discord bot token (required)
-  "owner_id": "YOUR_DISCORD_ID",         // Your user ID — grants owner-only commands
-  "owner_name": "YourName",              // How the AI refers to you in her lore
+    // ─── Bot Identity ───────────────────────────────────────────────────────────
+    "token": "YOUR_BOT_TOKEN_HERE", // Discord bot token (required)
+    "owner_id": "YOUR_DISCORD_ID", // Your user ID — grants owner-only commands
+    "owner_name": "YourName", // How the AI refers to you in her lore
 
-  // ─── LLM Provider ───────────────────────────────────────────────────────────
-  // Any OpenAI-compatible endpoint — Groq, NVIDIA NIM, OpenRouter, etc.
-  "llm_base_url": "https://integrate.api.nvidia.com/v1",
-  "llm_keys": [                           // Rotated automatically on rate limits
-    "nvapi-YOUR_KEY_1"
-  ],
+    // ─── LLM Provider ───────────────────────────────────────────────────────────
+    // Any OpenAI-compatible endpoint — Groq, NVIDIA NIM, OpenRouter, etc.
+    "llm_base_url": "https://integrate.api.nvidia.com/v1",
+    "llm_keys": [
+        // Rotated automatically on rate limits
+        "nvapi-YOUR_KEY_1",
+    ],
 
-  // ─── Research Provider (optional) ───────────────────────────────────────────
-  // Set these to use a DIFFERENT provider for web-search research calls only.
-  // Useful when your main model has no built-in web search (e.g. NVIDIA NIM)
-  // but you want to keep Groq compound-mini for live research.
-  // If omitted, research uses the same provider as the main client.
-  "research_base_url": "https://api.groq.com/openai/v1",
-  "research_key":      "gsk_YOUR_GROQ_KEY_HERE",
+    // ─── Research Provider (optional) ───────────────────────────────────────────
+    // Set these to use a DIFFERENT provider for web-search research calls only.
+    // Useful when your main model has no built-in web search (e.g. NVIDIA NIM)
+    // but you want to keep Groq compound-mini for live research.
+    // If omitted, research uses the same provider as the main client.
+    "research_base_url": "https://api.groq.com/openai/v1",
+    "research_key": "gsk_YOUR_GROQ_KEY_HERE",
 
-  // ─── Model Stack ────────────────────────────────────────────────────────────
-  // Recommended Groq models (free tier available):
-  "aiModel": "openai/gpt-oss-120b",          // Primary chat model
-  "research_model": "groq/compound-mini",             // ⚠️ 250 RPD limit — research ONLY
-  "vision_model": "meta-llama/llama-4-scout-17b-16e-instruct",  // Image understanding
-  "classifier_model": "llama-3.1-8b-instant",         // YES/NO routing classifier
-  "fallback_models": [                                // Used on 503 capacity errors
-    "llama-3.3-70b-versatile",
-    "qwen/qwen3-32b",
-    "llama-3.1-8b-instant"
-  ],
+    // ─── Model Stack ────────────────────────────────────────────────────────────
+    // Recommended Groq models (free tier available):
+    "aiModel": "openai/gpt-oss-120b", // Primary chat model
+    "research_model": "groq/compound-mini", // ⚠️ 250 RPD limit — research ONLY
+    "vision_model": "meta-llama/llama-4-scout-17b-16e-instruct", // Image understanding
+    "classifier_model": "llama-3.1-8b-instant", // YES/NO routing classifier
+    "fallback_models": [
+        // Used on 503 capacity errors
+        "llama-3.3-70b-versatile",
+        "qwen/qwen3-32b",
+        "llama-3.1-8b-instant",
+    ],
 
-  // ─── Generation Parameters ──────────────────────────────────────────────────
-  "temperature": 0.9,      // Chat creativity (0.0–2.0)
-  "topP": 1.0,             // Nucleus sampling
-  "chatTokens": 1024,      // Max tokens for chat responses
+    // ─── Generation Parameters ──────────────────────────────────────────────────
+    "temperature": 0.9, // Chat creativity (0.0–2.0)
+    "topP": 1.0, // Nucleus sampling
+    "chatTokens": 1024, // Max tokens for chat responses
 
-  "researchTemp": 0.6,     // Research model temperature (lower = more factual)
-  "searchTokens": 1500,    // Max tokens for research responses
+    "researchTemp": 0.6, // Research model temperature (lower = more factual)
+    "searchTokens": 1500, // Max tokens for research responses
 
-  "visionTemp": 0.4,       // Vision model temperature
-  "visionTokens": 1024,     // Max tokens for vision responses
+    "visionTemp": 0.4, // Vision model temperature
+    "visionTokens": 1024, // Max tokens for vision responses
 
-  // ─── Personality ────────────────────────────────────────────────────────────
-  "triggers": "meddy,medusa,med",  // Words that wake her up (comma-separated)
-  "systemPrompt": "You are ...",   // Full system prompt — her entire personality (better to leave as is or just modify lightly)
+    // ─── Personality ────────────────────────────────────────────────────────────
+    "triggers": "meddy,medusa,med", // Words that wake her up (comma-separated)
+    "systemPrompt": "You are ...", // Full system prompt — her entire personality (better to leave as is or just modify lightly)
 
-  // ─── Optional Integrations ──────────────────────────────────────────────────
-  "giphyKey": "",    // Giphy API key for GIF reactions (leave blank to use free fallback)
+    // ─── Optional Integrations ──────────────────────────────────────────────────
+    "giphyKey": "", // Giphy API key for GIF reactions (leave blank to use free fallback)
 
-  // ─── Behavior Flags ─────────────────────────────────────────────────────────
-  "allowDMs": false,        // Whether she responds to DMs
-  "memoryDepth": 25,        // How many conversation turns to include in history
-  "FunMsgInterval": 5400,   // Seconds between unprompted messages (0 to disable)
+    // ─── Behavior Flags ─────────────────────────────────────────────────────────
+    "allowDMs": false, // Whether she responds to DMs
+    "memoryDepth": 25, // How many conversation turns to include in history
+    "FunMsgInterval": 5400,   // Seconds between unprompted messages (0 to disable)
 
-  // ─── Server Scope ───────────────────────────────────────────────────────────
-  // Leave arrays empty [] to allow all servers
-  "guilds": [],                    // Servers where prefix commands work
-  "ai_allowed_guilds": [],         // Servers where AI responds (subset of guilds)
-  "always_active_channels": [],    // Channel IDs: AI always active here (no trigger needed)
-  "fun_channels": [],              // Channel IDs for unprompted messages
-  "isolated_servers": []           // Server IDs with their own separate AI memory
+    // ─── Quick Agent (/medusa slash command) ────────────────────────────────────
+    "quickAgent": {
+    "model": "",             // Override model (empty = use aiModel)
+    "temperature": 0.4,     // Lower = more precise
+    "topP": 0.9,
+    "maxTokens": 1400,
+    "allowResearch": true,   // Whether /medusa can trigger web search
+    "systemPrompt": [...]    // Array of lines (see config.json)
+  },
+
+    // ─── Server Scope ───────────────────────────────────────────────────────────
+    // Leave arrays empty [] to allow all servers
+    "guilds": [], // Servers where prefix commands work
+    "ai_allowed_guilds": [], // Servers where AI responds (subset of guilds)
+    "always_active_channels": [], // Channel IDs: AI always active here (no trigger needed)
+    "fun_channels": [], // Channel IDs for unprompted messages
+    "isolated_servers": [], // Server IDs with their own separate AI memory
 }
 ```
+
 > [!NOTE]
 > `research_model` is intended for research-only use and is not suitable as the main chat model on the free tier.
 > **Critical model note:** `research_model` (`groq/compound-mini`) has a hard limit of 250 requests/day on Groq's free tier. If you set it as `aiModel`, the bot will exhaust its quota in hours. Keep it research-only.
@@ -182,28 +196,29 @@ npm run dev      # development (auto-restart on file changes)
 > **Recommended stack:** NVIDIA NIM for chat (`mistralai/mistral-small-4-119b-2603`) + Groq compound-mini for research + Serper.dev for live web search results. Get a free Serper key at [serper.dev](https://serper.dev) (2500 searches/month, no card needed). If you only have one provider, omit `research_base_url` and it falls back gracefully.
 
 > [!TIP]
-> **Multi-provider setup:** You can run your main chat on one provider (e.g. NVIDIA NIM or OpenRouter) and keep Groq *only* for research. Set `research_base_url` and `research_key` in your config — the bot handles routing automatically. If you only have one provider, just omit those fields and everything falls back gracefully.
+> **Multi-provider setup:** You can run your main chat on one provider (e.g. NVIDIA NIM or OpenRouter) and keep Groq _only_ for research. Set `research_base_url` and `research_key` in your config — the bot handles routing automatically. If you only have one provider, just omit those fields and everything falls back gracefully.
 
 ---
 
 ## Slash Commands
 
-| Command | Description | Who |
-|---|---|---|
-| `/memory` | View what Open-Dusa remembers about you | Everyone |
-| `/forgetme` | Permanently delete your stored data | Everyone |
-| `/mode` | Switch between `focused` (analytical) and `normal` (casual) mode | Everyone |
-| `/summarize` | Summarize recent channel conversation | Everyone (rate-limited) |
-| `/lore list` | View all recorded server lore | Everyone |
-| `/lore add` | Add a server lore fact she'll reference | Mods |
-| `/lore remove` | Remove a lore entry by ID | Mods |
-| `/lore clear` | Clear all auto-extracted lore | Mods |
-| `/ghost add/remove/list/clear` | Control which users influence your AI context | Everyone |
-| `/automod` | Configure anti-spam, anti-caps, anti-links | Mods |
-| `/ban`, `/mute`, `/warn`, etc. | Standard moderation suite | Mods |
-| `/aipause` | Toggle AI on/off | Owner |
-| `/aimodel` | Get/set the current LLM model | Owner |
-| `/iso` / `/uniso` | Isolate/un-isolate server memory | Owner |
+| Command                        | Description                                                      | Who                     |
+| ------------------------------ | ---------------------------------------------------------------- | ----------------------- |
+| `/memory`                      | View what Open-Dusa remembers about you                          | Everyone                |
+| `/forgetme`                    | Permanently delete your stored data                              | Everyone                |
+| `/mode`                        | Switch between `focused` (analytical) and `normal` (casual) mode | Everyone                |
+| `/summarize`                   | Summarize recent channel conversation                            | Everyone (rate-limited) |
+| `/lore list`                   | View all recorded server lore                                    | Everyone                |
+| `/lore add`                    | Add a server lore fact she'll reference                          | Mods                    |
+| `/lore remove`                 | Remove a lore entry by ID                                        | Mods                    |
+| `/lore clear`                  | Clear all auto-extracted lore                                    | Mods                    |
+| `/ghost add/remove/list/clear` | Control which users influence your AI context                    | Everyone                |
+| `/automod`                     | Configure anti-spam, anti-caps, anti-links                       | Mods                    |
+| `/medusa`                      | Quick Agent stateless one-shot AI query. No memory, works in DMs.| Everyone                |
+| `/ban`, `/mute`, `/warn`, etc. | Standard moderation suite                                        | Mods                    |
+| `/aipause`                     | Toggle AI on/off                                                 | Owner                   |
+| `/aimodel`                     | Get/set the current LLM model                                    | Owner                   |
+| `/iso` / `/uniso`              | Isolate/un-isolate server memory                                 | Owner                   |
 
 ## Prefix Commands (`med,`)
 
@@ -242,7 +257,7 @@ export function init(client, db, heart) {
 export async function handleMessage(message) {
     if (message.content === 'ping') {
         await message.reply('pong')
-        return true   // sink — AI won't see this
+        return true // sink — AI won't see this
     }
     return false
 }
@@ -259,11 +274,13 @@ export async function handleInteraction(interaction) {
 Drop the file in `/extensions/` and restart. That's it.
 
 **What extensions get access to:**
+
 - `client` — the full Discord.js Client, including `client.commands` (prefix map) and `client.aiCog` (AI manager)
 - `db` — the main SQLite database (mod logs, warnings, automod settings)
 - `heart` — the system monitor: `heart.rateLimiter`, `heart.cache` (LRU), `heart.monitor` (CPU/RAM/lag)
-> [!TIP]
-> The dynamic extension loader makes it easy to add features without touching core files and causing critical issues which makes the project easier to maintain.
+    > [!TIP]
+    > The dynamic extension loader makes it easy to add features without touching core files and causing critical issues which makes the project easier to maintain.
+
 ---
 
 ## AI System Design
@@ -292,7 +309,7 @@ Keys in `llm_keys` rotate automatically on 429/401 errors. Keys are permanently 
 Destructive agentic commands (`ban`, `mute`, `clear`, `purge`) require explicit user confirmation before executing:
 
 1. AI decides to mute someone → emits `<<RUN_CMD: mute 123456789 1h reason>>`
-2. Bot intercepts it, stores pending, asks: *"Confirm mute on @user for 1h? Reply yes within 30s"*
+2. Bot intercepts it, stores pending, asks: _"Confirm mute on @user for 1h? Reply yes within 30s"_
 3. User replies `yes` → command fires → `✅` react
 4. No reply within 35s → pending expires silently
 
@@ -323,32 +340,38 @@ Servers added to `isolated_servers` get their own memory database, so she mainta
 ### What she already does
 
 **Memory & Awareness**
-- Cross-session callbacks: occasionally surfaces old topics ("last time you mentioned X...")  
-- Relationship graph: tracks who talks to who, references them naturally  
-- Server lore: mods feed her facts via `/lore add`, she uses them organically  
-- Ghost list: users can hide specific people from their AI context (`/ghost add`)  
+
+- Cross-session callbacks: occasionally surfaces old topics ("last time you mentioned X...")
+- Relationship graph: tracks who talks to who, references them naturally
+- Server lore: mods feed her facts via `/lore add`, she uses them organically
+- Ghost list: users can hide specific people from their AI context (`/ghost add`)
 - User modes: `focused` mode drops the persona for analytical work  
+- Quick Agent (`/medusa`): stateless slash command — user-installable, DM-capable, no memory, no tools, dedicated tuning in `config.quickAgent`
 
 **Agentic Actions**
+
 - Runs Discord actions autonomously: fetch avatars/banners, create polls/threads, set slowmode, move users in VC, pin messages, manage channels
-- All destructive actions go through the confirmation gate  
-- Permission-gated: only fires commands the triggering user has permission to run  
+- All destructive actions go through the confirmation gate
+- Permission-gated: only fires commands the triggering user has permission to run
 
 **Moderation Suite**
-- Slash + prefix: `ban`, `unban`, `mute`, `unmute`, `warn`, `warnings`, `modlog`, `clearwarns`, `clear`, `mpurge`, `fpurge`, `filter_purge`  
-- Automod: anti-spam (configurable threshold), anti-caps (>70% uppercase), anti-links (with whitelist)  
-- DM notifications sent to targets before action lands  
+
+- Slash + prefix: `ban`, `unban`, `mute`, `unmute`, `warn`, `warnings`, `modlog`, `clearwarns`, `clear`, `mpurge`, `fpurge`, `filter_purge`
+- Automod: anti-spam (configurable threshold), anti-caps (>70% uppercase), anti-links (with whitelist)
+- DM notifications sent to targets before action lands
 
 **Expressive Media**
-- Tone-matched sticker and GIF reactions (40% chance when triggered)  
-- Falls back to free anime GIF API (nekos.best) if no Giphy key  
-- Hard-blocked on moderation and NSFW responses  
+
+- Tone-matched sticker and GIF reactions (40% chance when triggered)
+- Falls back to free anime GIF API (nekos.best) if no Giphy key
+- Hard-blocked on moderation and NSFW responses
 
 **System**
-- Health endpoint: `GET :8080/` → `{status, uptime, guilds, ping, memory}`  
-- Paginated mod log viewer with button navigation  
-- Configurable fun messages with weighted roast/fact/philosophical types  
-- AFK system with nickname prefixing and mention notifications  
+
+- Health endpoint: `GET :8080/` → `{status, uptime, guilds, ping, memory}`
+- Paginated mod log viewer with button navigation
+- Configurable fun messages with weighted roast/fact/philosophical types
+- AFK system with nickname prefixing and mention notifications
 
 ---
 
@@ -357,12 +380,14 @@ Servers added to `isolated_servers` get their own memory database, so she mainta
 Open-Dusa is built to survive on cheap shared hosts, VPS boxes, and container platforms. Here is what you need to know for each environment.
 
 ### Shared Hosting / Pterodactyl / Ephemeral Storage
+
 - **SQLite WAL mode** is enabled by default. The `-wal` and `-shm` files are normal and required while the bot is running.
 - If your host wipes the working directory on restart, place `Ai Database/` and `Logs/` on a persistent mount (e.g., `/home/container/persist/`). Change the paths in `config.json` if your host requires it.
 - The bot auto-checks disk space. If you see `[Heart] DISK ALMOST FULL`, clear old logs or reduce `journal_size_limit`.
 
 ### Docker
-```dockerfile
+
+````dockerfile
 FROM node:20-alpine
 RUN apk add --no-cache python3 make g++  # for better-sqlite3 native builds
 WORKDIR /app
@@ -375,7 +400,7 @@ Config is file-based (`config.json`) but the bot token can also be passed as an 
 
 ```bash
 TOKEN=your_token_here npm start
-```
+````
 
 The health server port can be overridden:
 
@@ -387,38 +412,41 @@ HEALTH_PORT=3000 npm start
 
 Open-Dusa uses SQLite with WAL mode. Over months of heavy use, the database files can fragment. Here's how to keep them lean:
 
-| Task | Command | When |
-|---|---|---|
-| Manual compact | `npm run db:compact` | Monthly or when `.db` files exceed 500MB |
-| Check size | `ls -lh Ai Database/ Logs/` | Weekly |
-| WAL cleanup | Automatic every 5 minutes | Always running |
-| Auto-prune | Automatic every 10 minutes | Deletes conversations/interests older than 90 days |
+| Task           | Command                     | When                                               |
+| -------------- | --------------------------- | -------------------------------------------------- |
+| Manual compact | `npm run db:compact`        | Monthly or when `.db` files exceed 500MB           |
+| Check size     | `ls -lh Ai Database/ Logs/` | Weekly                                             |
+| WAL cleanup    | Automatic every 5 minutes   | Always running                                     |
+| Auto-prune     | Automatic every 10 minutes  | Deletes conversations/interests older than 90 days |
 
 **What gets pruned automatically:**
+
 - Conversations, interests, personality, aliases, relationships: 90 days of inactivity
 - Mod logs, resolved warnings: 180 days (configurable in `index.js`)
 - Reaction roles: 90 days
 - Orphaned guild data: when no logs/warnings reference the guild
 
 **What grows forever (intentionally):**
+
 - Active warnings (`active = TRUE`) — must be cleared via `/clearwarns`
 - Server lore (`/lore`) — manual management only
 - Custom prompts & user modes — per-user files, negligible size
 
 ## Troubleshooting
 
-| Symptom | Cause | Fix |
-|---|---|---|
-| `SQLITE_IOERR_SHMSIZE` on start | Host doesn't allow shared-memory files | Already handled — the bot forces `locking_mode = EXCLUSIVE` to avoid `-shm` |
-| `SQLITE_FULL` errors | Disk quota exceeded on host | The bot auto-truncates WAL every 5 min. Free up disk or move DB to a larger partition. |
-| Bot starts but doesn't respond to mentions | `Message Content Intent` disabled | Enable it in the [Discord Developer Portal](https://discord.com/developers/applications) → Bot → Privileged Gateway Intents |
-| High memory usage over time | Normal — LRU caches grow to their limits | The bot auto-cleans every 10 min. If RSS exceeds ~400MB, check `[Heart] MEMORY LEAK` warnings. |
-| `better-sqlite3` install fails | Missing build tools | Run `npm install --build-from-source` or install `python3`, `make`, and `g++` |
-| `npm start` crashes immediately | Node 24+ with `better-sqlite3@11` | Downgrade to Node 20–23, or upgrade `better-sqlite3` to 12.x |
+| Symptom                                    | Cause                                                  | Fix                                                                                                                                     |
+| ------------------------------------------ | ------------------------------------------------------ | --------------------------------------------------------------------------------------------------------------------------------------- |
+| `SQLITE_IOERR_SHMSIZE` on start            | Host doesn't allow shared-memory files                 | Already handled — the bot forces `locking_mode = EXCLUSIVE` to avoid `-shm`                                                             |
+| `SQLITE_FULL` errors                       | Disk quota exceeded on host                            | The bot auto-truncates WAL every 5 min. Free up disk or move DB to a larger partition.                                                  |
+| Bot starts but doesn't respond to mentions | `Message Content Intent` disabled                      | Enable it in the [Discord Developer Portal](https://discord.com/developers/applications) → Bot → Privileged Gateway Intents             |
+| High memory usage over time                | Normal — LRU caches grow to their limits               | The bot auto-cleans every 10 min. If RSS exceeds ~400MB, check `[Heart] MEMORY LEAK` warnings.                                          |
+| `better-sqlite3` install fails             | Missing build tools                                    | Run `npm install --build-from-source` or install `python3`, `make`, and `g++`                                                           |
+| `npm start` crashes immediately            | Missing native build toolchain for `better-sqlite3@12` | Install `python3`, `make`, `g++` (Alpine: `apk add python3 make g++`), then `npm rebuild better-sqlite3`. Node 20–24 are all supported. |
 
 ---
 
 ## License
+
 > [!NOTE]
 > MIT — fork it, modify it, ship it. A credit back would be appreciated but isn't required.
 
