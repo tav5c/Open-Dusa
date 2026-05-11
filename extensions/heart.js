@@ -1,32 +1,44 @@
 import { LRUCache } from 'lru-cache'
-import os from 'os'
 import { monitorEventLoopDelay } from 'perf_hooks'
 import si from 'systeminformation'
 
-
 class GlobalRateLimiter {
     constructor() {
-        this.limit     = 4
-        this.window    = 5000
+        this.limit = 4
+        this.window = 5000
+        this.staffLimit = 20 // mods get 5x the budget
+        this.staffWindow = 5000
         this.cooldowns = new Map()
-        this.violations= new Map()
-        this.windows   = new Map()
+        this.violations = new Map()
+        this.windows = new Map()
     }
 
-    check(userId) {
+    /**
+     * @param {string} userId
+     * @param {{ isStaff?: boolean, isOwner?: boolean }} ctx
+     */
+    check(userId, ctx = {}) {
+        if (ctx.isOwner) return { ok: true, bypass: 'owner' }
         const now = Date.now()
+        const limit = ctx.isStaff ? this.staffLimit : this.limit
+        const window = ctx.isStaff ? this.staffWindow : this.window
         if (this.cooldowns.has(userId)) {
             if (now < this.cooldowns.get(userId)) return { ok: false, reason: 'user_cooldown' }
             this.cooldowns.delete(userId)
             this.violations.delete(userId)
         }
         let dq = this.windows.get(userId)
-        if (!dq) { dq = []; this.windows.set(userId, dq) }
-        while (dq.length && now - dq[0] > this.window) dq.shift()
-        if (dq.length >= this.limit) {
-            const v = (this.violations.get(userId) || 0) + 1
-            this.violations.set(userId, v)
-            if (v >= 3) this.cooldowns.set(userId, now + 30_000)
+        if (!dq) {
+            dq = []
+            this.windows.set(userId, dq)
+        }
+        while (dq.length && now - dq[0] > window) dq.shift()
+        if (dq.length >= limit) {
+            if (!ctx.isStaff) {
+                const v = (this.violations.get(userId) || 0) + 1
+                this.violations.set(userId, v)
+                if (v >= 3) this.cooldowns.set(userId, now + 30_000)
+            }
             return { ok: false, reason: 'rate_limited' }
         }
         dq.push(now)
@@ -37,8 +49,8 @@ class GlobalRateLimiter {
         const now = Date.now()
         for (const [k, v] of this.cooldowns) {
             if (now > v) {
-                this.cooldowns.delete(k);
-                this.violations.delete(k);
+                this.cooldowns.delete(k)
+                this.violations.delete(k)
             }
         }
         for (const [k, dq] of this.windows) if (!dq.length) this.windows.delete(k)
@@ -48,19 +60,21 @@ class GlobalRateLimiter {
 class SmartRetrier {
     constructor(attempts = 3, backoff = 1500, maxDelay = 30_000) {
         this.attempts = attempts
-        this.backoff  = backoff
+        this.backoff = backoff
         this.maxDelay = maxDelay
     }
 
     async retry(fn) {
         let last
         for (let i = 0; i < this.attempts; i++) {
-            try { return await fn() } catch (e) {
+            try {
+                return await fn()
+            } catch (e) {
                 last = e
                 if (i < this.attempts - 1) {
-                    const base   = Math.min(this.maxDelay, this.backoff * (1.5 ** i))
+                    const base = Math.min(this.maxDelay, this.backoff * 1.5 ** i)
                     const jitter = Math.random() * base * 0.3
-                    await new Promise(r => setTimeout(r, base + jitter))
+                    await new Promise((r) => setTimeout(r, base + jitter))
                 }
             }
         }
@@ -70,31 +84,41 @@ class SmartRetrier {
 
 export class MedusaHeart {
     constructor(client) {
-        this.client       = client
-        this.startTime    = Date.now()
-        this._closed      = false
-        this._tasks       = new Set()
-        this._stats       = { commands: 0, errors: 0, rateLimited: 0, firedTasks: 0 }
+        this.client = client
+        this.startTime = Date.now()
+        this._closed = false
+        this._tasks = new Set()
+        this._stats = { commands: 0, errors: 0, rateLimited: 0, firedTasks: 0 }
 
         this.cache = new LRUCache({
-    max: 2048,
-    ttl: 300_000,
-    updateAgeOnGet: false,
-    allowStale: false,
-    maxSize: 50 * 1024 * 1024,
-    sizeCalculation: (value) => typeof value === 'string' ? value.length : 1024,
-});
-        this.guildCache   = new Map()
+            max: 2048,
+            ttl: 300_000,
+            updateAgeOnGet: false,
+            allowStale: false,
+            maxSize: 50 * 1024 * 1024,
+            sizeCalculation: (value) => (typeof value === 'string' ? value.length : 1024),
+        })
+        this.guildCache = new Map()
         this.automodCache = new Map()
 
-        this.rateLimiter  = new GlobalRateLimiter()
-        this.retrier      = new SmartRetrier()
+        this.rateLimiter = new GlobalRateLimiter()
+        this.retrier = new SmartRetrier()
 
-        this.monitor      = { mem: 0, heap: 0, cpu: 0, last: 0, peakMem: 0, loopLag: 0, diskUsed: 0, diskTotal: 0, uptime: 0 }
-        this._latency     =[]
+        this.monitor = {
+            mem: 0,
+            heap: 0,
+            cpu: 0,
+            last: 0,
+            peakMem: 0,
+            loopLag: 0,
+            diskUsed: 0,
+            diskTotal: 0,
+            uptime: 0,
+        }
+        this._latency = []
         this.wsLatencyAvg = 0
         this.wsLatencySpike = false
-        this._memHistory  = []
+        this._memHistory = []
 
         this.loopHistogram = monitorEventLoopDelay({ resolution: 20 })
         this.loopHistogram.enable()
@@ -106,16 +130,20 @@ export class MedusaHeart {
 
     fire(promise, name = 'task', timeout = 300_000) {
         this._stats.firedTasks++
-        let p = (promise instanceof Promise ? promise : Promise.resolve().then(promise))
-            .catch(e => console.error(`[Heart] Task '${name}' error:`, e))
-        
+        let p = (promise instanceof Promise ? promise : Promise.resolve().then(promise)).catch((e) =>
+            console.error(`[Heart] Task '${name}' error:`, e),
+        )
+
         // auto-expunge hung tasks so they don't leak in the set forever
         // timeout <= 0 means daemon loop — never expire
-        const timer = timeout > 0 ? setTimeout(() => {
-            console.warn(`[Heart] Task '${name}' timed out after ${timeout}ms — forcing cleanup`)
-            this._tasks.delete(p)
-        }, timeout).unref() : null
-        
+        const timer =
+            timeout > 0
+                ? setTimeout(() => {
+                      console.warn(`[Heart] Task '${name}' timed out after ${timeout}ms — forcing cleanup`)
+                      this._tasks.delete(p)
+                  }, timeout).unref()
+                : null
+
         p.finally(() => {
             if (timer) clearTimeout(timer)
             this._tasks.delete(p)
@@ -127,7 +155,7 @@ export class MedusaHeart {
     recordLatency(ms) {
         this._latency.push(ms)
         if (this._latency.length > 30) this._latency.shift()
-        this.wsLatencyAvg   = this._latency.reduce((a, b) => a + b, 0) / this._latency.length
+        this.wsLatencyAvg = this._latency.reduce((a, b) => a + b, 0) / this._latency.length
         this.wsLatencySpike = ms > this.wsLatencyAvg * 3
     }
 
@@ -136,24 +164,26 @@ export class MedusaHeart {
         const tick = async () => {
             if (this._closed) return
             const mem = process.memoryUsage()
-            const mb  = mem.rss / 1024 / 1024
+            const mb = mem.rss / 1024 / 1024
             const heapMb = mem.heapUsed / 1024 / 1024
-            this.monitor.mem     = mb
-            this.monitor.heap    = heapMb
+            this.monitor.mem = mb
+            this.monitor.heap = heapMb
             this.monitor.peakMem = Math.max(this.monitor.peakMem, mb)
-            this.monitor.last    = Date.now()
-            this.monitor.uptime  = Math.floor(process.uptime())
+            this.monitor.last = Date.now()
+            this.monitor.uptime = Math.floor(process.uptime())
 
             this._memHistory.push({ ts: Date.now(), rss: mb })
             if (this._memHistory.length > 30) this._memHistory.shift()
             if (this._memHistory.length >= 10) {
                 const first = this._memHistory[0]
-                const last  = this._memHistory[this._memHistory.length - 1]
-                const mins  = (last.ts - first.ts) / 60000
+                const last = this._memHistory[this._memHistory.length - 1]
+                const mins = (last.ts - first.ts) / 60000
                 if (mins > 2) {
                     const growth = (last.rss - first.rss) / mins
                     if (growth > 30 && mb > 400) {
-                        console.warn(`[Heart] MEMORY LEAK: RSS +${growth.toFixed(1)}MB/min (now ${mb.toFixed(0)}MB)`)
+                        console.warn(
+                            `[Heart] MEMORY LEAK: RSS +${growth.toFixed(1)}MB/min (now ${mb.toFixed(0)}MB)`,
+                        )
                     }
                 }
             }
@@ -162,25 +192,31 @@ export class MedusaHeart {
             histResetCount++
             if (histResetCount >= 30) {
                 histResetCount = 0
-                try { this.loopHistogram.disable() } catch {}
+                try {
+                    this.loopHistogram.disable()
+                } catch {}
                 this.loopHistogram = monitorEventLoopDelay({ resolution: 20 })
                 this.loopHistogram.enable()
             }
             this.monitor.loopLag = this.loopHistogram.mean / 1e6
             if (this.monitor.loopLag > 500) {
-                console.warn(`[Heart] EVENT LOOP LAG: ${this.monitor.loopLag.toFixed(0)}ms — possible blocking operation`)
+                console.warn(
+                    `[Heart] EVENT LOOP LAG: ${this.monitor.loopLag.toFixed(0)}ms — possible blocking operation`,
+                )
             }
 
             // Disk check (critical for Pterodactyl/ephemeral hosts)
             try {
                 const fsData = await si.fsSize()
-                const main = fsData?.find(f => f.fs === '/' || f.mount === '/') || fsData?.[0]
+                const main = fsData?.find((f) => f.fs === '/' || f.mount === '/') || fsData?.[0]
                 if (main) {
-                    this.monitor.diskUsed  = main.used / 1024 / 1024 / 1024
+                    this.monitor.diskUsed = main.used / 1024 / 1024 / 1024
                     this.monitor.diskTotal = main.size / 1024 / 1024 / 1024
                     if (main.use > 90) console.warn(`[Heart] DISK ALMOST FULL: ${main.use.toFixed(0)}%`)
                 }
-            } catch { /* fsSize fails in some containers — ignore */ }
+            } catch {
+                /* fsSize fails in some containers — ignore */
+            }
 
             // CPU: prefer systeminformation, fallback to last-known (non-blocking)
             try {
@@ -231,22 +267,36 @@ export class MedusaHeart {
                     if (mgr._flushTimer) {
                         clearTimeout(mgr._flushTimer)
                         mgr._flushTimer = null
-                        for (const f of mgr._writeQueue) try { f() } catch {}
+                        for (const f of mgr._writeQueue)
+                            try {
+                                f()
+                            } catch {}
                         mgr._writeQueue = []
                     }
                 }
             }
             if (this._tasks.size) await Promise.allSettled([...this._tasks])
         }
-        process.once('SIGINT',  () => shutdown('SIGINT').then(() => { process.exitCode = 0 }))
-        process.once('SIGTERM', () => shutdown('SIGTERM').then(() => { process.exitCode = 0 }))
-        process.on('uncaughtException', e => { 
+        process.once('SIGINT', () =>
+            shutdown('SIGINT').then(() => {
+                process.exitCode = 0
+            }),
+        )
+        process.once('SIGTERM', () =>
+            shutdown('SIGTERM').then(() => {
+                process.exitCode = 0
+            }),
+        )
+        process.on('uncaughtException', (e) => {
             console.error('[Heart] FATAL Uncaught:', e)
             // Allow async cleanup (DB flush, WAL checkpoint) before exit
             process.exitCode = 1
             setTimeout(() => process.exit(1), 2000).unref()
         })
-        process.on('unhandledRejection', (r) => { console.error('[Heart] Unhandled rejection:', r); this._stats.errors++ })
+        process.on('unhandledRejection', (r) => {
+            console.error('[Heart] Unhandled rejection:', r)
+            this._stats.errors++
+        })
     }
 
     close() {
@@ -254,7 +304,9 @@ export class MedusaHeart {
         clearInterval(this._monitorInterval)
         clearInterval(this._cleanupInterval)
         if (this.loopHistogram) {
-            try { this.loopHistogram.disable() } catch {}
+            try {
+                this.loopHistogram.disable()
+            } catch {}
             this.loopHistogram = null
         }
     }

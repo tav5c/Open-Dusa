@@ -1,23 +1,30 @@
-/**
- * myFeature.js — Extension template. Rename this file and build your feature here.
- *
- * ⚠️  REMOVE OR DISABLE THE PING HANDLER BELOW BEFORE PRODUCTION USE.
- *     It intercepts ANY message with content === 'ping' and sinks it from
- *     the entire pipeline. Use a prefixed command or a unique keyword instead.
- */
+// extensions/myFeature.js — example extension using the manifest-based loader.
+// Copy this file, rename the manifest, and drop it in /extensions to activate.
 
-export function init(client, db, heart) {
-    console.log('[myFeature] Template extension loaded. Replace this with your own feature.')
+export const manifest = {
+    name: 'myFeature',
+    version: '1.0.0',
+    author: 'you',
+    description: 'Example extension template',
+    apiVersion: 1,
+    slashCommands: [], // array of SlashCommandBuilder().toJSON() shapes
+    permissions: [], // e.g. ['ManageMessages']
+    dependencies: [], // ['ai', 'automod', ...]
 }
 
-export async function handleMessage(message) {
-    // Example: intercept bare "ping" — REMOVE this before going live.
-    // if (message.content === 'ping') {
-    //     await message.reply('pong')
-    //     return true  // sinks the message
-    // }
+export async function init(client, db, heart) {
+    console.log(`[${manifest.name}] Loaded v${manifest.version}`)
+    // Register dynamic prefix commands or listeners here
+    client.commands.set('hello', async (msg) => {
+        await msg.reply('world!')
+    })
 }
 
-export async function handleInteraction(interaction) {
-    // Handle your custom slash commands dynamically here.
+export async function handleMessage(_message) {
+    // Return true to "sink" (stop pipeline), false/undefined to pass through.
+    return false
+}
+
+export async function handleInteraction(_interaction) {
+    return false
 }

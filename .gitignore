@@ -8,6 +8,7 @@ package-lock.json
 # Medusa Database & AI Memory
 Logs/
 Ai Database/
+call-d/
 *.db
 *.db-wal
 *.db-shm
@@ -20,4 +21,6 @@ Ai Database/
 .DS_Store
 Thumbs.db
 extensions/private.js
+extensions/timezone.js
 priv.json
+timezones.json

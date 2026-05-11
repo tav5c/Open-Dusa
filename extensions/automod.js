@@ -1,12 +1,18 @@
 import { PermissionFlagsBits } from 'discord.js'
 
+// Hoisted — compiled once per process instead of on every message
+const LINK_WHITELIST =
+    /(?:cdn\.discordapp\.com|media\.discordapp\.net|discord\.gg|tenor\.com|giphy\.com|discord\.com\/channels)/i
+const URL_REGEX = /(?:https?:\/\/|www\.)[^\s<>"{}|\\^`[\]]+/i
+const OBFUSCATED_REGEX = /(?:dot|\.)\s*(?:com|net|org|gg|io|dev|app)\b/i
+
 export function registerAutomod(client, db, heart) {
     const automodSpam = new Map()
 
     setInterval(() => {
         const now = Date.now()
         for (const [k, arr] of automodSpam) {
-            const fresh = arr.filter(t => now - t < 5000)
+            const fresh = arr.filter((t) => now - t < 5000)
             if (!fresh.length) automodSpam.delete(k)
             else automodSpam.set(k, fresh)
         }
@@ -18,7 +24,9 @@ export function registerAutomod(client, db, heart) {
 
         let settings = heart.automodCache.get(message.guild.id)
         if (settings === undefined) {
-            settings = db.prepare('SELECT * FROM automod_settings WHERE guild_id=?').get(String(message.guild.id)) ?? false
+            settings =
+                db.prepare('SELECT * FROM automod_settings WHERE guild_id=?').get(String(message.guild.id)) ??
+                false
             heart.automodCache.set(message.guild.id, settings)
         }
         if (!settings) return
@@ -28,44 +36,56 @@ export function registerAutomod(client, db, heart) {
 
         if (settings.anti_spam) {
             let ts = automodSpam.get(key) ?? []
-            ts = ts.filter(t => now - t < 5000)
+            ts = ts.filter((t) => now - t < 5000)
             ts.push(now)
             automodSpam.set(key, ts)
             if (ts.length >= (settings.spam_threshold || 5)) {
                 automodSpam.delete(key)
-                try { await message.delete() } catch {}
-                await message.channel.send({ content: `🛑 ${message.author}, you're sending messages too fast!` })
-                    .then(m => setTimeout(() => m.delete().catch(() => {}), 5000))
+                try {
+                    await message.delete()
+                } catch {}
+                await message.channel
+                    .send({ content: `🛑 ${message.author}, you're sending messages too fast!` })
+                    .then((m) => setTimeout(() => m.delete().catch(() => {}), 5000))
                 return
             }
         }
 
         if (settings.anti_caps && message.content.length > 10) {
-            const ratio = [...message.content].filter(c => c >= 'A' && c <= 'Z').length / message.content.length
+            const ratio =
+                [...message.content].filter((c) => c >= 'A' && c <= 'Z').length / message.content.length
             if (ratio > 0.7) {
-                try { await message.delete() } catch {}
-                await message.channel.send({ content: `${message.author}, please don't use excessive caps!` })
-                    .then(m => setTimeout(() => m.delete().catch(() => {}), 5000))
+                try {
+                    await message.delete()
+                } catch {}
+                await message.channel
+                    .send({ content: `${message.author}, please don't use excessive caps!` })
+                    .then((m) => setTimeout(() => m.delete().catch(() => {}), 5000))
                 return
             }
         }
 
         if (settings.max_mentions && message.mentions.users.size > settings.max_mentions) {
-            try { await message.delete() } catch {}
-            await message.channel.send({ content: `${message.author}, too many mentions in one message!` })
-                .then(m => setTimeout(() => m.delete().catch(() => {}), 5000))
+            try {
+                await message.delete()
+            } catch {}
+            await message.channel
+                .send({ content: `${message.author}, too many mentions in one message!` })
+                .then((m) => setTimeout(() => m.delete().catch(() => {}), 5000))
             return
         }
 
         if (settings.anti_links) {
-            const LINK_WHITELIST = /(?:cdn\.discordapp\.com|media\.discordapp\.net|discord\.gg|tenor\.com|giphy\.com|discord\.com\/channels)/i
-            const URL_REGEX = /(?:https?:\/\/|www\.)[^\s<>\"{}|\\^`\[\]]+/i
-            // Also catch obfuscated links
-            const OBFUSCATED_REGEX = /(?:dot|\.)\s*(?:com|net|org|gg|io|dev|app)\b/i
-            if ((URL_REGEX.test(message.content) || OBFUSCATED_REGEX.test(message.content.toLowerCase())) && !LINK_WHITELIST.test(message.content)) {
-                try { await message.delete() } catch {}
-                await message.channel.send({ content: `${message.author}, links are not allowed!` })
-                    .then(m => setTimeout(() => m.delete().catch(() => {}), 5000))
+            if (
+                (URL_REGEX.test(message.content) || OBFUSCATED_REGEX.test(message.content.toLowerCase())) &&
+                !LINK_WHITELIST.test(message.content)
+            ) {
+                try {
+                    await message.delete()
+                } catch {}
+                await message.channel
+                    .send({ content: `${message.author}, links are not allowed!` })
+                    .then((m) => setTimeout(() => m.delete().catch(() => {}), 5000))
             }
         }
     }
@@ -76,10 +96,16 @@ export function registerAutomod(client, db, heart) {
             await interaction.reply({ content: '❌ Manage Server permission required.', flags: 64 })
             return true
         }
-        const sub     = interaction.options.getSubcommand()
+        const sub = interaction.options.getSubcommand()
         const guildId = String(interaction.guild.id)
-        const current = db.prepare('SELECT * FROM automod_settings WHERE guild_id=?').get(guildId)
-            ?? { guild_id: guildId, anti_spam: 0, anti_caps: 0, anti_links: 0, max_mentions: 5, spam_threshold: 5 }
+        const current = db.prepare('SELECT * FROM automod_settings WHERE guild_id=?').get(guildId) ?? {
+            guild_id: guildId,
+            anti_spam: 0,
+            anti_caps: 0,
+            anti_links: 0,
+            max_mentions: 5,
+            spam_threshold: 5,
+        }
 
         if (sub === 'status') {
             const lines = [
@@ -95,11 +121,22 @@ export function registerAutomod(client, db, heart) {
         if (field) {
             const enabled = interaction.options.getBoolean('enabled')
             current[field] = enabled ? 1 : 0
-            db.prepare(`INSERT INTO automod_settings (guild_id, anti_spam, anti_caps, anti_links, max_mentions, spam_threshold)
-                VALUES (?,?,?,?,?,?) ON CONFLICT(guild_id) DO UPDATE SET ${field}=excluded.${field}`)
-                .run(guildId, current.anti_spam, current.anti_caps, current.anti_links, current.max_mentions, current.spam_threshold)
+            db.prepare(
+                `INSERT INTO automod_settings (guild_id, anti_spam, anti_caps, anti_links, max_mentions, spam_threshold)
+                VALUES (?,?,?,?,?,?) ON CONFLICT(guild_id) DO UPDATE SET ${field}=excluded.${field}`,
+            ).run(
+                guildId,
+                current.anti_spam,
+                current.anti_caps,
+                current.anti_links,
+                current.max_mentions,
+                current.spam_threshold,
+            )
             heart.automodCache.set(interaction.guild.id, current)
-            await interaction.reply({ content: `✅ **${sub}** ${enabled ? 'enabled' : 'disabled'}.`, flags: 64 })
+            await interaction.reply({
+                content: `✅ **${sub}** ${enabled ? 'enabled' : 'disabled'}.`,
+                flags: 64,
+            })
             return true
         }
         return false
