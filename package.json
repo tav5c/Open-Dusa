@@ -1,12 +1,14 @@
 {
     "name": "open-dusa",
-    "version": "1.1.0",
+    "version": "1.2.0",
     "description": "Agentic AI Resident for Discord",
     "type": "module",
     "main": "index.js",
-    "scripts": {
-        "start": "cross-env UV_THREADPOOL_SIZE=12 node index.js",
-        "dev": "cross-env UV_THREADPOOL_SIZE=12 node --watch --expose-gc index.js",
+  "scripts": {
+    "start": "cross-env UV_THREADPOOL_SIZE=12 node index.js",
+    "start:beefy": "cross-env UV_THREADPOOL_SIZE=16 NODE_OPTIONS=\"--max-old-space-size=3072 --max-semi-space-size=128\" node index.js",
+    "start:max": "cross-env UV_THREADPOOL_SIZE=24 NODE_OPTIONS=\"--max-old-space-size=6144 --max-semi-space-size=256\" node index.js",
+    "dev": "cross-env UV_THREADPOOL_SIZE=12 node --watch --expose-gc index.js",
         "lint": "eslint \"**/*.js\"",
         "lint:fix": "eslint \"**/*.js\" --fix",
         "format": "prettier --write \"**/*.{js,json,md}\"",

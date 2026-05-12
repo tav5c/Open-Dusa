@@ -22,7 +22,10 @@ import { performance } from 'perf_hooks'
 import { setGlobalDispatcher } from 'undici'
 import { _undiciAgent, buildAISlashCommands } from './extensions/ai.js'
 import { attachHeart } from './extensions/heart.js'
+import { loadPerformance } from './extensions/performance.js'
 import { resolveTarget } from './extensions/utils.js'
+
+const PERF = loadPerformance()
 
 // Owner permission
 const _isOwner = (id) => {
@@ -149,12 +152,11 @@ try {
     }
     db.pragma('synchronous = NORMAL')
     db.pragma('temp_store = MEMORY')
-    db.pragma('journal_size_limit = 4096000')
-    try {
-        db.pragma('mmap_size = 67108864')
-    } catch {}
-    db.pragma('cache_size = -20000')
-    db.pragma('wal_autocheckpoint = 1000')
+    db.pragma(`journal_size_limit = ${PERF.sqlite.journalSizeLimit}`)
+    try { db.pragma(`mmap_size = ${PERF.sqlite.mmapSizeBytes}`) } catch (e) {}
+    db.pragma(`cache_size = -${PERF.sqlite.cacheSizeKB}`)
+    db.pragma(`wal_autocheckpoint = ${PERF.sqlite.walAutocheckpoint}`)
+
     db.pragma('busy_timeout = 5000')
 
     let _vacuumEligible = false
@@ -229,15 +231,16 @@ const client = new Client({
     ws: { properties: { os: 'linux', browser: 'Discord Android', device: 'Mobile' } },
     makeCache: Options.cacheWithLimits({
         ...Options.DefaultMakeCacheSettings,
-        MessageManager: 100,
+        MessageManager: PERF.discord.messageCache,
         GuildMemberManager: {
-            maxSize: 200,
-            keepOverLimit: (m) => m.id === client.user?.id,
+            maxSize: PERF.discord.memberCacheMax,
+            keepOverLimit: m => m.id === client.user?.id,
         },
+        ...(PERF.discord.userCache ? { UserManager: PERF.discord.userCache } : {}),
     }),
     sweepers: {
         ...Options.DefaultSweeperSettings,
-        messages: { interval: 300, lifetime: 900 },
+        messages:     { interval: PERF.discord.messageSweepInterval, lifetime: PERF.discord.messageSweepLifetime },
         guildMembers: { interval: 600, filter: () => (m) => !m.voice?.channelId && m.id !== client.user?.id },
         users: { interval: 1800, filter: () => (u) => u.id !== client.user?.id },
         threads: { interval: 600, lifetime: 1800 },
@@ -328,17 +331,21 @@ process.on('exit', () => {
 
 async function cmdPing(ctx) {
     const t = performance.now()
-    const reply = await ctx.reply({ content: 'Pinging...' })
+    try {
+        const reply = await ctx.reply({ content: 'Pinging...' })
+        const cli = (performance.now() - t).toFixed(2)
+        const content = `Websocket Latency: \`${client.ws.ping.toFixed(2)}ms\`, Client Latency: \`${cli}ms\``
 
-    const cli = (performance.now() - t).toFixed(2)
-    const content = `Websocket Latency: \`${client.ws.ping.toFixed(2)}ms\`, Client Latency: \`${cli}ms\``
-
-    if (ctx.isChatInputCommand?.()) {
-        // It's a slash command idiota
-        await ctx.editReply({ content })
-    } else {
-        // It's a prefix message command
-        await reply.edit({ content })
+        if (ctx.isChatInputCommand?.()) await ctx.editReply({ content })
+        else await reply.edit({ content })
+    } catch (e) {
+        // 10062 = token expired (Discord gives ~3s), 40060 = already acknowledged
+        // Both are non-fatal — just log and return so uncaughtException doesn't kill the process
+        if (e?.code === 10062 || e?.code === 40060) {
+            console.warn(`[CMD] ping skipped (${e.code})`)
+            return
+        }
+        throw e
     }
 }
 

@@ -1,0 +1,48 @@
+{
+  "_comment": "Performance tuning file. Copy to performance.json and edit. All keys are optional — defaults apply if absent or if the file doesn't exist.",
+  "_presets": "See README for 'low' (256MB RAM shared host) and 'beefy' (2GB+ VPS) recommendations",
+
+  "node": {
+    "uvThreadpoolSize": null,
+    "maxOldSpaceSizeMB": null,
+    "maxSemiSpaceSizeMB": null,
+    "_note": "Node flags can ALSO be set via NODE_OPTIONS env var. The bot only advises you of mismatch; the flags must be passed at node startup (they're read by V8 before bot code runs)."
+  },
+
+  "sqlite": {
+    "cacheSizeKB": 20000,
+    "mmapSizeBytes": 67108864,
+    "journalSizeLimit": 4096000,
+    "walAutocheckpoint": 5000
+  },
+
+  "discord": {
+    "messageCache": 100,
+    "memberCacheMax": 200,
+    "userCache": null,
+    "messageSweepInterval": 300,
+    "messageSweepLifetime": 900
+  },
+
+  "ai": {
+    "responseCacheMax": 512,
+    "responseCacheTTLSec": 300,
+    "responseCacheMaxMB": 20,
+    "userCacheMax": 500,
+    "userCacheTTLSec": 120,
+    "messageHistoryMax": 200,
+    "messageHistoryTTLMin": 30,
+    "repliedMsgCacheMax": 500,
+    "repliedMsgCacheTTLMin": 10,
+    "memoryDepth": 25,
+    "passiveBufferMax": 25,
+    "passiveBufferChannelsMax": 500
+  },
+
+  "maintenance": {
+    "cleanupIntervalMin": 10,
+    "retentionDays": 90,
+    "vacuumEveryDays": 7,
+    "loopLagWarnMs": 500
+  }
+}

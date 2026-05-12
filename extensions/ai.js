@@ -17,6 +17,9 @@ import { dirname, join } from 'path'
 import { performance } from 'perf_hooks'
 import { Agent } from 'undici'
 import { fileURLToPath } from 'url'
+import { loadPerformance } from './performance.js'
+
+const PERF = loadPerformance()
 export const _undiciAgent = new Agent({
     connections: 30,
     pipelining: 4,
@@ -390,12 +393,12 @@ class DBPool {
             }
             conn.pragma('synchronous = NORMAL')
             conn.pragma('temp_store = MEMORY')
-            conn.pragma('journal_size_limit = 4096000')
+            conn.pragma(`journal_size_limit = ${PERF.sqlite.journalSizeLimit}`)
             try {
-                conn.pragma('mmap_size = 67108864')
+                conn.pragma(`mmap_size = ${PERF.sqlite.mmapSizeBytes}`)
             } catch {}
-            conn.pragma('cache_size = -20000')
-            conn.pragma('wal_autocheckpoint = 5000')
+            conn.pragma(`cache_size = -${PERF.sqlite.cacheSizeKB}`)
+            conn.pragma(`wal_autocheckpoint = ${PERF.sqlite.walAutocheckpoint}`)
             conn.pragma('busy_timeout = 5000')
 
             // TRUNCATE truncates the WAL file to zero bytes, freeing disk space (fixes SQLITE_FULL on Pterodactyl)
@@ -943,11 +946,15 @@ class AIMemoryManager {
             )
             .run(cutoff)
         this.cleanupLore()
-        // Compact after bulk delete
-        try {
-            this.db.prepare('VACUUM').run()
-        } catch {}
+        // Gated VACUUM — defaults to once per 7 days to avoid 3-5s blocking ops
+        const now = Date.now()
+        const gapMs = PERF.maintenance.vacuumEveryDays * 86400_000
+        this._lastVacuum ??= 0
+        if (now - this._lastVacuum > gapMs) {
+            try { this.db.prepare('VACUUM').run(); this._lastVacuum = now } catch {}
+        }
     }
+
 
     // Server lore
     addLore(fact, source = 'manual') {
@@ -1114,7 +1121,7 @@ class AIChatManager {
         this.instructions = Array.isArray(_sp)
             ? _sp.join(String.fromCharCode(10))
             : (typeof _sp === 'string' && _sp.trim() ? _sp : 'You are Medusa, a warm and witty Discord AI resident. Respond in first person.')
-        this.maxHistory = config.memoryDepth ?? 25
+        this.maxHistory = config.memoryDepth ?? PERF.ai.memoryDepth
         this.allowDM = config.allowDMs ?? false
         this.FunMsgInterval = (config.FunMsgInterval ?? 5400) * 1000
 
@@ -1165,20 +1172,21 @@ class AIChatManager {
         this._initProviders()
 
         // Caches
+        const P = PERF.ai
         this.responseCache = new LRUCache({
-            max: 512,
-            ttl: 300_000,
+            max: P.responseCacheMax,
+            ttl: P.responseCacheTTLSec * 1000,
             updateAgeOnGet: true,
             allowStale: true,
-            maxSize: 20 * 1024 * 1024,
+            maxSize: P.responseCacheMaxMB * 1024 * 1024,
             sizeCalculation: (value) => (typeof value === 'string' ? value.length : 1024),
         })
-        this.userCache = new LRUCache({ max: 500, ttl: 120_000 })
+        this.userCache = new LRUCache({ max: P.userCacheMax, ttl: P.userCacheTTLSec * 1000 })
         this.summarizeCDs = new Map()
 
         // Runtime state
-        this.messageHistory = new LRUCache({ max: 200, ttl: 30 * 60_000 })
-        this.repliedMsgCache = new LRUCache({ max: 500, ttl: 10 * 60_000 })
+        this.messageHistory = new LRUCache({ max: P.messageHistoryMax, ttl: P.messageHistoryTTLMin * 60_000 })
+        this.repliedMsgCache = new LRUCache({ max: P.repliedMsgCacheMax, ttl: P.repliedMsgCacheTTLMin * 60_000 })
         this.activeConvs = new Map()
         this.processedMsgIds = makeIdSet(2500, 30 * 60_000)
         this.triggeredMsgs = makeIdSet(1000, 15 * 60_000)
@@ -1213,7 +1221,7 @@ class AIChatManager {
         this.lastRandomMsg = Date.now()
 
         // Background tasks
-        setInterval(() => this._periodicCleanup(), 600_000).unref()
+        setInterval(() => this._periodicCleanup(), PERF.maintenance.cleanupIntervalMin * 60_000).unref()
         if (this.funChannels.size && this.FunMsgInterval > 0) {
             setInterval(() => {
                 if (Date.now() - this.lastRandomMsg >= this.FunMsgInterval && !this.paused)
@@ -1479,7 +1487,8 @@ class AIChatManager {
         return this.instructions
     }
 
-    // Key rotation
+    // Key rotation with per-key cooldown to prevent thrashing when all keys are rate-limited.
+    // Without this, 2 limited keys ping-pong every few seconds burning logs and TTFT.
     async rotateKey(errorMsg = '') {
         if (this._rotatePromise) return this._rotatePromise
 
@@ -1487,14 +1496,25 @@ class AIChatManager {
             const n = this.aiTokens.length
             if (!n) return false
             const old = this.currentKeyIdx
+            this._keyCooldowns ??= new Map()   // keyIdx -> timestamp when it becomes usable again
+
             if (this._isDeadKeyError(errorMsg)) {
                 this.deadKeys.add(old)
                 this._saveDeadKeys()
                 console.log(`[AI] Key ${old + 1} permanently blacklisted`)
+            } else if (this._isRateError(errorMsg)) {
+                // Put the current key on 30s cooldown. If all keys are cooling down,
+                // we'll just wait out the shortest one rather than ping-ponging.
+                this._keyCooldowns.set(old, Date.now() + 30_000)
             }
+
+            const now = Date.now()
+            // Find a non-dead, non-cooling key
             for (let step = 1; step <= n; step++) {
                 const next = (old + step) % n
                 if (this.deadKeys.has(next)) continue
+                const cooldownUntil = this._keyCooldowns.get(next) ?? 0
+                if (cooldownUntil > now) continue
                 this.currentKeyIdx = next
                 this._initGroq()
                 if (this._groq) {
@@ -1503,7 +1523,29 @@ class AIChatManager {
                     return true
                 }
             }
-            console.warn(`[AI] All keys exhausted (${this.deadKeys.size} dead)`)
+
+            // All keys cooling down. Wait for the earliest one to recover rather than failing.
+            const aliveCooldowns = [...this._keyCooldowns.entries()]
+                .filter(([k]) => !this.deadKeys.has(k))
+                .map(([, t]) => t)
+            if (aliveCooldowns.length) {
+                const waitMs = Math.max(0, Math.min(...aliveCooldowns) - Date.now())
+                if (waitMs > 0 && waitMs < 60_000) {
+                    console.log(`[AI] All keys cooling down — waiting ${(waitMs / 1000).toFixed(1)}s`)
+                    await new Promise(r => setTimeout(r, waitMs + 100))
+                    // Retry once
+                    for (let step = 0; step < n; step++) {
+                        const next = (old + step) % n
+                        if (this.deadKeys.has(next)) continue
+                        if ((this._keyCooldowns.get(next) ?? 0) > Date.now()) continue
+                        this.currentKeyIdx = next
+                        this._initGroq()
+                        if (this._groq) { console.log(`[AI] Key recovered after cooldown: key ${next + 1}`); return true }
+                    }
+                }
+            }
+
+            console.warn(`[AI] All keys exhausted (${this.deadKeys.size} dead, ${this._keyCooldowns.size} cooling)`)
             return false
         })()
 
@@ -2282,8 +2324,23 @@ class AIChatManager {
                     'dm',
                 ])
                 if (DESTRUCTIVE.has(cmdName) && MOD_CMDS.has(cmdName)) {
-                    const targetArg = args[0] ? args[0].replace(/[<@!>]/g, '').toLowerCase() : 'none'
-                    const confirmKey = `${message.author.id}:${cmdName}:${targetArg}:${Date.now()}`
+                    // Reject obviously-hallucinated targets before even asking for confirmation.
+                    // ban/kick/mute/warn/mpurge need a user snowflake; clear/purge/fpurge need an int count.
+                    const needsUserId = ['ban', 'kick', 'mute', 'unmute', 'warn', 'mpurge', 'clearwarns'].includes(cmdName)
+                    const needsInt    = ['clear', 'purge', 'fpurge'].includes(cmdName)
+                    const rawArg = args[0]?.replace(/[<@!>]/g, '') ?? ''
+                    if (needsUserId && !/^\d{15,20}$/.test(rawArg)) {
+                        console.warn(`[AI] Blocked hallucinated ${cmdName} — arg '${rawArg}' is not a user ID`)
+                        finalResponse = finalResponse.replace(/<<\s*RUN_CMD:[\s\S]*?>>/g, '').trim()
+                        continue
+                    }
+                    if (needsInt && !/^\d{1,3}$/.test(rawArg)) {
+                        console.warn(`[AI] Blocked hallucinated ${cmdName} — arg '${rawArg}' is not a valid count`)
+                        finalResponse = finalResponse.replace(/<<\s*RUN_CMD:[\s\S]*?>>/g, '').trim()
+                        continue
+                    }
+                    const targetArg = rawArg.toLowerCase() || 'none'
+                    const confirmKey = `${message.author.id}:${cmdName}:${targetArg}:${Date.now()}`;
                     // Store full state including original message reference for reply context
                     const existing = this._pendingConfirms.get(confirmKey)
                     const now = Date.now()
@@ -2630,6 +2687,31 @@ class AIChatManager {
             }
         }
 
+        // On format/400 error, try once more with the raw URL (no base64) — some NVIDIA
+        // vision endpoints reject data URLs and need a direct link.
+        if (errType === 'format' && imageUrl) {
+            try {
+                const retryMsgs = [
+                    { role: 'system', content: visionSys },
+                    { role: 'user', content: [
+                        { type: 'image_url', image_url: { url: imageUrl } },
+                        { type: 'text', text: userText },
+                    ]},
+                ]
+                const r = await this._groq.chat.completions.create({
+                    model: this.visionModel,
+                    messages: retryMsgs,
+                    max_completion_tokens: this.visionTokens,
+                    temperature: this.visionTemp,
+                    top_p: this.topP,
+                })
+                raw = r.choices[0].message.content
+                errType = null
+            } catch (e) {
+                console.warn('[AI] Vision raw-URL retry also failed:', String(e).slice(0, 100))
+            }
+        }
+
         if (errType === 'expired') return "that image link seems to have expired or isn't loading for me 😅"
         if (errType === 'format') return "hmm i couldn't process that image format 🤔"
         if (!raw) {
@@ -2723,11 +2805,16 @@ class AIChatManager {
         for (const term of DANGEROUS_TERMS) if (lower.includes(term)) return 'dangerous'
         for (const s of ALWAYS_LIVE) if (lower.includes(s)) return 'research'
 
-        const isNever =
-            NEVER_RESEARCH_EXACT.has(lower) ||
-            NEVER_RESEARCH_PREFIXES.some((p) => lower.startsWith(p)) ||
-            (wc <= 6 && !hasQ && !hasTemp)
+        // Short-message skip only when clearly conversational (greeting/emoji/ack).
+        const CASUAL_SHORT = /^(hi+|hey+|yo+|sup|hello|ty|thx|thanks|ok|okay|cool|nice|bye|cya|gn|gm|lol|lmao|[💜💚🥺💀·👀🪼])/i
+        const isShortCasual = wc <= 3 && CASUAL_SHORT.test(lower)
+
+        const isNever = NEVER_RESEARCH_EXACT.has(lower)
+            || NEVER_RESEARCH_PREFIXES.some(p => lower.startsWith(p))
+            || (wc <= 6 && !hasQ && !hasTemp)
+            || isShortCasual
         if (isNever) return 'direct'
+
 
         // Classifier round-trip — cache for 2 min so spam of "what's the weather"
         // doesn't burn 30 LLM calls in a fun channel
@@ -2849,31 +2936,37 @@ class AIChatManager {
         return chunks
     }
 
-    async secureReply(message, content, opts = {}) {
-        const validated = this.finalSecurityCheck(String(content || ''))
-        const hasContent = !!validated.trim()
-        const hasEmbeds = !!opts.embeds?.length
+        async secureReply(message, content, opts = {}) {
+            const validated = this.finalSecurityCheck(String(content || ''))
+            const hasContent = !!validated.trim()
+            const hasEmbeds = !!opts.embeds?.length
 
-        if (!hasContent && !hasEmbeds) return null
+            if (!hasContent && !hasEmbeds) return null
 
-        const safe = validated.length > 2000 ? validated.slice(0, 1997) + '...' : validated
-        const payload = { allowedMentions: { parse: ['users'], repliedUser: true }, ...opts }
-        if (hasContent) payload.content = safe
+            const safe = validated.length > 2000 ? validated.slice(0, 1997) + '...' : validated
+            const payload = { allowedMentions: { parse: ['users'], repliedUser: true }, ...opts }
+            if (hasContent) payload.content = safe;
 
-        if (/<@!?\d+>|<@&\d+>|@everyone|@here/.test(safe)) {
-            payload.flags = MessageFlags.SuppressNotifications
-        }
+            if (/<@!?\d+>|<@&\d+>|@everyone|@here/.test(safe)) {
+                payload.flags = MessageFlags.SuppressNotifications;
+            }
 
-        try {
-            return await message.reply(payload)
-        } catch {
-            try {
-                return await message.channel.send(payload)
-            } catch {
-                return null
+            // Try reply first (keeps the thread visual). Fall back to plain channel send on:
+            //   50035 MESSAGE_REFERENCE_UNKNOWN_MESSAGE — original was deleted (e.g. by purge)
+            //   10008 Unknown Message — same situation, different endpoint
+            try { return await message.reply(payload) }
+            catch (e) {
+                const code = e?.code
+                if (code === 10008 || code === 50035) {
+                    // Strip the reply-reference and send as a normal channel message
+                    const { message_reference, ...safePayload } = payload
+                    try { return await message.channel.send(safePayload) }
+                    catch { return null }
+                }
+                try { return await message.channel.send(payload) } catch { return null }
             }
         }
-    }
+
 
     // Cache keys are `${userId}_${guildId}` — scan and drop all guild buckets for one user
     _invalidateUserCache(userId) {
@@ -2888,6 +2981,17 @@ class AIChatManager {
         const cacheKey = `${userId}_${guildId}`
         const cached = this.userCache.get(cacheKey)
         if (cached !== undefined) return cached
+
+        // For 1–3 word greetings, build a minimal context. The full context (interests,
+        // relationships, passive buffer, emoji list) is wasted prefill on "hi" / "ty".
+        const msgText = (message?.content ?? '').trim()
+        if (msgText && msgText.split(/\s+/).length <= 3 && /^(hi|hey|hello|yo|sup|ty|thanks|bye|cya|gn|gm|ok|lol|lmao|💜|💚|·)\b/i.test(msgText)) {
+            const name = message.member?.displayName ?? message.author?.username ?? 'user'
+            const mini = `ACTIVE USER: ${name} (<@${message.author.id}>)
+TIME: ${new Date().toISOString().slice(0, 16)} UTC`
+            this.userCache.set(cacheKey, mini)
+            return mini
+        }
 
         const mem = this.getMem(message?.guild)
         // Load ghost list for this user in this guild so buildContext can filter channel context
@@ -2951,6 +3055,10 @@ class AIChatManager {
             }
         }
 
+        // Keep time at the END of the context block so the prefix stays stable between
+        // messages (lets NIM's KV-cache hit on the static parts of the system prompt).
+        // Move this push to right before `parts.filter(Boolean).join('')` below.
+        // (Already near the bottom — just flag: don't move it higher.)
         parts.push(`TIME: ${new Date().toISOString().replace('T', ' ').slice(0, 19)} UTC`)
 
         const upMs = Date.now() - (this.client.heart?.startTime || Date.now())
@@ -3126,14 +3234,17 @@ Answer concisely using the research.`
                 if (cached) return cached
             }
 
+            // Inject CAPABILITIES_NOTE only when the prompt plausibly needs a RUN_CMD.
+            // Skipping it on casual chat shaves ~1.5 KB of prefill → measurable TTFT drop.
+            const ACTION_RE = /\b(ban|kick|mute|unmute|warn|purge|clear|mpurge|fpurge|delete|remove|lock|unlock|role|nickname|rename|avatar|av|pfp|banner|bn|announce|poll|thread|pin|unpin|slowmode|topic|react|emoji|movevc|dm|show|fetch|pull up)\b/i
+            const needsCaps = ACTION_RE.test(prompt) || ACTION_RE.test(message?.content ?? '')
+
             const messages = []
             if (systemPrompt) {
-                messages.push({ role: 'system', content: systemPrompt + CAPABILITIES_NOTE })
+                messages.push({ role: 'system', content: needsCaps ? systemPrompt + CAPABILITIES_NOTE : systemPrompt })
             } else {
-                let base =
-                    this.getUserPrompt(userId) ||
-                    "You are Medusa, a vibrant AI assistant with personality. Respond as yourself in first person. Be expressive, use emojis occasionally. You're helpful but also playful, witty, and engaging."
-                base += CAPABILITIES_NOTE
+                let base = this.getUserPrompt(userId) || 'You are Medusa, a vibrant AI assistant with personality. Respond as yourself in first person. Be expressive, use emojis occasionally. You\'re helpful but also playful, witty, and engaging.'
+                if (needsCaps) base += CAPABILITIES_NOTE
                 if (userId) {
                     const ctx = await this.getUserContext(userId, message)
                     const convoCtx = history?.length
@@ -3164,13 +3275,24 @@ Answer concisely using the research.`
             messages.push(...historyToAdd)
             messages.push({ role: 'user', content: prompt.slice(0, 24000) })
 
+            // Streaming must NOT run when the response may contain <<RUN_CMD>> tags
+            // for destructive commands — those need to be intercepted, rewritten into
+            // a confirmation prompt, and stored in _pendingConfirms BEFORE the user
+            // sees anything. Streaming shows raw LLM output and breaks that flow.
+            const mayEmitCmd = /\b(ban|kick|mute|warn|mpurge|clear|purge|fpurge|delchan|announce|dm)\b/i.test(prompt || '')
+            // Scale token budget to prompt length. Short "hey" doesn't need 1200 tokens reserved.
+            // NIM's KV cache allocation respects max_completion_tokens on many deployments,
+            // so a lower value = faster first token and lower queue pressure under load.
+            const wordCount = (prompt || '').split(/\s+/).length
+            const adaptiveMax = wordCount < 8 ? 500 : wordCount < 30 ? 800 : this.chatTokens
             const streamingOn =
                 this._config?.streaming === true &&
                 !!message?.channel &&
                 !systemPrompt?.includes?.('[CONFIRMATION_REQUIRED]')
             const response = streamingOn
-                ? await this._streamChat(messages, this.aiModel, this.chatTokens, this.temperature, message)
-                : await this._groqCallWithFallbacks(messages, this.aiModel, this.chatTokens, this.temperature)
+                ? await this._streamChat(messages, this.aiModel, adaptiveMax, this.temperature, message)
+                : await this._groqCallWithFallbacks(messages, this.aiModel, adaptiveMax, this.temperature)
+
             if (!response) return null
             if (this._isDegenerate(response)) {
                 this.errorCount++
@@ -3326,10 +3448,14 @@ Answer concisely using the research.`
         if (content.toLowerCase().startsWith(PREFIX)) return { kind: 'ignore', reason: 'prefix_cmd' }
 
         const lower = content.toLowerCase()
-        const mentioned =
-            message.mentions.users.has(this.client.user.id) &&
-            !content.includes('@everyone') &&
-            !content.includes('@here')
+        const botMentionRx = new RegExp(`^<@!?${this.client.user.id}>\\s+`)
+        // True = user typed @Medusa as the first token, intentionally summoning her.
+        // Discord replies auto-prepend <@botId>, but in replies the reference.messageId is set,
+        // so we distinguish "explicit @ping at start" from "reply auto-ping" here.
+        const startsWithExplicitPing = botMentionRx.test(content) && !message.reference?.messageId
+        // Mid-sentence mentions or reply-auto-pings don't count as an intentional summon.
+        const mentioned = startsWithExplicitPing
+
         const isDM = message.channel.type === 1 && this.allowDM
         const inAlways = this.alwaysActiveCh.has(message.channel.id)
 
@@ -3348,16 +3474,19 @@ Answer concisely using the research.`
         const hasTrig = this._triggerRegexes.some((rx) => rx.test(lower))
 
         let trigger = false
+        // Always-active channels and DMs: mention/keyword/reply/conv all wake her.
+        // Regular channels: ONLY an explicit @Medusa at the start of the message.
+        // (No keyword match, no reply, no conv-continuation in regular channels.)
         if (isDM) trigger = hasTrig || mentioned || repliedToBot || inConv
         else if (inAlways && !repliedToOther) trigger = hasTrig || mentioned || repliedToBot || inConv
-        else if (mentioned || repliedToBot) trigger = true // explicit summons always win
+        else if (startsWithExplicitPing) trigger = true
 
         if (trigger) {
             this.activeConvs.set(convKey, Date.now())
             this.processedMsgIds.add(message.id)
             return {
                 kind: 'trigger',
-                reason: mentioned ? 'mention' : repliedToBot ? 'reply' : hasTrig ? 'keyword' : 'conv',
+                reason: mentioned ? 'mention' : hasTrig ? 'keyword' : repliedToBot ? 'reply' : 'conv',
             }
         }
         return { kind: 'passive', reason: 'no_summon' }
@@ -3459,13 +3588,24 @@ Answer concisely using the research.`
                 systemPrompt: proactiveSys,
             })
             if (!response) return
-            if (streamed) {
-                // Reply was already sent live; still run command parser so RUN_CMDs fire,
-                // and record to memory, but skip the chunk send loop below.
+            if (streamed) {111
+                // Reply was already sent live; still run command parser so RUN_CMDs fire.
+                // If the parser rewrote the response (e.g. into a ⚠️ Confirm prompt),
+                // we need to overwrite the streamed message with the rewritten text so
+                // the user sees the actual confirmation, not the raw LLM output.
                 let execResult = await this._executeParsedCommands(response, message)
+                const finalText = execResult.text || response
+                if (finalText !== response) {
+                    // Stream placeholder was the last bot message we sent — fetch and edit it
+                    try {
+                        const recent = await message.channel.messages.fetch({ limit: 5 })
+                        const ours = recent.find(m => m.author.id === this.client.user.id && m.reference?.messageId === message.id)
+                        if (ours) await ours.edit({ content: this.finalSecurityCheck(finalText).slice(0, 2000) }).catch(() => {})
+                    } catch {}
+                }
                 const mem = this.getMem(message.guild)
-                if (!response.startsWith('⚠️ Confirm'))
-                    mem.addConversation(userId, message.channel.id, finalContent, execResult.text || response)
+                if (!finalText.startsWith('⚠️ Confirm'))
+                    mem.addConversation(userId, message.channel.id, finalContent, finalText)
                 return
             }
 
@@ -3563,7 +3703,10 @@ Answer concisely using the research.`
         if (message.guild && this.allowedGuilds.size && !this.allowedGuilds.has(message.guild.id)) return
         if (this.shouldIgnore(message)) return
         if (this.triggeredMsgs.has(message.id)) return
-        if (!message.content) return
+        // Allow messages with no text if they carry images/attachments — vision pipeline needs them
+        const hasMedia = message.attachments?.size > 0 ||1
+                         message.embeds?.some(e => e.image?.url || e.thumbnail?.url || e.data?.type === 'gifv')
+        if (!message.content && !hasMedia) return
         if (message.guild) {
             const ownerScope = `${message.guild.id}:${OWNER_ID}`
             if (this.ghost.isGhosted(ownerScope, message.author.id)) return
@@ -3618,9 +3761,8 @@ Answer concisely using the research.`
             return
         }
 
-        const hasTrig = this._triggerRegexes.some((rx) => rx.test(lower))
-        const isMention = message.mentions.users.has(this.client.user.id)
-        const isAlways = this.alwaysActiveCh.has(message.channel.id)
+        // Prefix commands take precedence — "med, snaek" is a prefix attempt, not an AI trigger.
+        if (lower.startsWith(PREFIX)) return
 
         const replyResolved = await this._resolveReplyContext(message)
         const repliedTo = replyResolved?.ref?.author ?? null
@@ -3673,19 +3815,37 @@ Answer concisely using the research.`
 
         const isReplyToMe = repliedTo?.id === this.client.user.id
 
+        const _botMentionRx = new RegExp(`^<@!?${this.client.user.id}>\\s+`)
+        const startsWithExplicitPing = _botMentionRx.test(raw) && !message.reference?.messageId
+        const hasTrig = this._triggerRegexes.some((rx) => rx.test(lower))
+        const isMention = startsWithExplicitPing
+        const isAlways = this.alwaysActiveCh.has(message.channel.id)
+
         let trigger = false
         let prompt = raw
 
         if (isAlways && (isMention || isReplyToMe || hasTrig)) {
             trigger = true
-            if (replyCtx) prompt = `${replyCtx}\n\n${raw}`
-        } else if (raw.startsWith(mention) || raw.startsWith(mentionAlt)) {
-            const cleaned = raw.replace(new RegExp(`^<@!?${this.client.user.id}>\\s*`), '').trim()
+            if (replyCtx) prompt = `${replyCtx}
+
+${raw}`
+        } else if (isReplyToMe && hasMedia) {
+            // Regular channel reply-to-bot with image attached — treat as explicit "look at this"
+            trigger = true
+            prompt = replyCtx ? `${replyCtx}
+
+${raw || 'what do you see'}` : (raw || 'what do you see')
+        } else if (startsWithExplicitPing) {
+            // Regular channel: ONLY an explicit @Medusa at the start (not a reply-auto-ping)
+            const cleaned = raw.replace(_botMentionRx, '').trim()
             if (cleaned) {
                 trigger = true
-                prompt = replyCtx ? `${replyCtx}\n\n${cleaned}` : cleaned
+                prompt = replyCtx ? `${replyCtx}
+
+${cleaned}` : cleaned
             }
         }
+
 
         if (trigger) {
             const guildId = message.guild?.id ?? '0'
@@ -3976,7 +4136,7 @@ Answer concisely using the research.`
         // Cleanup old DB entries
         for (const mem of [this.globalMem, ...this.isolatedMems.values()]) {
             try {
-                mem.cleanupOld(90)
+                mem.cleanupOld(PERF.maintenance.retentionDays)
             } catch {}
         }
     }
@@ -4079,8 +4239,10 @@ export async function registerAI(client, db, config) {
     }
 
     const _passiveBuf = new Map()
-    const _PASSIVE_MAX = 25
+    const _PASSIVE_MAX = PERF.ai.passiveBufferMax
+    const _PASSIVE_CHANNELS_MAX = PERF.ai.passiveBufferChannelsMax
     globalThis._aiPassiveBuf = _passiveBuf
+
 
     const ai = new AIChatManager(client, db, config)
     client.aiCog = ai
@@ -4123,11 +4285,15 @@ export async function registerAI(client, db, config) {
         }
         let buf = _passiveBuf.get(msg.channel.id)
         if (!buf) {
+            if (_passiveBuf.size >= _PASSIVE_CHANNELS_MAX) {
+                const firstKey = _passiveBuf.keys().next().value
+                if (firstKey) _passiveBuf.delete(firstKey)
+            }
             buf = []
             _passiveBuf.set(msg.channel.id, buf)
         }
         buf.push(entry)
-        if (buf.length > _PASSIVE_MAX) buf.shift() // evict oldest
+        if (buf.length > _PASSIVE_MAX) buf.shift()
     })
 
     // Auto-extract server lore every 30 min, throttled to once per 2h per guild
