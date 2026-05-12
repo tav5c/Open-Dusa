@@ -1,6 +1,9 @@
 import { LRUCache } from 'lru-cache'
 import { monitorEventLoopDelay } from 'perf_hooks'
 import si from 'systeminformation'
+import { loadPerformance } from './performance.js'
+
+const PERF = loadPerformance()
 
 class GlobalRateLimiter {
     constructor() {
@@ -199,7 +202,7 @@ export class MedusaHeart {
                 this.loopHistogram.enable()
             }
             this.monitor.loopLag = this.loopHistogram.mean / 1e6
-            if (this.monitor.loopLag > 500) {
+            if (this.monitor.loopLag > PERF.maintenance.loopLagWarnMs) {
                 console.warn(
                     `[Heart] EVENT LOOP LAG: ${this.monitor.loopLag.toFixed(0)}ms — possible blocking operation`,
                 )
@@ -288,8 +291,19 @@ export class MedusaHeart {
             }),
         )
         process.on('uncaughtException', (e) => {
+            // Discord API errors bubble up as uncaughts from floating promises.
+            // Most are non-fatal (token expired, DM blocked, unknown message) — log and continue.
+            // Only bail on genuine runtime crashes.
+            const code = e?.code
+            const isDiscordSoft = code === 10008 || code === 10062 || code === 40060 ||
+                                  code === 50001 || code === 50013 || code === 50035 ||
+                                  code === 50007
+            if (isDiscordSoft) {
+                console.warn(`[Heart] Soft Discord error (${code}) — continuing`)
+                this._stats.errors++
+                return
+            }
             console.error('[Heart] FATAL Uncaught:', e)
-            // Allow async cleanup (DB flush, WAL checkpoint) before exit
             process.exitCode = 1
             setTimeout(() => process.exit(1), 2000).unref()
         })

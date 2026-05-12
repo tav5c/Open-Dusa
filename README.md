@@ -200,6 +200,65 @@ npm run dev      # development (auto-restart on file changes)
 
 ---
 
+## Performance Tuning
+
+Open-Dusa ships with safe defaults suitable for cheap shared hosts (256 MB RAM, shared CPU). If you're running on a VPS with more headroom, create a `performance.json` at the repo root to override any of these knobs.
+
+On first startup, if `performance.json` doesn't exist, the bot auto-creates it with defaults. Edit and restart to apply.
+
+```jsonc
+{
+  "sqlite": {
+    "cacheSizeKB": 20000,           // SQLite page cache (20 MB → raise to 100 MB on a VPS)
+    "mmapSizeBytes": 67108864,      // mmap I/O window (64 MB → 512 MB if you have RAM)
+    "journalSizeLimit": 4096000,    // WAL ceiling (4 MB) — rarely worth tuning
+    "walAutocheckpoint": 5000       // Checkpoint every N pages
+  },
+  "discord": {
+    "messageCache": 100,            // Messages cached per channel
+    "memberCacheMax": 200,          // Guild members cached per guild
+    "userCache": null,              // Set to a number (e.g. 5000) to cache more user objects
+    "messageSweepInterval": 300,    // seconds between sweeps
+    "messageSweepLifetime": 900     // seconds before a cached message is eligible for eviction
+  },
+  "ai": {
+    "responseCacheMax": 512,        // Entries in the LLM response cache
+    "responseCacheTTLSec": 300,
+    "responseCacheMaxMB": 20,       // Hard size ceiling for the response cache
+    "userCacheMax": 500,            // Per-user context cache (entries)
+    "userCacheTTLSec": 120,
+    "messageHistoryMax": 200,       // Active conversations retained in memory
+    "messageHistoryTTLMin": 30,
+    "repliedMsgCacheMax": 500,
+    "repliedMsgCacheTTLMin": 10,
+    "memoryDepth": 25,              // How many turns of history injected into prompts
+    "passiveBufferMax": 25,         // Recent messages per channel retained for room-awareness
+    "passiveBufferChannelsMax": 500 // Total channels tracked (prevents RAM bloat at scale)
+  },
+  "maintenance": {
+    "cleanupIntervalMin": 10,       // How often periodic cleanup runs
+    "retentionDays": 90,            // Keep conversation history this long in SQLite
+    "vacuumEveryDays": 7,           // VACUUM gate — weekly by default (expensive op)
+    "loopLagWarnMs": 500            // Warn when Node event loop lag exceeds this
+  }
+}
+
+{
+  "sqlite":      { "cacheSizeKB": 100000, "mmapSizeBytes": 536870912 },
+  "discord":     { "messageCache": 500, "memberCacheMax": 2000, "userCache": 5000, "messageSweepLifetime": 1800 },
+  "ai":          { "responseCacheMax": 4096, "responseCacheTTLSec": 600, "responseCacheMaxMB": 100,
+                   "userCacheMax": 5000, "userCacheTTLSec": 300,
+                   "messageHistoryMax": 1000, "messageHistoryTTLMin": 120,
+                   "repliedMsgCacheMax": 2000, "repliedMsgCacheTTLMin": 30,
+                   "memoryDepth": 50, "passiveBufferMax": 50, "passiveBufferChannelsMax": 1500 },
+  "maintenance": { "cleanupIntervalMin": 30, "retentionDays": 180, "loopLagWarnMs": 200 }
+}
+
+npm run start:beefy    # 3 GB heap, 16 UV threads — good for 2-4 GB VPS
+npm run start:max      # 6 GB heap, 24 UV threads — 8 GB+ hosts
+
+---
+
 ## Slash Commands
 
 | Command                        | Description                                                      | Who                     |
