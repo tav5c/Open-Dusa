@@ -2155,8 +2155,6 @@ class AIChatManager {
             'pm',
             'snake',
             'userinfo',
-            'ban',
-            'kick',
             'eval',
             'exec',
             'shell',
@@ -2166,6 +2164,7 @@ class AIChatManager {
             'require',
             'import',
         ])
+
         const MOD_CMDS = new Set([
             'ban',
             'kick',
