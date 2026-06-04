@@ -27,13 +27,6 @@ import { resolveTarget } from './extensions/utils.js'
 
 const PERF = loadPerformance()
 
-// Owner permission
-const _isOwner = (id) => {
-    const appOwner = client.application?.owner
-    const ownerId = appOwner?.ownerId || appOwner?.id || config.owner_id
-    return String(id) === String(ownerId)
-}
-
 setGlobalDispatcher(_undiciAgent)
 process.setMaxListeners(30)
 global.backendErrors = 0
@@ -153,7 +146,9 @@ try {
     db.pragma('synchronous = NORMAL')
     db.pragma('temp_store = MEMORY')
     db.pragma(`journal_size_limit = ${PERF.sqlite.journalSizeLimit}`)
-    try { db.pragma(`mmap_size = ${PERF.sqlite.mmapSizeBytes}`) } catch (e) {}
+    try {
+        db.pragma(`mmap_size = ${PERF.sqlite.mmapSizeBytes}`)
+    } catch (e) {}
     db.pragma(`cache_size = -${PERF.sqlite.cacheSizeKB}`)
     db.pragma(`wal_autocheckpoint = ${PERF.sqlite.walAutocheckpoint}`)
 
@@ -234,13 +229,16 @@ const client = new Client({
         MessageManager: PERF.discord.messageCache,
         GuildMemberManager: {
             maxSize: PERF.discord.memberCacheMax,
-            keepOverLimit: m => m.id === client.user?.id,
+            keepOverLimit: (m) => m.id === client.user?.id,
         },
         ...(PERF.discord.userCache ? { UserManager: PERF.discord.userCache } : {}),
     }),
     sweepers: {
         ...Options.DefaultSweeperSettings,
-        messages:     { interval: PERF.discord.messageSweepInterval, lifetime: PERF.discord.messageSweepLifetime },
+        messages: {
+            interval: PERF.discord.messageSweepInterval,
+            lifetime: PERF.discord.messageSweepLifetime,
+        },
         guildMembers: { interval: 600, filter: () => (m) => !m.voice?.channelId && m.id !== client.user?.id },
         users: { interval: 1800, filter: () => (u) => u.id !== client.user?.id },
         threads: { interval: 600, lifetime: 1800 },
@@ -264,10 +262,10 @@ client.extensions = new Collection()
 const { registerAfk } = await import('./extensions/afk.js')
 const { registerAutomod } = await import('./extensions/automod.js')
 const { registerModeration } = await import('./extensions/moderation.js')
-registerAfk(client)
+client.afk = registerAfk(client)
 const automod = registerAutomod(client, db, heart)
 client.automod = automod
-registerModeration(client, db, { ...config, memeGuildId: null })
+client.moderation = registerModeration(client, db, { ...config, memeGuildId: null })
 console.log('[System] Loaded core: afk, automod, moderation')
 
 // Dynamic loader for contributed extensions (manifest-based — see Part 7)
@@ -635,8 +633,16 @@ async function cmdMenu(ctx) {
 // Slash command definitions
 const SLASH_CMDS = [
     // User-installable + DM-capable utility commands
-    new SlashCommandBuilder().setName('ping').setDescription('Check latency').setIntegrationTypes(0, 1).setContexts(0, 1, 2),
-    new SlashCommandBuilder().setName('stats').setDescription('Live performance stats').setIntegrationTypes(0, 1).setContexts(0, 1, 2),
+    new SlashCommandBuilder()
+        .setName('ping')
+        .setDescription('Check latency')
+        .setIntegrationTypes(0, 1)
+        .setContexts(0, 1, 2),
+    new SlashCommandBuilder()
+        .setName('stats')
+        .setDescription('Live performance stats')
+        .setIntegrationTypes(0, 1)
+        .setContexts(0, 1, 2),
     new SlashCommandBuilder()
         .setName('userinfo')
         .setDescription('User information')
@@ -800,9 +806,10 @@ for (const [name, ext] of client.extensions) {
                 console.log(`[System] Registered ${extCmds.length} slash command(s) from ${name}`)
             }
         }
-    } catch (e) { console.warn(`[System] Could not load slash commands from ${name}:`, e.message) }
+    } catch (e) {
+        console.warn(`[System] Could not load slash commands from ${name}:`, e.message)
+    }
 }
-
 
 addCmd('av', (msg, args) => cmdAv(msg, args))
 addCmd('bn', (msg, args) => cmdBn(msg, args))
@@ -1003,13 +1010,7 @@ client.once('clientReady', async () => {
     } catch (e) {
         console.error('[System] Failed to fetch application info:', e)
     }
-    console.clear()
     const allCmds = [...SLASH_CMDS, ...buildAISlashCommands()]
-
-    // Dynamically inject Slash Commands from Extensions
-    for (const ext of client.extensions.values()) {
-        if (ext.getSlashCommands) allCmds.push(...ext.getSlashCommands())
-    }
 
     const { createHash } = await import('crypto')
     const currentHash = createHash('md5').update(JSON.stringify(allCmds)).digest('hex')
@@ -1039,7 +1040,7 @@ client.once('clientReady', async () => {
     }
 
     await client.user.setPresence({
-        activities: [{ name: 'Meduda 🪼', type: ActivityType.Watching }],
+        activities: [{ name: 'Medusa 🪼', type: ActivityType.Watching }],
         status: 'online',
     })
 
@@ -1067,36 +1068,29 @@ client.once('clientReady', async () => {
 })
 
 // interactionCreate
-client.on('interactionCreate', async interaction => {
+client.on('interactionCreate', async (interaction) => {
     // Let dynamic extensions handle buttons / commands they own
     for (const ext of client.extensions.values()) {
         if (ext.handleInteraction) {
             try {
                 const handled = await ext.handleInteraction(interaction)
                 if (handled === true) return
-            } catch (e) { console.error('[Ext handleInteraction]', e) }
+            } catch (e) {
+                console.error('[Ext handleInteraction]', e)
+            }
         }
     }
 
     if (!interaction.isChatInputCommand()) return
 
     // Let core extensions claim the interaction first
-    if (client.automod && await client.automod.handleInteraction(interaction)) return
-
+    if (client.automod && (await client.automod.handleInteraction(interaction))) return
+    if (client.moderation && (await client.moderation.handleInteraction(interaction))) return
 
     const { commandName } = interaction
     const uid = BigInt(interaction.user.id)
-    const _perm = interaction.memberPermissions
 
     if (client.COMMANDS_BLOCKED && uid !== BOT_OWNER_ID) return
-
-    // Dynamic Extension Interaction Handlers
-    for (const ext of client.extensions.values()) {
-        if (ext.handleInteraction) {
-            const handled = await ext.handleInteraction(interaction)
-            if (handled === true) return
-        }
-    }
 
     // Core commands
     if (commandName === 'ping') return cmdPing(interaction)
@@ -1129,6 +1123,18 @@ client.on('messageCreate', async (message) => {
             await client.automod?.runAutomod(message)
         } catch (e) {
             console.error('[Automod]', e)
+        }
+
+        // Core extension message handlers (afk auto-unafk + mention notices; moderation keyword triggers)
+        try {
+            await client.afk?.handleMessage(message)
+        } catch (e) {
+            console.error('[AFK]', e)
+        }
+        try {
+            if (await client.moderation?.handleMessage(message)) return
+        } catch (e) {
+            console.error('[Moderation]', e)
         }
 
         // Dynamic Extension Message Handlers

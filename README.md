@@ -7,7 +7,7 @@
 
 **The Agentic AI Resident for Discord**
 
-[![Node.js](https://img.shields.io/badge/Node.js-18+-success?logo=node.js&logoColor=white)](#)
+[![Node.js](https://img.shields.io/badge/Node.js-20+-success?logo=node.js&logoColor=white)](#)
 [![Discord.js](https://img.shields.io/badge/discord.js-v14-5865F2?logo=discord&logoColor=white)](#)
 [![SQLite](https://img.shields.io/badge/SQLite-WAL-lightgrey?logo=sqlite&logoColor=white)](#)
 [![License](https://img.shields.io/badge/License-MIT-green)](#)

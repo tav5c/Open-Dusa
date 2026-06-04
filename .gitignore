@@ -24,4 +24,4 @@ extensions/private.js
 extensions/timezone.js
 priv.json
 timezones.json
-performance.json
+performance.json*.zip
