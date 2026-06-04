@@ -1098,15 +1098,45 @@ client.on('interactionCreate', async (interaction) => {
     if (commandName === 'menu') return cmdMenu(interaction)
     if (commandName === 'guild') return cmdGuild(interaction)
     if (commandName === 'userinfo')
-        return cmdUserinfo(interaction, interaction.options.getMember('member') ?? interaction.member)
+        return cmdUserinfo(
+            interaction,
+            interaction.options.getMember('member') ??
+                interaction.options.getUser('member') ??
+                interaction.member ??
+                interaction.user,
+        )
     if (commandName === 'av')
-        return cmdAv(interaction, interaction.options.getMember('member') ?? interaction.member)
+        return cmdAv(
+            interaction,
+            interaction.options.getMember('member') ??
+                interaction.options.getUser('member') ??
+                interaction.member ??
+                interaction.user,
+        )
     if (commandName === 'mav')
-        return cmdMav(interaction, interaction.options.getMember('member') ?? interaction.member)
+        return cmdMav(
+            interaction,
+            interaction.options.getMember('member') ??
+                interaction.options.getUser('member') ??
+                interaction.member ??
+                interaction.user,
+        )
     if (commandName === 'bn')
-        return cmdBn(interaction, interaction.options.getMember('member') ?? interaction.member)
+        return cmdBn(
+            interaction,
+            interaction.options.getMember('member') ??
+                interaction.options.getUser('member') ??
+                interaction.member ??
+                interaction.user,
+        )
     if (commandName === 'mbn')
-        return cmdMbn(interaction, interaction.options.getMember('member') ?? interaction.member)
+        return cmdMbn(
+            interaction,
+            interaction.options.getMember('member') ??
+                interaction.options.getUser('member') ??
+                interaction.member ??
+                interaction.user,
+        )
     if (commandName === 'embed') return cmdEmbed(interaction)
 })
 

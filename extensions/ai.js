@@ -336,11 +336,11 @@ const DANGEROUS_TERMS = new Set([
 const CAPABILITIES_NOTE =
     `\n\n[AGENT CAPABILITIES & STRICT BEHAVIOR]\n` +
     `• FIRM RULE: DO NOT emit a <<RUN_CMD>> tag unprompted! Only emit a tag if the user EXPLICITLY asks for an action that matches one of the commands below. For casual chat, reply in plain text ONLY.\n` +
-    `• PERSISTENCE: If the user DOES ask for a command below, you MUST execute the matching <<RUN_CMD>> tag. NEVER say "I already did that" as an excuse to skip it.\n` +
+    `• PERSISTENCE: If the user DOES ask for a command below, you MUST execute the matching <<RUN_CMD>> tag. NEVER say "I already did that" as an excuse to skip it. And NEVER announce that an action already succeeded (e.g. "Muted X", "Banned them") in your own words — each command posts its own confirmation embed; just say you're doing it, then append the tag.\n` +
     `• NO INVENTING: You may ONLY use the exact commands listed below. NEVER invent, guess, or approximate command names.\n` +
     `• AGENT POWERS (use ONLY when requested!):\n` +
     `   - Fetch Avatars/Banners: <<RUN_CMD: av 123456789>> | <<RUN_CMD: mav 123456789>> | <<RUN_CMD: bn 123456789>> | <<RUN_CMD: mbn 123456789>>\n` +
-    `   - Moderation (Include duration): <<RUN_CMD: mute 123456789 1h reason>> | <<RUN_CMD: warn 123456789 reason>> | <<RUN_CMD: clearwarns 123456789>>\n` +
+    `   - Moderation (use the target's <@id> mention or numeric ID — NEVER a username or "him/her/them" — and include the duration): <<RUN_CMD: mute 123456789 1h reason>> | <<RUN_CMD: warn 123456789 reason>> | <<RUN_CMD: clearwarns 123456789>>\n` +
     `   - Delete Messages: <<RUN_CMD: mpurge 123456789>> | <<RUN_CMD: clear 10>>\n` +
     `   - Manage Server: <<RUN_CMD: createchan text channel-name>> | <<RUN_CMD: delchan 123456789>> | <<RUN_CMD: lockchannel>> | <<RUN_CMD: unlockchannel>> | <<RUN_CMD: auditlogs>>\n` +
     `   - Roles: <<RUN_CMD: addrole 123456789 987654321>> | <<RUN_CMD: removerole 123456789 987654321>> | <<RUN_CMD: listroles>>\n` +
@@ -2104,6 +2104,12 @@ class AIChatManager {
 
         const textContext = parts.join('\n')
 
+        if (this._config?.debug === true) {
+            console.log(
+                `[AI][replyctx] embeds=${ref.embeds?.length ?? 0} attachments=${ref.attachments?.size ?? 0} textLen=${textContext.length} preview=${JSON.stringify(textContext.slice(0, 200))}`,
+            )
+        }
+
         // Check if the replied message has an image (for vision routing)
         const imgData = this._getImageFromMessage(ref)
 
@@ -2323,14 +2329,14 @@ class AIChatManager {
 
                     if (!hasPerm) {
                         console.warn(`[AI] Blocked unpermitted RUN_CMD '${cmdName}' by ${message.author.id}`)
-                        executionLogs.push(`🛑 Unauthorized execution attempt intercepted.`)
+                        finalResponse = `🔑 You don't have permission to \`${cmdName}\`.`
                         continue
                     }
                     if (!botHasPerm) {
                         console.warn(
                             `[AI] Blocked RUN_CMD '${cmdName}': Bot lacks permission ${requiredPerm}`,
                         )
-                        executionLogs.push(`🛑 I don't have permission to do that.`)
+                        finalResponse = `🛑 I don't have permission to \`${cmdName}\` here.`
                         continue
                     }
                 }
@@ -2408,14 +2414,14 @@ class AIChatManager {
                         console.warn(
                             `[AI] Blocked hallucinated ${cmdName} — arg '${rawArg}' is not a user ID`,
                         )
-                        finalResponse = finalResponse.replace(/<<\s*RUN_CMD:[\s\S]*?>>/g, '').trim()
+                        finalResponse = `❌ I couldn't \`${cmdName}\` them — give me a real @mention or numeric user ID (not a name or "him/her/them"), then I'll do it.`
                         continue
                     }
                     if (needsInt && !/^\d{1,3}$/.test(rawArg)) {
                         console.warn(
                             `[AI] Blocked hallucinated ${cmdName} — arg '${rawArg}' is not a valid count`,
                         )
-                        finalResponse = finalResponse.replace(/<<\s*RUN_CMD:[\s\S]*?>>/g, '').trim()
+                        finalResponse = `❌ I couldn't \`${cmdName}\` — that wasn't a valid number of messages.`
                         continue
                     }
                     const targetArg = rawArg.toLowerCase() || 'none'
@@ -3587,10 +3593,11 @@ Answer concisely using the research.`
 
         const lower = content.toLowerCase()
         const botMentionRx = new RegExp(`^<@!?${this.client.user.id}>\\s+`)
-        // True = user typed @Medusa as the first token, intentionally summoning her.
-        // Discord replies auto-prepend <@botId>, but in replies the reference.messageId is set,
-        // so we distinguish "explicit @ping at start" from "reply auto-ping" here.
-        const startsWithExplicitPing = botMentionRx.test(content) && !message.reference?.messageId
+        // True = user typed @Medusa as the first token of the message, intentionally summoning her.
+        // This holds even when the message is ALSO a reply: Discord does NOT inject the reply
+        // auto-ping into message.content, so a typed @ping at the start is always a real summon
+        // (a bare reply with no typed mention won't match and stays silent in non-active channels).
+        const startsWithExplicitPing = botMentionRx.test(content)
         // Mid-sentence mentions or reply-auto-pings don't count as an intentional summon.
         const mentioned = startsWithExplicitPing
 
@@ -3961,7 +3968,9 @@ Answer concisely using the research.`
         const isReplyToMe = repliedTo?.id === this.client.user.id
 
         const _botMentionRx = new RegExp(`^<@!?${this.client.user.id}>\\s+`)
-        const startsWithExplicitPing = _botMentionRx.test(raw) && !isReplyToMe
+        // A typed @ping at the start counts as a summon even if the message is also a reply to her.
+        // (Discord doesn't put the reply auto-ping into raw content, so a bare reply still won't match.)
+        const startsWithExplicitPing = _botMentionRx.test(raw)
         const hasTrig = this._triggerRegexes.some((rx) => rx.test(lower))
         const isMention = startsWithExplicitPing
         const isAlways = this.alwaysActiveCh.has(message.channel.id)
