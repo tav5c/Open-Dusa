@@ -951,10 +951,12 @@ class AIMemoryManager {
         const gapMs = PERF.maintenance.vacuumEveryDays * 86400_000
         this._lastVacuum ??= 0
         if (now - this._lastVacuum > gapMs) {
-            try { this.db.prepare('VACUUM').run(); this._lastVacuum = now } catch {}
+            try {
+                this.db.prepare('VACUUM').run()
+                this._lastVacuum = now
+            } catch {}
         }
     }
-
 
     // Server lore
     addLore(fact, source = 'manual') {
@@ -1120,7 +1122,9 @@ class AIChatManager {
         const _sp = config.systemPrompt
         this.instructions = Array.isArray(_sp)
             ? _sp.join(String.fromCharCode(10))
-            : (typeof _sp === 'string' && _sp.trim() ? _sp : 'You are Medusa, a warm and witty Discord AI resident. Respond in first person.')
+            : typeof _sp === 'string' && _sp.trim()
+              ? _sp
+              : 'You are Medusa, a warm and witty Discord AI resident. Respond in first person.'
         this.maxHistory = config.memoryDepth ?? PERF.ai.memoryDepth
         this.allowDM = config.allowDMs ?? false
         this.FunMsgInterval = (config.FunMsgInterval ?? 5400) * 1000
@@ -1186,7 +1190,10 @@ class AIChatManager {
 
         // Runtime state
         this.messageHistory = new LRUCache({ max: P.messageHistoryMax, ttl: P.messageHistoryTTLMin * 60_000 })
-        this.repliedMsgCache = new LRUCache({ max: P.repliedMsgCacheMax, ttl: P.repliedMsgCacheTTLMin * 60_000 })
+        this.repliedMsgCache = new LRUCache({
+            max: P.repliedMsgCacheMax,
+            ttl: P.repliedMsgCacheTTLMin * 60_000,
+        })
         this.activeConvs = new Map()
         this.processedMsgIds = makeIdSet(2500, 30 * 60_000)
         this.triggeredMsgs = makeIdSet(1000, 15 * 60_000)
@@ -1382,7 +1389,7 @@ class AIChatManager {
      * or all of them are either circuit-open or exhausted. Capacity/503 errors don't count
      * against a provider as long as its other keys still respond.
      */
-    async _routedCall(messages, maxTokens, temp) {
+    async _routedCall(messages, maxTokens, temp, topP) {
         if (!this._providers) this._initProviders()
         const now = Date.now()
         for (const p of this._providers) {
@@ -1390,7 +1397,7 @@ class AIChatManager {
             if (now < p.state.openUntil) continue // breaker open
             try {
                 const payload = {
-                    ...this._buildPayload(p.model ?? this.aiModel, messages, maxTokens, temp),
+                    ...this._buildPayload(p.model ?? this.aiModel, messages, maxTokens, temp, topP),
                     stream: false,
                 }
                 const r = await p.client.chat.completions.create(payload)
@@ -1496,7 +1503,7 @@ class AIChatManager {
             const n = this.aiTokens.length
             if (!n) return false
             const old = this.currentKeyIdx
-            this._keyCooldowns ??= new Map()   // keyIdx -> timestamp when it becomes usable again
+            this._keyCooldowns ??= new Map() // keyIdx -> timestamp when it becomes usable again
 
             if (this._isDeadKeyError(errorMsg)) {
                 this.deadKeys.add(old)
@@ -1532,7 +1539,7 @@ class AIChatManager {
                 const waitMs = Math.max(0, Math.min(...aliveCooldowns) - Date.now())
                 if (waitMs > 0 && waitMs < 60_000) {
                     console.log(`[AI] All keys cooling down — waiting ${(waitMs / 1000).toFixed(1)}s`)
-                    await new Promise(r => setTimeout(r, waitMs + 100))
+                    await new Promise((r) => setTimeout(r, waitMs + 100))
                     // Retry once
                     for (let step = 0; step < n; step++) {
                         const next = (old + step) % n
@@ -1540,12 +1547,17 @@ class AIChatManager {
                         if ((this._keyCooldowns.get(next) ?? 0) > Date.now()) continue
                         this.currentKeyIdx = next
                         this._initGroq()
-                        if (this._groq) { console.log(`[AI] Key recovered after cooldown: key ${next + 1}`); return true }
+                        if (this._groq) {
+                            console.log(`[AI] Key recovered after cooldown: key ${next + 1}`)
+                            return true
+                        }
                     }
                 }
             }
 
-            console.warn(`[AI] All keys exhausted (${this.deadKeys.size} dead, ${this._keyCooldowns.size} cooling)`)
+            console.warn(
+                `[AI] All keys exhausted (${this.deadKeys.size} dead, ${this._keyCooldowns.size} cooling)`,
+            )
             return false
         })()
 
@@ -1663,12 +1675,12 @@ class AIChatManager {
         return AIChatManager.PROVIDERS.find((p) => p.match(url, model))
     }
 
-    _buildPayload(model, messages, maxTokens, temp) {
+    _buildPayload(model, messages, maxTokens, temp, topP) {
         let payload = {
             model,
             messages,
             temperature: temp ?? this.temperature,
-            top_p: this.topP,
+            top_p: topP ?? this.topP,
         }
         const provider = this._detectProvider(model)
         payload = provider.paramMap(payload, maxTokens ?? this.chatTokens)
@@ -1688,10 +1700,10 @@ class AIChatManager {
         return payload
     }
 
-    async _groqCall(messages, model, maxTokens, temp) {
+    async _groqCall(messages, model, maxTokens, temp, topP) {
         if (!this._groq) return null
 
-        const payload = this._buildPayload(model, messages, maxTokens, temp)
+        const payload = this._buildPayload(model, messages, maxTokens, temp, topP)
         try {
             const r = await this._groq.chat.completions.create(payload)
             this.keyFailures[this.currentKeyIdx] = 0
@@ -1759,14 +1771,14 @@ class AIChatManager {
         }
     }
 
-    async _groqCallWithFallbacks(messages, model, maxTokens = 2500, temp = this.temperature) {
+    async _groqCallWithFallbacks(messages, model, maxTokens = 2500, temp = this.temperature, topP) {
         // Prefer the multi-provider router when configured. Falls back to
         // single-provider with capacity-model fallbacks on total router miss.
         if (this._providers?.length > 1) {
-            const routed = await this._routedCall(messages, maxTokens, temp)
+            const routed = await this._routedCall(messages, maxTokens, temp, topP)
             if (routed) return routed
         }
-        const result = await this._groqCall(messages, model, maxTokens, temp)
+        const result = await this._groqCall(messages, model, maxTokens, temp, topP)
         if (result && !result.capacityError) return result
         for (const fb of this.capacityFallbacks) {
             if (fb === model) continue
@@ -1776,17 +1788,31 @@ class AIChatManager {
                     messages,
                     max_completion_tokens: maxTokens,
                     temperature: temp,
-                    top_p: 1,
+                    top_p: topP ?? 1,
                 })
                 return r.choices[0].message.content
             } catch (e) {
-                if (!this._isCapacityError(String(e))) continue
+                // Capacity error -> try the next fallback model; any other error -> stop.
+                if (this._isCapacityError(String(e))) continue
+                break
             }
         }
         return null
     }
 
     // Research pipeline
+    // Detect Groq's 400 tool_use_failed ("Failed to call a function") so we can retry without tools.
+    _isToolCallError(err) {
+        if (err?.status !== 400 && err?.statusCode !== 400) return false
+        const s = `${err?.code ?? ''} ${err?.message ?? ''} ${err?.error?.message ?? ''}`.toLowerCase()
+        return (
+            s.includes('tool_use_failed') ||
+            s.includes('failed_generation') ||
+            s.includes('failed to call a function') ||
+            (s.includes('function') && s.includes('adjust your prompt'))
+        )
+    }
+
     async _callResearch(prompt) {
         if (!this._researchClient) return null
 
@@ -1820,97 +1846,131 @@ class AIChatManager {
             { role: 'user', content: prompt.slice(0, 800) },
         ]
 
+        const hasSearch = !!(serperKey || tavilyKey)
         try {
-            const r1 = await this._researchClient.chat.completions.create({
-                model: this.researchModel,
-                messages,
-                tools: serperKey || tavilyKey ? [searchTool] : undefined,
-                tool_choice: serperKey || tavilyKey ? 'auto' : undefined,
-                max_completion_tokens: this.searchTokens,
-                temperature: this.researchTemp,
-                top_p: this.topP,
-            })
+            // Bounded tool-calling loop. Tools stay attached on every round so tool_choice is
+            // never implicitly "none" while the model might still emit a call — that mismatch is
+            // exactly what triggers the provider's 400 tool_use_failed (Tool choice is none, but
+            // model called a tool). The round cap prevents runaway search loops.
+            const MAX_ROUNDS = 4
+            const convo = [...messages]
+            for (let round = 0; round < MAX_ROUNDS; round++) {
+                // Lower temp on tool rounds — high temp is the main cause of malformed tool-call JSON.
+                const toolRoundTemp = Math.min(this.researchTemp, 0.3)
+                const runRound = (useTools) =>
+                    this._researchClient.chat.completions.create({
+                        model: this.researchModel,
+                        messages: convo,
+                        tools: useTools ? [searchTool] : undefined,
+                        tool_choice: useTools ? 'auto' : undefined,
+                        max_completion_tokens: this.searchTokens,
+                        temperature: useTools ? toolRoundTemp : this.researchTemp,
+                        top_p: this.topP,
+                    })
+                let r
+                try {
+                    r = await runRound(hasSearch)
+                } catch (err) {
+                    // Groq 400 tool_use_failed: the model emitted a malformed tool call. Retry this
+                    // round WITHOUT tools so the research model still answers from context gathered
+                    // so far, instead of crashing out to the primary (search-less) fallback.
+                    if (hasSearch && this._isToolCallError(err)) {
+                        r = await runRound(false)
+                    } else {
+                        throw err
+                    }
+                }
 
-            const msg = r1.choices[0].message
+                const msg = r.choices?.[0]?.message
+                if (!msg) return null
 
-            if (!msg.tool_calls?.length) {
-                return msg.content ?? null
-            }
+                // No tool call means this is the final synthesized answer.
+                if (!msg.tool_calls?.length) {
+                    return msg.content ?? null
+                }
 
-            // Execute all tool calls NVIDIA requested
-            const toolResults = await Promise.all(
-                msg.tool_calls.map(async (tc) => {
-                    let result = 'No results found.'
-                    try {
-                        const args = JSON.parse(tc.function.arguments)
-                        const query = args.query
+                // Record the assistant turn that requested the tool calls.
+                convo.push({ role: 'assistant', content: msg.content ?? '', tool_calls: msg.tool_calls })
 
-                        if (serperKey) {
-                            const res = await fetch('https://google.serper.dev/search', {
-                                method: 'POST',
-                                headers: { 'X-API-KEY': serperKey, 'Content-Type': 'application/json' },
-                                body: JSON.stringify({ q: query, num: 5 }),
-                                signal: AbortSignal.timeout(8000),
-                            })
-                            const data = await res.json()
-                            const organic = data.organic ?? []
-                            const snippets = organic
-                                .map((r, i) => `[${i + 1}] ${r.title}\n${r.snippet}\nURL: ${r.link}`)
-                                .join('\n\n')
-                            const answer = data.answerBox?.answer ?? data.answerBox?.snippet ?? ''
-                            result = answer
-                                ? `Quick answer: ${answer}\n\n${snippets}`
-                                : snippets || 'No results.'
-                        } else if (this._tavily) {
-                            // Tavily JS SDK: tavily({apiKey}).search(query, { maxResults, searchDepth, includeAnswer })
-                            // https://docs.tavily.com/sdk/javascript/reference
-                            const tr = await this._tavily.search(query, {
-                                maxResults: 5,
-                                searchDepth: 'basic',
-                                includeAnswer: true,
-                            })
-                            const snippets = (tr.results ?? [])
-                                .map(
-                                    (r, i) => `[${i + 1}] ${r.title}
+                // Execute every tool call the model requested.
+                const toolResults = await Promise.all(
+                    msg.tool_calls.map(async (tc) => {
+                        let result = 'No results found.'
+                        try {
+                            const args = JSON.parse(tc.function.arguments)
+                            const query = args.query
+
+                            if (serperKey) {
+                                const res = await fetch('https://google.serper.dev/search', {
+                                    method: 'POST',
+                                    headers: { 'X-API-KEY': serperKey, 'Content-Type': 'application/json' },
+                                    body: JSON.stringify({ q: query, num: 5 }),
+                                    signal: AbortSignal.timeout(8000),
+                                })
+                                const data = await res.json()
+                                const organic = data.organic ?? []
+                                const snippets = organic
+                                    .map((r, i) => `[${i + 1}] ${r.title}\n${r.snippet}\nURL: ${r.link}`)
+                                    .join('\n\n')
+                                const answer = data.answerBox?.answer ?? data.answerBox?.snippet ?? ''
+                                result = answer
+                                    ? `Quick answer: ${answer}\n\n${snippets}`
+                                    : snippets || 'No results.'
+                            } else if (this._tavily) {
+                                // Tavily JS SDK: tavily({apiKey}).search(query, { maxResults, searchDepth, includeAnswer })
+                                // https://docs.tavily.com/sdk/javascript/reference
+                                const tr = await this._tavily.search(query, {
+                                    maxResults: 5,
+                                    searchDepth: 'basic',
+                                    includeAnswer: true,
+                                })
+                                const snippets = (tr.results ?? [])
+                                    .map(
+                                        (r, i) => `[${i + 1}] ${r.title}
                             ${(r.content ?? '').slice(0, 400)}
                             URL: ${r.url}`,
-                                )
-                                .join('')
-                            result = tr.answer
-                                ? `Quick answer: ${tr.answer}
+                                    )
+                                    .join('')
+                                result = tr.answer
+                                    ? `Quick answer: ${tr.answer}
                             ${snippets}`
-                                : snippets
-                        } else {
-                            // No search provider configured — tell the model to answer from knowledge
-                            result =
-                                'No external search tool available. Answer using only your training data and be honest about uncertainty.'
+                                    : snippets
+                            } else {
+                                // No search provider configured — tell the model to answer from knowledge
+                                result =
+                                    'No external search tool available. Answer using only your training data and be honest about uncertainty.'
+                            }
+                        } catch (e) {
+                            result = `Search failed: ${String(e).slice(0, 100)}`
                         }
-                    } catch (e) {
-                        result = `Search failed: ${String(e).slice(0, 100)}`
-                    }
 
-                    return {
-                        role: 'tool',
-                        tool_call_id: tc.id,
-                        content: result,
-                    }
-                }),
-            )
+                        return {
+                            role: 'tool',
+                            tool_call_id: tc.id,
+                            content: result,
+                        }
+                    }),
+                )
 
-            // Round 2 — feed search results back, get final answer
-            const r2 = await this._researchClient.chat.completions.create({
+                // Feed results back; the loop decides whether to search again or synthesize.
+                convo.push(...toolResults)
+            }
+
+            // Round cap reached without a plain-text answer — force one final synthesis pass.
+            const fin = await this._researchClient.chat.completions.create({
                 model: this.researchModel,
                 messages: [
-                    ...messages,
-                    { role: 'assistant', content: msg.content ?? '', tool_calls: msg.tool_calls },
-                    ...toolResults,
+                    ...convo,
+                    {
+                        role: 'system',
+                        content: 'Stop searching. Answer now using the information gathered above.',
+                    },
                 ],
                 max_completion_tokens: this.searchTokens,
                 temperature: this.researchTemp,
                 top_p: this.topP,
             })
-
-            return r2.choices[0]?.message?.content ?? null
+            return fin.choices?.[0]?.message?.content ?? null
         } catch (e) {
             console.error('[AI] _callResearch failed:', String(e).slice(0, 300))
             // Last-ditch: ask the primary chat client to answer from its own knowledge
@@ -2020,14 +2080,22 @@ class AIChatManager {
             if (!isImg) parts.push(`[Attachment: ${att.name} — ${att.url}]`)
         }
 
-        // Embeds: links, rich embeds, articles
+        // Embeds: links, rich embeds, articles — incl. fields/footer/provider where bots (Last.fm, "now playing", etc.) put the real payload
         for (const embed of ref.embeds) {
-            if (embed.data.type === 'gifv' || embed.data.type === 'image') continue // handled by vision
+            const etype = embed.data?.type
+            if (etype === 'gifv' || etype === 'image') continue // handled by vision
             const bits = []
-            if (embed.title) bits.push(`Title: ${embed.title}`)
-            if (embed.description) bits.push(`Description: ${embed.description.slice(0, 300)}`)
-            if (embed.url) bits.push(`URL: ${embed.url}`)
             if (embed.author?.name) bits.push(`From: ${embed.author.name}`)
+            if (embed.title) bits.push(`Title: ${embed.title}`)
+            if (embed.description) bits.push(`Description: ${embed.description.slice(0, 400)}`)
+            for (const f of embed.fields ?? []) {
+                const fn = (f?.name ?? '').trim()
+                const fv = (f?.value ?? '').trim()
+                if (fn || fv) bits.push(`${fn}: ${fv}`.slice(0, 200))
+            }
+            if (embed.footer?.text) bits.push(`Footer: ${embed.footer.text}`)
+            if (embed.provider?.name) bits.push(`Via: ${embed.provider.name}`)
+            if (embed.url) bits.push(`URL: ${embed.url}`)
             if (bits.length) parts.push(`[Embed — ${bits.join(' | ')}]`)
         }
 
@@ -2322,24 +2390,36 @@ class AIChatManager {
                     'announce',
                     'dm',
                 ])
-                if (DESTRUCTIVE.has(cmdName) && MOD_CMDS.has(cmdName)) {
+                if (DESTRUCTIVE.has(cmdName)) {
                     // Reject obviously-hallucinated targets before even asking for confirmation.
                     // ban/kick/mute/warn/mpurge need a user snowflake; clear/purge/fpurge need an int count.
-                    const needsUserId = ['ban', 'kick', 'mute', 'unmute', 'warn', 'mpurge', 'clearwarns'].includes(cmdName)
-                    const needsInt    = ['clear', 'purge', 'fpurge'].includes(cmdName)
+                    const needsUserId = [
+                        'ban',
+                        'kick',
+                        'mute',
+                        'unmute',
+                        'warn',
+                        'mpurge',
+                        'clearwarns',
+                    ].includes(cmdName)
+                    const needsInt = ['clear', 'purge', 'fpurge'].includes(cmdName)
                     const rawArg = args[0]?.replace(/[<@!>]/g, '') ?? ''
                     if (needsUserId && !/^\d{15,20}$/.test(rawArg)) {
-                        console.warn(`[AI] Blocked hallucinated ${cmdName} — arg '${rawArg}' is not a user ID`)
+                        console.warn(
+                            `[AI] Blocked hallucinated ${cmdName} — arg '${rawArg}' is not a user ID`,
+                        )
                         finalResponse = finalResponse.replace(/<<\s*RUN_CMD:[\s\S]*?>>/g, '').trim()
                         continue
                     }
                     if (needsInt && !/^\d{1,3}$/.test(rawArg)) {
-                        console.warn(`[AI] Blocked hallucinated ${cmdName} — arg '${rawArg}' is not a valid count`)
+                        console.warn(
+                            `[AI] Blocked hallucinated ${cmdName} — arg '${rawArg}' is not a valid count`,
+                        )
                         finalResponse = finalResponse.replace(/<<\s*RUN_CMD:[\s\S]*?>>/g, '').trim()
                         continue
                     }
                     const targetArg = rawArg.toLowerCase() || 'none'
-                    const confirmKey = `${message.author.id}:${cmdName}:${targetArg}:${Date.now()}`;
+                    const confirmKey = `${message.author.id}:${cmdName}:${targetArg}:${Date.now()}`
                     // Store full state including original message reference for reply context
                     const existing = this._pendingConfirms.get(confirmKey)
                     const now = Date.now()
@@ -2692,10 +2772,13 @@ class AIChatManager {
             try {
                 const retryMsgs = [
                     { role: 'system', content: visionSys },
-                    { role: 'user', content: [
-                        { type: 'image_url', image_url: { url: imageUrl } },
-                        { type: 'text', text: userText },
-                    ]},
+                    {
+                        role: 'user',
+                        content: [
+                            { type: 'image_url', image_url: { url: imageUrl } },
+                            { type: 'text', text: userText },
+                        ],
+                    },
                 ]
                 const r = await this._groq.chat.completions.create({
                     model: this.visionModel,
@@ -2805,15 +2888,16 @@ class AIChatManager {
         for (const s of ALWAYS_LIVE) if (lower.includes(s)) return 'research'
 
         // Short-message skip only when clearly conversational (greeting/emoji/ack).
-        const CASUAL_SHORT = /^(hi+|hey+|yo+|sup|hello|ty|thx|thanks|ok|okay|cool|nice|bye|cya|gn|gm|lol|lmao|[💜💚🥺💀·👀🪼])/i
+        const CASUAL_SHORT =
+            /^(hi+|hey+|yo+|sup|hello|ty|thx|thanks|ok|okay|cool|nice|bye|cya|gn|gm|lol|lmao|[💜💚🥺💀·👀🪼])/i
         const isShortCasual = wc <= 3 && CASUAL_SHORT.test(lower)
 
-        const isNever = NEVER_RESEARCH_EXACT.has(lower)
-            || NEVER_RESEARCH_PREFIXES.some(p => lower.startsWith(p))
-            || (wc <= 6 && !hasQ && !hasTemp)
-            || isShortCasual
+        const isNever =
+            NEVER_RESEARCH_EXACT.has(lower) ||
+            NEVER_RESEARCH_PREFIXES.some((p) => lower.startsWith(p)) ||
+            (wc <= 6 && !hasQ && !hasTemp) ||
+            isShortCasual
         if (isNever) return 'direct'
-
 
         // Classifier round-trip — cache for 2 min so spam of "what's the weather"
         // doesn't burn 30 LLM calls in a fun channel
@@ -2880,8 +2964,11 @@ class AIChatManager {
     finalSecurityCheck(text) {
         if (text === undefined || text === null) return ''
         let out = text.replace(/@(?:[\u200B\u200C\u200D\uFEFF]*)?(everyone|here)/gi, '🪼')
-        // Strip any leaked internal-context markers the LLM echoed back as prose
-        out = out.replace(/\[INTERNAL[^\]]*\][^]*/g, '').trim()
+        // Strip leaked internal-context markers: tolerate a missing ']' and an echoed "**Name**:" preface, and bound to the first blank line so a top-of-reply echo can't wipe the real message
+        out = out
+            .replace(/^[\s>"'`]*(?:\*\*[^\n*]+\*\*\s*:?\s*["']?)?\s*\[INTERNAL\b[\s\S]*?(?:\]\s*["']?|\n\s*\n|$)/i, '')
+            .replace(/\[INTERNAL\b[^\]]*\]/gi, '')
+            .trim()
         out = out.replace(/<\/?reply_context[^>]*>/g, '')
         out = out.replace(/^\s*User['’]s message:\s*"[^"]*"\s*$/gim, '').trim()
         out = out.replace(/^\s*\w+:\s*"User is replying to your message:[\s\S]*?"\s*$/gim, '').trim()
@@ -2935,37 +3022,44 @@ class AIChatManager {
         return chunks
     }
 
-        async secureReply(message, content, opts = {}) {
-            const validated = this.finalSecurityCheck(String(content || ''))
-            const hasContent = !!validated.trim()
-            const hasEmbeds = !!opts.embeds?.length
+    async secureReply(message, content, opts = {}) {
+        const validated = this.finalSecurityCheck(String(content || ''))
+        const hasContent = !!validated.trim()
+        const hasEmbeds = !!opts.embeds?.length
 
-            if (!hasContent && !hasEmbeds) return null
+        if (!hasContent && !hasEmbeds) return null
 
-            const safe = validated.length > 2000 ? validated.slice(0, 1997) + '...' : validated
-            const payload = { allowedMentions: { parse: ['users'], repliedUser: true }, ...opts }
-            if (hasContent) payload.content = safe;
+        const safe = validated.length > 2000 ? validated.slice(0, 1997) + '...' : validated
+        const payload = { allowedMentions: { parse: ['users'], repliedUser: true }, ...opts }
+        if (hasContent) payload.content = safe
 
-            if (/<@!?\d+>|<@&\d+>|@everyone|@here/.test(safe)) {
-                payload.flags = MessageFlags.SuppressNotifications;
-            }
-
-            // Try reply first (keeps the thread visual). Fall back to plain channel send on:
-            //   50035 MESSAGE_REFERENCE_UNKNOWN_MESSAGE — original was deleted (e.g. by purge)
-            //   10008 Unknown Message — same situation, different endpoint
-            try { return await message.reply(payload) }
-            catch (e) {
-                const code = e?.code
-                if (code === 10008 || code === 50035) {
-                    // Strip the reply-reference and send as a normal channel message
-                    const { message_reference, ...safePayload } = payload
-                    try { return await message.channel.send(safePayload) }
-                    catch { return null }
-                }
-                try { return await message.channel.send(payload) } catch { return null }
-            }
+        if (/<@!?\d+>|<@&\d+>|@everyone|@here/.test(safe)) {
+            payload.flags = MessageFlags.SuppressNotifications
         }
 
+        // Try reply first (keeps the thread visual). Fall back to plain channel send on:
+        //   50035 MESSAGE_REFERENCE_UNKNOWN_MESSAGE — original was deleted (e.g. by purge)
+        //   10008 Unknown Message — same situation, different endpoint
+        try {
+            return await message.reply(payload)
+        } catch (e) {
+            const code = e?.code
+            if (code === 10008 || code === 50035) {
+                // Strip the reply-reference and send as a normal channel message
+                const { message_reference, ...safePayload } = payload
+                try {
+                    return await message.channel.send(safePayload)
+                } catch {
+                    return null
+                }
+            }
+            try {
+                return await message.channel.send(payload)
+            } catch {
+                return null
+            }
+        }
+    }
 
     // Cache keys are `${userId}_${guildId}` — scan and drop all guild buckets for one user
     _invalidateUserCache(userId) {
@@ -2984,7 +3078,11 @@ class AIChatManager {
         // For 1–3 word greetings, build a minimal context. The full context (interests,
         // relationships, passive buffer, emoji list) is wasted prefill on "hi" / "ty".
         const msgText = (message?.content ?? '').trim()
-        if (msgText && msgText.split(/\s+/).length <= 3 && /^(hi|hey|hello|yo|sup|ty|thanks|bye|cya|gn|gm|ok|lol|lmao|💜|💚|·)\b/i.test(msgText)) {
+        if (
+            msgText &&
+            msgText.split(/\s+/).length <= 3 &&
+            /^(hi|hey|hello|yo|sup|ty|thanks|bye|cya|gn|gm|ok|lol|lmao|💜|💚|·)\b/i.test(msgText)
+        ) {
             const name = message.member?.displayName ?? message.author?.username ?? 'user'
             const mini = `ACTIVE USER: ${name} (<@${message.author.id}>)
 TIME: ${new Date().toISOString().slice(0, 16)} UTC`
@@ -3066,6 +3164,15 @@ TIME: ${new Date().toISOString().slice(0, 16)} UTC`
         parts.push(
             `YOUR SYSTEM STATS: Ping/Latency: ${this.client.ws.ping}ms | Uptime: ${upStr} | Memory: ${memMB}MB`,
         )
+        const _provider = this._detectProvider(this.aiModel)?.id ?? 'unknown'
+        const _cfg = this._config ?? this.config
+        const _realKey = (k) => !!k && !/YOUR_|_HERE|PLACEHOLDER/i.test(k)
+        const _canResearch = !!this._researchClient && (_realKey(_cfg.tavily_key) || _realKey(_cfg.serper_key))
+        parts.push(
+            `YOUR MODEL/RUNTIME: You run on "${this.aiModel}" via ${_provider} (vision: "${this.visionModel}", research: "${this.researchModel}"). ` +
+                `Capabilities: image vision, long-term memory${_canResearch ? ', live web research' : ''}. ` +
+                `If asked what AI or model you are, answer truthfully with this model and provider — never claim to be ChatGPT, Claude, or Gemini unless that is literally the model named above.`,
+        )
         if (guild?.emojis?.cache?.size) {
             const emojiList = [...guild.emojis.cache.values()]
                 .filter((e) => !e.name.match(/nsfw|nude|sex|porn/i))
@@ -3088,13 +3195,27 @@ TIME: ${new Date().toISOString().slice(0, 16)} UTC`
 
         if (message?.reference?.resolved) {
             const ref = message.reference.resolved
-            const refText = (ref.content ?? '')
+            let refText = (ref.content ?? '')
                 .replace(/<@!?(\d+)>/g, (_, id) => {
                     const u = this.client.users.cache.get(id)
                     return u ? `@${u.username}` : ''
                 })
                 .trim()
-            const preview = refText.slice(0, 150) + (refText.length > 150 ? '...' : '')
+            if (!refText && ref.embeds?.length) {
+                const e = ref.embeds.find((x) => x.data?.type !== 'image' && x.data?.type !== 'gifv') ?? ref.embeds[0]
+                const eb = [
+                    e?.author?.name,
+                    e?.title,
+                    e?.description,
+                    ...(e?.fields ?? []).map((f) => `${f.name}: ${f.value}`),
+                    e?.footer?.text,
+                ]
+                    .filter(Boolean)
+                    .join(' • ')
+                if (eb) refText = `[embed] ${eb}`
+            }
+            if (!refText && ref.attachments?.size) refText = `[${ref.attachments.size} attachment(s)]`
+            const preview = refText.slice(0, 220) + (refText.length > 220 ? '...' : '')
             if (ref.author.id === this.client.user.id) {
                 // Only inject if the original message wasn't addressed to a different user
                 const mentionedIds = [...(ref.content ?? '').matchAll(/<@!?(\d+)>/g)].map((m) => m[1])
@@ -3119,32 +3240,34 @@ TIME: ${new Date().toISOString().slice(0, 16)} UTC`
         if (!this._groq) return null
 
         const q = this._config?.quickAgent ?? {}
-        const model       = q.model && q.model.trim() ? q.model : this.aiModel
+        const model = q.model && q.model.trim() ? q.model : this.aiModel
         const temperature = typeof q.temperature === 'number' ? q.temperature : 0.4
-        const topP        = typeof q.topP        === 'number' ? q.topP        : 0.9
-        const maxTokens   = typeof q.maxTokens   === 'number' ? q.maxTokens   : 1400
+        const topP = typeof q.topP === 'number' ? q.topP : 0.9
+        const maxTokens = typeof q.maxTokens === 'number' ? q.maxTokens : 1400
         const allowResearch = q.allowResearch !== false
         const rawPrompt = q.systemPrompt
         const systemPrompt = Array.isArray(rawPrompt)
             ? rawPrompt.join('')
-            : (typeof rawPrompt === 'string' && rawPrompt.trim() ? rawPrompt : this._defaultQuickAgentPrompt())
+            : typeof rawPrompt === 'string' && rawPrompt.trim()
+              ? rawPrompt
+              : this._defaultQuickAgentPrompt()
 
-
-        const routing = (allowResearch && forceSearch) ? 'research'
-                      : (allowResearch ? await this.needsResearch(prompt) : 'direct')
+        const routing =
+            allowResearch && forceSearch
+                ? 'research'
+                : allowResearch
+                  ? await this.needsResearch(prompt)
+                  : 'direct'
         if (routing === 'nsfw' || routing === 'dangerous') return "I can't help with that."
-
-        const savedTopP = this.topP
-        this.topP = topP   // _buildPayload reads this.topP — scope it for this call only
 
         const runDirect = async (finalPrompt, sys) => {
             const messages = [
                 { role: 'system', content: sys },
-                { role: 'user',   content: String(finalPrompt).slice(0, 20000) },
+                { role: 'user', content: String(finalPrompt).slice(0, 20000) },
             ]
-            try {
-                return await this._groqCallWithFallbacks(messages, model, maxTokens, temperature)
-            } finally { this.topP = savedTopP }
+            // topP is threaded as a call-scoped argument — no shared this.topP mutation, so
+            // concurrent stateless calls can't race on each other's sampling settings.
+            return await this._groqCallWithFallbacks(messages, model, maxTokens, temperature, topP)
         }
 
         if (routing === 'research') {
@@ -3165,7 +3288,7 @@ Answer concisely using the research.`
                 const final = await runDirect(researchPrompt, systemPrompt)
                 if (final && sources.length) {
                     const footer = `
--# ${sources.map(s => `[${s.name}](<${s.url}>)`).join(' · ')}`
+-# ${sources.map((s) => `[${s.name}](<${s.url}>)`).join(' · ')}`
                     return final.length + footer.length <= 2000 ? final + footer : final
                 }
                 if (final) return final
@@ -3187,7 +3310,8 @@ Answer concisely using the research.`
         // Kill persona roleplay leakage
         out = out.replace(/^(?:as medusa|i['\u2019]m medusa|i am medusa)[,:]?\s*/gim, '')
         // Collapse >2 blank lines
-        while (out.indexOf(String.fromCharCode(10, 10, 10)) !== -1) out = out.replace(String.fromCharCode(10, 10, 10), String.fromCharCode(10, 10))
+        while (out.indexOf(String.fromCharCode(10, 10, 10)) !== -1)
+            out = out.replace(String.fromCharCode(10, 10, 10), String.fromCharCode(10, 10))
         out = out.trim()
         return out || null
     }
@@ -3214,9 +3338,16 @@ Answer concisely using the research.`
         ].join('')
     }
 
-    // Core generate 
-    async generateResponse({ prompt, history = null, userId = null, username = null, displayName = null, message = null, systemPrompt = null }) {
-
+    // Core generate
+    async generateResponse({
+        prompt,
+        history = null,
+        userId = null,
+        username = null,
+        displayName = null,
+        message = null,
+        systemPrompt = null,
+    }) {
         if (!this._groq) return null
         this.totalRequests++
         const t0 = performance.now()
@@ -3235,14 +3366,20 @@ Answer concisely using the research.`
 
             // Inject CAPABILITIES_NOTE only when the prompt plausibly needs a RUN_CMD.
             // Skipping it on casual chat shaves ~1.5 KB of prefill → measurable TTFT drop.
-            const ACTION_RE = /\b(ban|kick|mute|unmute|warn|purge|clear|mpurge|fpurge|delete|remove|lock|unlock|role|nickname|rename|avatar|av|pfp|banner|bn|announce|poll|thread|pin|unpin|slowmode|topic|react|emoji|movevc|dm|show|fetch|pull up)\b/i
+            const ACTION_RE =
+                /\b(ban|kick|mute|unmute|warn|purge|clear|mpurge|fpurge|delete|remove|lock|unlock|role|nickname|rename|avatar|av|pfp|banner|bn|announce|poll|thread|pin|unpin|slowmode|topic|react|emoji|movevc|dm|show|fetch|pull up)\b/i
             const needsCaps = ACTION_RE.test(prompt) || ACTION_RE.test(message?.content ?? '')
 
             const messages = []
             if (systemPrompt) {
-                messages.push({ role: 'system', content: needsCaps ? systemPrompt + CAPABILITIES_NOTE : systemPrompt })
+                messages.push({
+                    role: 'system',
+                    content: needsCaps ? systemPrompt + CAPABILITIES_NOTE : systemPrompt,
+                })
             } else {
-                let base = this.getUserPrompt(userId) || 'You are Medusa, a vibrant AI assistant with personality. Respond as yourself in first person. Be expressive, use emojis occasionally. You\'re helpful but also playful, witty, and engaging.'
+                let base =
+                    this.getUserPrompt(userId) ||
+                    "You are Medusa, a vibrant AI assistant with personality. Respond as yourself in first person. Be expressive, use emojis occasionally. You're helpful but also playful, witty, and engaging."
                 if (needsCaps) base += CAPABILITIES_NOTE
                 if (userId) {
                     const ctx = await this.getUserContext(userId, message)
@@ -3278,7 +3415,9 @@ Answer concisely using the research.`
             // for destructive commands — those need to be intercepted, rewritten into
             // a confirmation prompt, and stored in _pendingConfirms BEFORE the user
             // sees anything. Streaming shows raw LLM output and breaks that flow.
-            const mayEmitCmd = /\b(ban|kick|mute|warn|mpurge|clear|purge|fpurge|delchan|announce|dm)\b/i.test(prompt || '')
+            const mayEmitCmd = /\b(ban|kick|mute|warn|mpurge|clear|purge|fpurge|delchan|announce|dm)\b/i.test(
+                prompt || '',
+            )
             // Scale token budget to prompt length. Short "hey" doesn't need 1200 tokens reserved.
             // NIM's KV cache allocation respects max_completion_tokens on many deployments,
             // so a lower value = faster first token and lower queue pressure under load.
@@ -3587,7 +3726,7 @@ Answer concisely using the research.`
                 systemPrompt: proactiveSys,
             })
             if (!response) return
-            if (streamed) {111
+            if (streamed) {
                 // Reply was already sent live; still run command parser so RUN_CMDs fire.
                 // If the parser rewrote the response (e.g. into a ⚠️ Confirm prompt),
                 // we need to overwrite the streamed message with the rewritten text so
@@ -3598,8 +3737,14 @@ Answer concisely using the research.`
                     // Stream placeholder was the last bot message we sent — fetch and edit it
                     try {
                         const recent = await message.channel.messages.fetch({ limit: 5 })
-                        const ours = recent.find(m => m.author.id === this.client.user.id && m.reference?.messageId === message.id)
-                        if (ours) await ours.edit({ content: this.finalSecurityCheck(finalText).slice(0, 2000) }).catch(() => {})
+                        const ours = recent.find(
+                            (m) =>
+                                m.author.id === this.client.user.id && m.reference?.messageId === message.id,
+                        )
+                        if (ours)
+                            await ours
+                                .edit({ content: this.finalSecurityCheck(finalText).slice(0, 2000) })
+                                .catch(() => {})
                     } catch {}
                 }
                 const mem = this.getMem(message.guild)
@@ -3703,8 +3848,9 @@ Answer concisely using the research.`
         if (this.shouldIgnore(message)) return
         if (this.triggeredMsgs.has(message.id)) return
         // Allow messages with no text if they carry images/attachments — vision pipeline needs them
-        const hasMedia = message.attachments?.size > 0 ||1
-                         message.embeds?.some(e => e.image?.url || e.thumbnail?.url || e.data?.type === 'gifv')
+        const hasMedia =
+            message.attachments?.size > 0 ||
+            message.embeds?.some((e) => e.image?.url || e.thumbnail?.url || e.data?.type === 'gifv')
         if (!message.content && !hasMedia) return
         if (message.guild) {
             const ownerScope = `${message.guild.id}:${OWNER_ID}`
@@ -3815,7 +3961,7 @@ Answer concisely using the research.`
         const isReplyToMe = repliedTo?.id === this.client.user.id
 
         const _botMentionRx = new RegExp(`^<@!?${this.client.user.id}>\\s+`)
-        const startsWithExplicitPing = _botMentionRx.test(raw) && !message.reference?.messageId
+        const startsWithExplicitPing = _botMentionRx.test(raw) && !isReplyToMe
         const hasTrig = this._triggerRegexes.some((rx) => rx.test(lower))
         const isMention = startsWithExplicitPing
         const isAlways = this.alwaysActiveCh.has(message.channel.id)
@@ -3825,26 +3971,30 @@ Answer concisely using the research.`
 
         if (isAlways && (isMention || isReplyToMe || hasTrig)) {
             trigger = true
-            if (replyCtx) prompt = `${replyCtx}
+            if (replyCtx)
+                prompt = `${replyCtx}
 
 ${raw}`
         } else if (isReplyToMe && hasMedia) {
             // Regular channel reply-to-bot with image attached — treat as explicit "look at this"
             trigger = true
-            prompt = replyCtx ? `${replyCtx}
+            prompt = replyCtx
+                ? `${replyCtx}
 
-${raw || 'what do you see'}` : (raw || 'what do you see')
+${raw || 'what do you see'}`
+                : raw || 'what do you see'
         } else if (startsWithExplicitPing) {
             // Regular channel: ONLY an explicit @Medusa at the start (not a reply-auto-ping)
             const cleaned = raw.replace(_botMentionRx, '').trim()
             if (cleaned) {
                 trigger = true
-                prompt = replyCtx ? `${replyCtx}
+                prompt = replyCtx
+                    ? `${replyCtx}
 
-${cleaned}` : cleaned
+${cleaned}`
+                    : cleaned
             }
         }
-
 
         if (trigger) {
             const guildId = message.guild?.id ?? '0'
@@ -4242,7 +4392,6 @@ export async function registerAI(client, db, config) {
     const _PASSIVE_CHANNELS_MAX = PERF.ai.passiveBufferChannelsMax
     globalThis._aiPassiveBuf = _passiveBuf
 
-
     const ai = new AIChatManager(client, db, config)
     client.aiCog = ai
     ai._passiveBuf = _passiveBuf // wire buffer so getUserContext() can inject live channel activity
@@ -4326,24 +4475,27 @@ export async function registerAI(client, db, config) {
 
         // /medusa (Quick Agent) — stateless, user-installable, DM-allowed
         if (commandName === 'medusa') {
-            const prompt      = interaction.options.getString('prompt')
-            const forceSearch = interaction.options.getBoolean('search')  ?? false
-            const isPrivate   = interaction.options.getBoolean('private') ?? false
-            const flags       = isPrivate ? MessageFlags.Ephemeral : undefined
+            const prompt = interaction.options.getString('prompt')
+            const forceSearch = interaction.options.getBoolean('search') ?? false
+            const isPrivate = interaction.options.getBoolean('private') ?? false
+            const flags = isPrivate ? MessageFlags.Ephemeral : undefined
 
             await interaction.deferReply(flags ? { flags } : {})
 
             const isStaff = !!interaction.memberPermissions?.has(PermissionFlagsBits.ModerateMembers)
-            const gate    = client.heart?.rateLimiter?.check(uid, { isStaff, isOwner })
+            const gate = client.heart?.rateLimiter?.check(uid, { isStaff, isOwner })
             if (gate && !gate.ok) {
-                return interaction.editReply({ content: '⏳ Too many requests. Wait a few seconds and try again.' })
+                return interaction.editReply({
+                    content: '⏳ Too many requests. Wait a few seconds and try again.',
+                })
             }
 
             try {
                 const response = await ai.generateStatelessResponse({ prompt, forceSearch })
-                if (!response) return interaction.editReply({ content: '✗ All providers failed. Try again shortly.' })
+                if (!response)
+                    return interaction.editReply({ content: '✗ All providers failed. Try again shortly.' })
 
-                const safe   = ai.finalSecurityCheck(response)
+                const safe = ai.finalSecurityCheck(response)
                 const chunks = ai.splitResponse(safe, 1900)
                 await interaction.editReply({ content: chunks[0] || '...' })
                 for (let i = 1; i < Math.min(chunks.length, 4); i++) {
@@ -4351,12 +4503,14 @@ export async function registerAI(client, db, config) {
                 }
             } catch (e) {
                 console.error('[AI] /medusa error:', e)
-                try { await interaction.editReply({ content: '✗ Failed to generate response.' }) } catch {}
+                try {
+                    await interaction.editReply({ content: '✗ Failed to generate response.' })
+                } catch {}
             }
             return
         }
 
-        // /summarize 
+        // /summarize
 
         if (commandName === 'summarize') {
             const BETWEEN = 15 * 60_000,
@@ -5062,7 +5216,8 @@ export async function registerAI(client, db, config) {
 export function buildAISlashCommands() {
     return [
         new SlashCommandBuilder()
-            .setName('lore').setContexts(0)
+            .setName('lore')
+            .setContexts(0)
 
             .setDescription('Manage server lore Medusa learns from')
             .addSubcommand((s) => s.setName('list').setDescription('View all recorded server lore'))
@@ -5083,12 +5238,17 @@ export function buildAISlashCommands() {
                     ),
             )
             .addSubcommand((s) => s.setName('clear').setDescription('Clear all auto-extracted lore (mods)')),
-        new SlashCommandBuilder().setName('memory').setDescription('See what Medusa remembers about you').setContexts(0),
         new SlashCommandBuilder()
-            .setName('forgetme').setContexts(0)
+            .setName('memory')
+            .setDescription('See what Medusa remembers about you')
+            .setContexts(0),
+        new SlashCommandBuilder()
+            .setName('forgetme')
+            .setContexts(0)
             .setDescription('Delete everything Medusa remembers about you'),
         new SlashCommandBuilder()
-            .setName('mode').setContexts(0)
+            .setName('mode')
+            .setContexts(0)
             .setDescription('Switch between focused/normal AI mode')
             .addStringOption((o) =>
                 o
@@ -5097,7 +5257,8 @@ export function buildAISlashCommands() {
                     .addChoices({ name: 'focused', value: 'focused' }, { name: 'normal', value: 'normal' }),
             ),
         new SlashCommandBuilder()
-            .setName('ghost').setContexts(0)
+            .setName('ghost')
+            .setContexts(0)
             .setDescription('Manage ghost user filter')
             .addSubcommand((s) =>
                 s
@@ -5119,14 +5280,22 @@ export function buildAISlashCommands() {
             .addSubcommand((s) => s.setName('clear').setDescription('Clear ghost list')),
         // Owner-only (hidden by not setting defaultMemberPermissions, ephemeral responses guard access)
         new SlashCommandBuilder().setName('aipause').setDescription('Toggle AI pause (owner)').setContexts(0),
-        new SlashCommandBuilder().setName('aireinit').setDescription('Reinitialize Groq client (owner)').setContexts(0),
         new SlashCommandBuilder()
-            .setName('aimodel').setContexts(0)
+            .setName('aireinit')
+            .setDescription('Reinitialize Groq client (owner)')
+            .setContexts(0),
+        new SlashCommandBuilder()
+            .setName('aimodel')
+            .setContexts(0)
             .setDescription('Get/set AI model (owner)')
             .addStringOption((o) => o.setName('model').setDescription('Model string')),
-        new SlashCommandBuilder().setName('aiwipe').setDescription('Wipe all AI memory (owner)').setContexts(0),
         new SlashCommandBuilder()
-            .setName('pm').setContexts(0)
+            .setName('aiwipe')
+            .setDescription('Wipe all AI memory (owner)')
+            .setContexts(0),
+        new SlashCommandBuilder()
+            .setName('pm')
+            .setContexts(0)
             .setDescription('Toggle ping mode (owner)')
             .addStringOption((o) =>
                 o
@@ -5134,24 +5303,39 @@ export function buildAISlashCommands() {
                     .setDescription('on or off')
                     .addChoices({ name: 'on', value: 'on' }, { name: 'off', value: 'off' }),
             ),
-        new SlashCommandBuilder().setName('iso').setDescription('Isolate server AI memory (owner)').setContexts(0),
-        new SlashCommandBuilder().setName('uniso').setDescription('Un-isolate server AI memory (owner)').setContexts(0),
-        new SlashCommandBuilder().setName('summarize').setDescription('Summarize recent conversation').setIntegrationTypes(0, 1).setContexts(0, 1, 2).addStringOption(o => o.setName('start_from').setDescription('Message ID to start from')),
         new SlashCommandBuilder()
-            .setName('medusa')
-            .setDescription('Quick Agent — stateless AI query, no memory, no commands. Works in DMs and any server.')
+            .setName('iso')
+            .setDescription('Isolate server AI memory (owner)')
+            .setContexts(0),
+        new SlashCommandBuilder()
+            .setName('uniso')
+            .setDescription('Un-isolate server AI memory (owner)')
+            .setContexts(0),
+        new SlashCommandBuilder()
+            .setName('summarize')
+            .setDescription('Summarize recent conversation')
             .setIntegrationTypes(0, 1)
             .setContexts(0, 1, 2)
-            .addStringOption(o => o
-                .setName('prompt')
-                .setDescription('What do you want to ask?')
-                .setRequired(true)
-                .setMaxLength(1800))
-            .addBooleanOption(o => o
-                .setName('search')
-                .setDescription('Force a live web search (default: auto-detect)'))
-            .addBooleanOption(o => o
-                .setName('private')
-                .setDescription('Show only to you (ephemeral). Default: visible.')),
-    ].map(c => c.toJSON())
+            .addStringOption((o) => o.setName('start_from').setDescription('Message ID to start from')),
+        new SlashCommandBuilder()
+            .setName('medusa')
+            .setDescription(
+                'Quick Agent — stateless AI query, no memory, no commands. Works in DMs and any server.',
+            )
+            .setIntegrationTypes(0, 1)
+            .setContexts(0, 1, 2)
+            .addStringOption((o) =>
+                o
+                    .setName('prompt')
+                    .setDescription('What do you want to ask?')
+                    .setRequired(true)
+                    .setMaxLength(1800),
+            )
+            .addBooleanOption((o) =>
+                o.setName('search').setDescription('Force a live web search (default: auto-detect)'),
+            )
+            .addBooleanOption((o) =>
+                o.setName('private').setDescription('Show only to you (ephemeral). Default: visible.'),
+            ),
+    ].map((c) => c.toJSON())
 }
