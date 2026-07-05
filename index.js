@@ -21,9 +21,11 @@ import os from 'os'
 import { performance } from 'perf_hooks'
 import { setGlobalDispatcher } from 'undici'
 import { _undiciAgent, buildAISlashCommands } from './extensions/ai.js'
+import { loadConfig } from './extensions/config.js'
 import { attachHeart } from './extensions/heart.js'
 import { loadPerformance } from './extensions/performance.js'
 import { resolveTarget } from './extensions/utils.js'
+import { loadSqlite, openDb } from './extensions/db.js'
 
 const PERF = loadPerformance()
 
@@ -84,59 +86,29 @@ console.error = (...a) => {
     origError(`${clr.light_red}${getTs()} [ERROR]${clr.reset}`, ...a)
 }
 
-// Config
-const CONFIG_PATH = 'config.json'
-function loadConfig() {
-    try {
-        const raw = readFileSync(CONFIG_PATH, 'utf8')
-        return JSON.parse(raw.replace(/(?<=:\s*|\[\s*|,\s*)\b(\d{15,})\b(?=\s*[,}\]])/g, '"$1"'))
-    } catch {
-        return {}
-    }
-}
-export function saveConfig(data) {
-    try {
-        const runtimePath = 'runtime.json'
-        const existing = existsSync(runtimePath) ? JSON.parse(readFileSync(runtimePath, 'utf8')) : {}
-        // Only merge specific mutable fields, never overwrite base config
-        const mutable = ['aiModel', 'ping_mode', 'ignore_users', 'isolated_servers']
-        for (const key of mutable) {
-            if (data[key] !== undefined) existing[key] = data[key]
-        }
-        writeFileSync(runtimePath, JSON.stringify(existing, null, 2), 'utf8')
-    } catch (e) {
-        console.error('[Config] runtime save error:', e)
-    }
-}
+// Config — normalized to the canonical camelCase shape by extensions/config.js
+// (legacy keys are mapped there; runtime-mutable settings live in runtime.json)
 const config = loadConfig()
-globalThis._saveConfig = saveConfig
-
-const RUNTIME_PATH = 'runtime.json'
-if (existsSync(RUNTIME_PATH)) {
-    try {
-        const runtime = JSON.parse(readFileSync(RUNTIME_PATH, 'utf8'))
-        // Only override specific mutable fields
-        const mutable = ['aiModel', 'ping_mode', 'ignore_users', 'isolated_servers', 'temperature', 'topP']
-        for (const key of mutable) {
-            if (runtime[key] !== undefined) config[key] = runtime[key]
-        }
-        console.log('[Config] Loaded runtime overrides')
-    } catch (e) {
-        console.warn('[Config] Failed to load runtime.json:', e.message)
-    }
-}
 
 // Constants
-const BOT_OWNER_ID = config.owner_id ? BigInt(config.owner_id) : 0n
-const PREFIX = config.prefix ?? 'med,'
-const ALLOWED_GUILDS = new Set((config.guilds || []).map(BigInt))
+const BOT_OWNER_ID = config.ownerId ? BigInt(config.ownerId) : 0n
+const PREFIX = config.prefix
+const ALLOWED_GUILDS = new Set(config.guildIds.map(BigInt))
 
 // Database
 let db
+let _dbAttempt = 0
+// Retry loop: on Pterodactyl-style restarts the old process can still be
+// shutting down (holding the EXCLUSIVE lock) when the new one boots — a locked
+// DB must mean "wait and retry", never "silently run without persistence".
+while (true) {
 try {
-    const { default: Database } = await import('better-sqlite3')
+    await loadSqlite()
     mkdirSync('Logs', { recursive: true })
-    db = new Database('Logs/medusa.db')
+    db = openDb('Logs/medusa.db')
+    // Wait up to 10s on locks BEFORE any lock-taking pragma, so an overlapping
+    // restart blocks briefly instead of failing with "database is locked".
+    db.pragma('busy_timeout = 10000')
     db.pragma('locking_mode = EXCLUSIVE')
     try {
         db.pragma('journal_mode = WAL')
@@ -152,7 +124,6 @@ try {
     db.pragma(`cache_size = -${PERF.sqlite.cacheSizeKB}`)
     db.pragma(`wal_autocheckpoint = ${PERF.sqlite.walAutocheckpoint}`)
 
-    db.pragma('busy_timeout = 5000')
 
     let _vacuumEligible = false
     setInterval(() => {
@@ -208,9 +179,23 @@ try {
         CREATE INDEX IF NOT EXISTS idx_mod_logs_gu ON mod_logs(guild_id, user_id);
     `)
     console.log('[DB] SQLite WAL initialized')
+    break
 } catch (e) {
+    if (/locked/i.test(e.message) && _dbAttempt < 3) {
+        _dbAttempt++
+        console.warn(
+            `[DB] Database locked (previous instance still shutting down?) — retry ${_dbAttempt}/3 in 3s`,
+        )
+        try {
+            db?.close?.()
+        } catch {}
+        await new Promise((resolve) => setTimeout(resolve, 3000))
+        continue
+    }
     console.error('[DB] better-sqlite3 unavailable:', e.message)
     db = { prepare: () => ({ run: () => {}, get: () => null, all: () => [] }), exec: () => {} }
+    break
+}
 }
 
 // Client
@@ -262,7 +247,7 @@ client.extensions = new Collection()
 const { registerAfk } = await import('./extensions/afk.js')
 const { registerAutomod } = await import('./extensions/automod.js')
 const { registerModeration } = await import('./extensions/moderation.js')
-client.afk = registerAfk(client)
+client.afk = registerAfk(client, db)
 const automod = registerAutomod(client, db, heart)
 client.automod = automod
 client.moderation = registerModeration(client, db, { ...config, memeGuildId: null })
@@ -290,6 +275,9 @@ for (const file of extensionFiles) {
         }
 
         const { init, handleMessage, handleInteraction } = mod
+        // Library modules (config.js, db.js, performance.js) export helpers, not hooks —
+        // they're imported directly where needed, not mounted as extensions.
+        if (!mod.manifest && !init && !handleMessage && !handleInteraction && !mod.getSlashCommands) continue
         client.extensions.set(extName, { init, handleMessage, handleInteraction, manifest: mod.manifest })
         if (init) await init(client, db, heart)
         console.log(
@@ -574,11 +562,10 @@ async function cmdEmbed(interaction) {
 
 async function cmdMenu(ctx) {
     // Menu implementation preserved from original — abbreviated here for clarity
-    const PREFIX_REF = config.prefix ?? 'med,'
     const pages = [
         {
             title: '🐍 Medusa — Main Menu',
-            desc: `**Prefix:** \`${PREFIX_REF}\`\nUse the arrows to browse commands.`,
+            desc: `**Prefix:** \`${PREFIX}\`\nUse the arrows to browse commands.`,
         },
         {
             title: '🛡️ Moderation',
@@ -587,9 +574,9 @@ async function cmdMenu(ctx) {
         { title: '👤 Profile', desc: `\`av\` \`mav\` \`bn\` \`mbn\` \`userinfo\` \`guild\`` },
         {
             title: '🤖 AI',
-            desc: `Mention Medusa or type her name to chat.\n\`${PREFIX_REF}p\` — Set custom prompt\n\`${PREFIX_REF}pr\` — Reset prompt\n\`${PREFIX_REF}mode\` — focused/normal\n\`/memory\` \`/forgetme\` \`/summarize\` \`/lore\``,
+            desc: `Mention Medusa or type her name to chat.\n\`${PREFIX}p\` — Set custom prompt\n\`${PREFIX}pr\` — Reset prompt\n\`${PREFIX}mode\` — focused/normal\n\`/memory\` \`/forgetme\` \`/summarize\` \`/lore\``,
         },
-        { title: '💤 AFK', desc: `\`${PREFIX_REF}afk [reason]\` — Go AFK\n\`${PREFIX_REF}unafk\` — Return` },
+        { title: '💤 AFK', desc: `\`${PREFIX}afk [reason]\` — Go AFK\n\`${PREFIX}unafk\` — Return` },
         { title: '🔧 Utility', desc: `\`ping\` \`stats\` \`menu\` \`help\` \`embed\` \`benchmark\`` },
     ]
     let cur = 0

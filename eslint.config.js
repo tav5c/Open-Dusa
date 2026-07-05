@@ -18,7 +18,9 @@ export default [
         },
     },
     {
-        files: ['extensions/ai.js'],
+        // The AI engine keeps hook signatures uniform across the class chain even
+        // when a given layer doesn't use every argument.
+        files: ['extensions/ai.js', 'extensions/ai/**/*.js'],
         rules: { 'no-unused-vars': 'off' },
     },
 ]

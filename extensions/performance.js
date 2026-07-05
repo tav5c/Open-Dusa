@@ -42,7 +42,7 @@ const DEFAULTS = {
     },
     maintenance: {
         cleanupIntervalMin: 10,
-        retentionDays: 90,
+        retentionDays: 30,
         vacuumEveryDays: 7,
         loopLagWarnMs: 500,
     },

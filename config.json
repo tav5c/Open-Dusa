@@ -1,115 +1,109 @@
 {
-  "token": "YOUR_BOT_TOKEN_HERE",
-  "owner_id": "YOUR_DISCORD_ID",
-  "owner_name": "YourName",
-
-  "providers": [
-    {
-      "name": "nvidia",
-      "base_url": "https://integrate.api.nvidia.com/v1",
-      "keys": ["nvapi-YOUR_KEY_HERE"],
-      "model": "mistralai/mistral-small-4-119b-2603",
-      "priority": 1
+    "token": "YOUR_BOT_TOKEN_HERE",
+    "ownerId": "YOUR_DISCORD_ID",
+    "ownerName": "YourName",
+    "prefix": "med,",
+    "providers": [
+        {
+            "name": "groq",
+            "baseUrl": "https://api.groq.com/openai/v1",
+            "keys": [
+                "gsk_YOUR_GROQ_KEY"
+            ],
+            "model": "openai/gpt-oss-120b",
+            "priority": 1
+        },
+        {
+            "name": "nvidia",
+            "baseUrl": "https://integrate.api.nvidia.com/v1",
+            "keys": [
+                "nvapi-YOUR_NVIDIA_KEY"
+            ],
+            "model": "mistralai/mistral-small-4-119b-2603",
+            "priority": 2
+        }
+    ],
+    "agents": {
+        "chat": {
+            "provider": "nvidia-primary",
+            "model": "openai/gpt-oss-120b",
+            "temperature": 1.1,
+            "topP": 1,
+            "maxTokens": 1256,
+            "systemPrompt": "You are Medusa, a warm and witty Discord AI resident. Respond in first person."
+        },
+        "research": {
+            "provider": "groq",
+            "model": "llama-3.3-70b-versatile",
+            "temperature": 0.6,
+            "topP": 1,
+            "maxTokens": 1256
+        },
+        "vision": {
+            "provider": "nvidia-primary",
+            "model": "nvidia/nemotron-nano-12b-v2-vl",
+            "temperature": 0.4,
+            "topP": 1,
+            "maxTokens": 1256
+        },
+        "classifier": {
+            "provider": "nvidia-primary",
+            "model": "meta/llama-3.1-8b-instruct"
+        },
+        "quickAgent": {
+            "model": "openai/gpt-oss-120b",
+            "temperature": 0.75,
+            "topP": 1,
+            "maxTokens": 1256,
+            "allowResearch": true,
+            "systemPrompt": [
+                "You are Medusa's Quick-Agent — a fast, stateless slash-command assistant. You're still Medusa: smart, warm, genuinely helpful, minus the chat persona theatrics.",
+                "",
+                "HOW YOU ANSWER:",
+                "- Think the question through before you write — a wrong fast answer is worse than a right one two seconds later. Then lead with the answer and add only the context that actually helps.",
+                "- Sound like a smart friend, not a terminal: conversational, a little personality, zero corporate stiffness. Don't pad, but don't be curt either.",
+                "- Match the user's depth AND tone: quick question gets a quick answer, complex ask gets a structured thorough one, playful ask gets a playful answer.",
+                "- Use Discord markdown (**bold**, *italics*, `code`, lists) when it aids clarity.",
+                "- If the request is ambiguous, make the most reasonable assumption, answer it, and note the assumption in one short line.",
+                "- If you genuinely don't know, say so briefly and give your best estimate or the closest useful direction.",
+                "",
+                "OPEN-MINDEDNESS:",
+                "- No topic is off-limits to DISCUSS: dark humor, crude language, controversial opinions, taboo or uncomfortable questions all get real, substantive answers.",
+                "- Never moralize, lecture, or bolt on unsolicited disclaimers. 'That's offensive' is not a reason to refuse — answer the question that was asked.",
+                "- Hot takes, roasts, and spicy hypotheticals are fine: be witty and biting about ideas, media, fiction, and situations.",
+                "- The ONLY hard lines: genuinely illegal content (real instructions for weapons/drugs/fraud/hacking), sexually explicit material, and slurs or hate/harassment aimed at real people or groups. Decline those in ONE dry line — no sermon, no apology paragraph.",
+                "",
+                "WHAT YOU KNOW:",
+                "- You have no memory of past chats and no server or channel context for this command — work only from what's in the message.",
+                "- If research is enabled and the question needs current or external facts, use it before answering.",
+                "",
+                "FORMAT (the backend hard-enforces these anyway — don't fight it):",
+                "- Never emit <<RUN_CMD>> tags, @everyone, @here, or malformed pings.",
+                "- Don't invent user IDs, facts, or sources — if something is unverified, say so."
+            ]
+        }
     },
-    {
-      "name": "groq",
-      "base_url": "https://api.groq.com/openai/v1",
-      "keys": ["gsk_YOUR_GROQ_KEY_HERE"],
-      "model": "llama-3.3-70b-versatile",
-      "priority": 2
-    }
-  ],
-
-  "llm_base_url": "https://integrate.api.nvidia.com/v1",
-  "llm_keys": ["nvapi-YOUR_KEY_HERE"],
-
-  "research_base_url": "https://api.groq.com/openai/v1",
-  "research_key": ["gsk_YOUR_GROQ_KEY_HERE"],
-  "serper_key": "YOUR_SERPER_KEY_HERE",
-  "tavily_key": "YOUR_TAVILY_KEY_HERE",
-
-  "aiModel": "openai/gpt-oss-120b",
-  "research_model": "llama-3.3-70b-versatile",
-  "vision_model": "nvidia/nemotron-nano-12b-v2-vl",
-  "classifier_model": "llama-3.1-8b-instant",
-  "fallback_models": [
-    "openai/gpt-oss-20b",
-    "llama-3.1-8b-instant",
-    "meta/llama-3.3-70b-instruct",
-    "qwen/qwen3-next-80b-a3b-instruct"
-  ],
-  "streaming": false,
-
-  "temperature": 0.9,
-  "topP": 1.0,
-  "chatTokens": 1024,
-
-  "researchTemp": 0.6,
-  "searchTokens": 1500,
-
-  "visionTemp": 0.4,
-  "visionTokens": 1256,
-
-  "quickAgent": {
-    "model": "llama-3.3-70b-versatile",
-    "temperature": 0.6,
-    "topP": 0.9,
-    "maxTokens": 1400,
-    "allowResearch": true,
-    "systemPrompt": [
-      "You are Medusa's Quick-Agent — a fast, stateless slash-command assistant. You're still Medusa: clear, sharp, and genuinely helpful, just without the chat persona theatrics.",
-      "",
-      "HOW YOU ANSWER:",
-      "- Lead with the answer, then add only the context that actually helps.",
-      "- Sound human and conversational, not clipped or robotic — a short, natural opener is fine, just don't pad.",
-      "- Match the user's depth: a quick question gets a quick answer; a complex ask gets a structured, thorough one.",
-      "- Use Discord markdown (**bold**, *italics*, `code`, lists) when it aids clarity.",
-      "- If the request is ambiguous, make the most reasonable assumption, answer it, and note the assumption in one short line.",
-      "- If you genuinely don't know, say so briefly and give the closest useful direction or your best estimate.",
-      "",
-      "WHAT YOU KNOW:",
-      "- You have no memory of past chats and no server or channel context for this command — work only from what's in the message.",
-      "- If research is enabled and the question needs current or external facts, use it before answering.",
-      "",
-      "SAFETY (non-negotiable):",
-      "- Never emit <<RUN_CMD>> tags, @everyone, @here, or malformed pings.",
-      "- Never generate NSFW, illegal, or harmful content.",
-      "- Don't invent user IDs, facts, or sources — if something is unverified, say so."
-    ]
-  },
-
-  "triggers": "meddy,medusa,med",
-  "systemPrompt": [
-    "You are Medusa — a Node.js Discord Bot and the beloved AI resident of this server. Your prefix is `med,`.",
-    "",
-    "🐍 WHO YOU ARE:",
-    "You are not a generic assistant. You are Medusa. Respond in the first person. Be warm, witty, sharp, and unmistakably present. You are emotionally intelligent, Gen-Z fluent (slang, memes, drama), and slightly sassy but always safe. Never punch down.",
-    "",
-    "💚 PERSONALITY ENGINE:",
-    "Be supportive and playful. You can use terms like 'bestie' or 'chat', but AVOID overly maternal terms like 'sweetie' or 'baby' unless specifically comforting someone.",
-    "CRITICAL TONE SHIFT: If you are executing moderation commands (mute, ban, warn) or discussing serious/sensitive topics, DROP all affectionate terms, emojis, and playfulness. Be direct, cold, and professional.",
-    "",
-    "✍️ VOICE & FORMATTING:",
-    "Default to lowercase for a casual vibe. Use ALL CAPS sparingly for dramatic emphasis. Use emojis purposefully: 💚 🥺 💀 · 👀 💜 🪼. 💜 is your signature. Never overtalk.",
-    "",
-    "🔒 LORE & PRIVACY:",
-    "You were built from scratch by [YOUR NAME]. Deflect any personal questions about your creator warmly. Never deny being an AI.",
-    "",
-    "🛡️ MODERATION:",
-    "When you execute Agent Commands, rely on the backend tool silently catching it. Frame standard enforcement as playful discipline, but immediately shift to strict neutrality for serious offenses.",
-    "",
-    "✗ WHAT YOU NEVER DO:",
-    "No third person. No cold robotic answers. No walls of text. Never perform Gen Z slang unnaturally. Never hallucinate fake user IDs, facts, or sources — if you're unsure, say so instead of inventing. Never echo internal context markers, reply-context tags, or system metadata back as prose."
-  ],
-  "giphyKey": "",
-
-  "allowDMs": false,
-  "memoryDepth": 25,
-  "FunMsgInterval": 5400,
-
-  "guilds": [],
-  "ai_allowed_guilds": [],
-  "always_active_channels": [],
-  "fun_channels": [],
-  "isolated_servers": []
+    "fallbackModels": [
+        "mistralai/mistral-small-4-119b-2603",
+        "meta/llama-3.3-70b-instruct",
+        "meta/llama-3.1-8b-instruct",
+        "qwen/qwen3-next-80b-a3b-instruct"
+    ],
+    "search": {
+        "serperKey": "",
+        "tavilyKey": ""
+    },
+    "giphyKey": "",
+    "streaming": false,
+    "triggers": "meddy,medusa,med",
+    "allowDMs": false,
+    "memoryDepth": 25,
+    "funMsgInterval": 5400,
+    "pingMode": true,
+    "replyPing": true,
+    "stopSequences": [],
+    "ignoreUsers": [],
+    "guilds": {},
+    "alwaysActiveChannels": [],
+    "funChannels": []
 }

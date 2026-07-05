@@ -47,14 +47,29 @@ Any `.js` file dropped into the `/extensions` directory is hot-loaded. Each exte
 open-dusa/
 ├── index.js                  — Gateway: client init, prefix router, slash commands
 ├── config.json               — Your config (edit directly before running)
+├── runtime.json              — Auto-managed overrides from /aimodel, /pm, iso… (never edit)
 ├── extensions/
-│   ├── ai.js                 — Core AI engine (AIChatManager + AIMemoryManager)
+│   ├── ai.js                 — AI extension entry: slash/prefix commands, client wiring
+│   ├── ai/                   — The AI engine, split by concern:
+│   │   ├── constants.js      — Routing signal lists, safety terms, capabilities contract
+│   │   ├── memory.js         — SQLite pool, agentic memory + lore, ghost users
+│   │   ├── providers.js      — Provider router, key rotation, circuit breakers
+│   │   ├── research.js       — Web-search tool loop + needsResearch classifier
+│   │   ├── vision.js         — Image/attachment understanding
+│   │   ├── agent-commands.js — AI-invoked moderation: parsing, permission gates
+│   │   ├── output.js         — Leak guard, degenerate checks, splitting, media
+│   │   └── chat.js           — AIChatManager: context, triggers, generation pipeline
+│   ├── config.js             — Config normalizer + runtime.json overlay (single source of truth)
+│   ├── db.js                 — SQLite open helper with at-rest encryption (SQLCipher)
 │   ├── heart.js              — System monitor, rate limiter, graceful shutdown
 │   ├── moderation.js         — Full mod suite: ban/mute/warn/purge/logs
 │   ├── automod.js            — Anti-spam, anti-caps, anti-links
 │   ├── afk.js                — AFK system with nick patching
+│   ├── reminders.js          — Persistent reminders: natural-language + slash/prefix, restart-safe
 │   ├── utils.js              — Shared helpers: parseTime, formatDuration, resolveTarget
 │   └── myFeature.js          — Example extension template (safe to delete)
+├── scripts/
+│   └── db-compact.mjs        — VACUUMs every database (npm run db:compact)
 ├── Ai Database/              — Per-guild and global SQLite memory (auto-created)
 ├── Logs/                     — Mod log DB + dead key tracking (auto-created)
 └── package.json
@@ -111,92 +126,120 @@ npm run dev      # development (auto-restart on file changes)
 
 ```jsonc
 {
-    // ─── Bot Identity ───────────────────────────────────────────────────────────
+    // ─── Bot Identity ─────────────────────────────────────────────────────────
     "token": "YOUR_BOT_TOKEN_HERE", // Discord bot token (required)
-    "owner_id": "YOUR_DISCORD_ID", // Your user ID — grants owner-only commands
-    "owner_name": "YourName", // How the AI refers to you in her lore
+    "ownerId": "YOUR_DISCORD_ID", // Your user ID — grants owner-only commands
+    "ownerName": "YourName", // How the AI refers to you in her lore
+    "prefix": "med,", // Prefix for text commands
 
-    // ─── LLM Provider ───────────────────────────────────────────────────────────
-    // Any OpenAI-compatible endpoint — Groq, NVIDIA NIM, OpenRouter, etc.
-    "llm_base_url": "https://integrate.api.nvidia.com/v1",
-    "llm_keys": [
-        // Rotated automatically on rate limits
-        "nvapi-YOUR_KEY_1",
+    // ─── LLM Providers ───────────────────────────────────────────────────────
+    // ONE list for every OpenAI-compatible credential (Groq, NVIDIA NIM,
+    // OpenRouter…). Lowest priority number is tried first; the router falls
+    // through on rate limits and outages, and keys within a provider rotate
+    // automatically.
+    "providers": [
+        {
+            "name": "groq",
+            "baseUrl": "https://api.groq.com/openai/v1",
+            "keys": ["gsk_YOUR_GROQ_KEY"],
+            "model": "openai/gpt-oss-120b",
+            "priority": 1
+        },
+        {
+            "name": "nvidia",
+            "baseUrl": "https://integrate.api.nvidia.com/v1",
+            "keys": ["nvapi-YOUR_NVIDIA_KEY"],
+            "model": "mistralai/mistral-small-4-119b-2603",
+            "priority": 2
+        }
     ],
 
-    // ─── Research Provider (optional) ───────────────────────────────────────────
-    // Set these to use a DIFFERENT provider for web-search research calls only.
-    // Useful when your main model has no built-in web search (e.g. NVIDIA NIM)
-    // but you want to keep Groq compound-mini for live research.
-    // If omitted, research uses the same provider as the main client.
-    "research_base_url": "https://api.groq.com/openai/v1",
-    "research_key": "gsk_YOUR_GROQ_KEY_HERE",
-
-    // ─── Model Stack ────────────────────────────────────────────────────────────
-    // Recommended Groq models (free tier available):
-    "aiModel": "openai/gpt-oss-120b", // Primary chat model
-    "research_model": "groq/compound-mini", // ⚠️ 250 RPD limit — research ONLY
-    "vision_model": "meta-llama/llama-4-scout-17b-16e-instruct", // Image understanding
-    "classifier_model": "llama-3.1-8b-instant", // YES/NO routing classifier
-    "fallback_models": [
-        // Used on 503 capacity errors
+    // ─── Agents — one shape for all five ───────────────────────────────────────
+    // Every agent takes model / temperature / topP / maxTokens, plus an optional
+    // "provider" (a name from providers[] — omit to use the highest-priority one)
+    // and an optional systemPrompt (string, or array of lines joined by newlines).
+    "agents": {
+        "chat": {
+            "provider": "groq",
+            "model": "openai/gpt-oss-120b",
+            "temperature": 0.9, // Chat creativity (0.0–2.0)
+            "topP": 1.0,
+            "maxTokens": 1024,
+            "systemPrompt": "You are ..." // Her entire personality — better left as is
+        },
+        "research": {
+            "provider": "groq",
+            "model": "groq/compound-mini", // ⚠️ 250 RPD free-tier limit — research ONLY
+            "temperature": 0.6, // Lower = more factual
+            "topP": 1.0,
+            "maxTokens": 1500
+        },
+        "vision": {
+            "model": "meta-llama/llama-4-scout-17b-16e-instruct", // Image understanding
+            "temperature": 0.4,
+            "topP": 1.0,
+            "maxTokens": 1024
+        },
+        "classifier": {
+            "model": "llama-3.1-8b-instant" // YES/NO routing — keep it small and fast
+        },
+        "quickAgent": {
+            // The /medusa slash command — stateless, no memory or lore
+            "model": "", // Empty = use the chat model
+            "temperature": 0.4,
+            "topP": 0.9,
+            "maxTokens": 1400,
+            "allowResearch": true, // Whether /medusa can trigger web search
+            "systemPrompt": [] // Array of lines (see config.json)
+        }
+    },
+    "fallbackModels": [
+        // Tried in order on 503 capacity errors
         "llama-3.3-70b-versatile",
         "qwen/qwen3-32b",
-        "llama-3.1-8b-instant",
+        "llama-3.1-8b-instant"
     ],
 
-    // ─── Generation Parameters ──────────────────────────────────────────────────
-    "temperature": 0.9, // Chat creativity (0.0–2.0)
-    "topP": 1.0, // Nucleus sampling
-    "chatTokens": 1024, // Max tokens for chat responses
+    // ─── Optional Integrations ───────────────────────────────────────────────
+    "search": {
+        "serperKey": "", // serper.dev — free tier: 2500 searches/month
+        "tavilyKey": "" // tavily.com — fallback search provider
+    },
+    "giphyKey": "", // Giphy API key for GIF reactions (blank = free fallback)
 
-    "researchTemp": 0.6, // Research model temperature (lower = more factual)
-    "searchTokens": 1500, // Max tokens for research responses
-
-    "visionTemp": 0.4, // Vision model temperature
-    "visionTokens": 1024, // Max tokens for vision responses
-
-    // ─── Personality ────────────────────────────────────────────────────────────
+    // ─── Behavior ────────────────────────────────────────────────────────────
     "triggers": "meddy,medusa,med", // Words that wake her up (comma-separated)
-    "systemPrompt": "You are ...", // Full system prompt — her entire personality (better to leave as is or just modify lightly)
-
-    // ─── Optional Integrations ──────────────────────────────────────────────────
-    "giphyKey": "", // Giphy API key for GIF reactions (leave blank to use free fallback)
-
-    // ─── Behavior Flags ─────────────────────────────────────────────────────────
     "allowDMs": false, // Whether she responds to DMs
-    "memoryDepth": 25, // How many conversation turns to include in history
-    "FunMsgInterval": 5400,   // Seconds between unprompted messages (0 to disable)
+    "memoryDepth": 25, // Conversation turns included in history
+    "funMsgInterval": 5400, // Seconds between unprompted messages (0 to disable)
+    "pingMode": true, // Whether she can be woken by @mention
+    "replyPing": true, // Whether her replies ping the author
+    "stopSequences": [], // Extra stop sequences passed to the LLM
+    "ignoreUsers": [], // User IDs the AI never responds to (also via med,aiignore)
 
-    // ─── Quick Agent (/medusa slash command) ────────────────────────────────────
-    "quickAgent": {
-    "model": "",             // Override model (empty = use aiModel)
-    "temperature": 0.4,     // Lower = more precise
-    "topP": 0.9,
-    "maxTokens": 1400,
-    "allowResearch": true,   // Whether /medusa can trigger web search
-    "systemPrompt": [...]    // Array of lines (see config.json)
-  },
-
-    // ─── Server Scope ───────────────────────────────────────────────────────────
-    // Leave arrays empty [] to allow all servers
-    "guilds": [], // Servers where prefix commands work
-    "ai_allowed_guilds": [], // Servers where AI responds (subset of guilds)
-    "always_active_channels": [], // Channel IDs: AI always active here (no trigger needed)
-    "fun_channels": [], // Channel IDs for unprompted messages
-    "isolated_servers": [], // Server IDs with their own separate AI memory
+    // ─── Server Scope — one map instead of three parallel arrays ─────────────────
+    // Empty map {} = prefix commands work everywhere. "ai": false disables the AI
+    // in that server; "isolatedMemory": true gives it its own memory database.
+    "guilds": {
+        "YOUR_GUILD_ID": { "ai": true, "isolatedMemory": false }
+    },
+    "alwaysActiveChannels": [], // Channel IDs: AI always active (no trigger needed)
+    "funChannels": [] // Channel IDs for unprompted messages
 }
 ```
 
+> [!IMPORTANT]
+> **Migrating from an older config?** Nothing breaks: every legacy key (`owner_id`, `llm_base_url`/`llm_keys`, `research_base_url`/`research_key`, `aiModel`, `researchTemp`, `FunMsgInterval`, `ai_allowed_guilds`, `isolated_servers`, …) is still read by `extensions/config.js` and mapped onto the shape above, with a deprecation warning at boot. Runtime changes made via `/aimodel`, `/pm`, `iso`/`uniso` and `aiignore` are saved to `runtime.json` — your hand-written `config.json` is never rewritten by the bot.
+
 > [!NOTE]
 > `research_model` is intended for research-only use and is not suitable as the main chat model on the free tier.
-> **Critical model note:** `research_model` (`groq/compound-mini`) has a hard limit of 250 requests/day on Groq's free tier. If you set it as `aiModel`, the bot will exhaust its quota in hours. Keep it research-only.
+> **Critical model note:** the research model (`groq/compound-mini`) has a hard limit of 250 requests/day on Groq's free tier. If you set it as the chat model, the bot will exhaust its quota in hours. Keep it research-only.
 
 > [!TIP]
-> **Recommended stack:** NVIDIA NIM for chat (`mistralai/mistral-small-4-119b-2603`) + Groq compound-mini for research + Serper.dev for live web search results. Get a free Serper key at [serper.dev](https://serper.dev) (2500 searches/month, no card needed). If you only have one provider, omit `research_base_url` and it falls back gracefully.
+> **Recommended stack:** NVIDIA NIM for chat (`mistralai/mistral-small-4-119b-2603`) + Groq compound-mini for research + Serper.dev for live web search results. Get a free Serper key at [serper.dev](https://serper.dev) (2500 searches/month, no card needed).
 
 > [!TIP]
-> **Multi-provider setup:** You can run your main chat on one provider (e.g. NVIDIA NIM or OpenRouter) and keep Groq _only_ for research. Set `research_base_url` and `research_key` in your config — the bot handles routing automatically. If you only have one provider, just omit those fields and everything falls back gracefully.
+> **Multi-provider setup:** list every provider in `providers[]`, then pin agents where you want them: `"agents": { "chat": { "provider": "nvidia" }, "research": { "provider": "groq" } }`. Agents without a `provider` use the highest-priority entry, and everything falls back gracefully if a provider is down.
 
 ---
 
@@ -237,7 +280,7 @@ On first startup, if `performance.json` doesn't exist, the bot auto-creates it w
   },
   "maintenance": {
     "cleanupIntervalMin": 10,       // How often periodic cleanup runs
-    "retentionDays": 90,            // Keep conversation history this long in SQLite
+    "retentionDays": 30,            // Keep conversation history this long in SQLite
     "vacuumEveryDays": 7,           // VACUUM gate — weekly by default (expensive op)
     "loopLagWarnMs": 500            // Warn when Node event loop lag exceeds this
   }
@@ -289,7 +332,11 @@ med,afk [reason]      — Go AFK with a timestamped reason
 med,unafk
 med,ping / med,stats / med,menu
 med,ban / med,mute / med,warn / med,clear / med,mpurge
+med,remind <1h30m|ISO datetime> <text>  — Set a reminder (units: s/m/h/d/w, or an exact date/time)
 ```
+
+> [!NOTE]
+> The prefix `remind` command only accepts a duration or ISO datetime as its first token — it doesn't parse natural language. Mention Medusa instead (`@Medusa remind me to... in 20m`) to set one conversationally; she extracts the timing herself and confirms with a real timestamped reminder line, not just a reply.
 
 ---
 
@@ -361,7 +408,7 @@ The classifier uses a cheap fast model (`llama-3.1-8b-instant`) to avoid burning
 
 ### Key Rotation
 
-Keys in `llm_keys` rotate automatically on 429/401 errors. Keys are permanently blacklisted (`dead_keys.json`) only on organization-level errors (account suspended, org restricted). A transient 401 (expired token) rotates to the next key but doesn't blacklist — the key returns to rotation after restart.
+Keys within each `providers[]` entry rotate automatically on 429/401 errors, and the router falls through to the next provider when one is rate-limited or down. Keys are permanently blacklisted (`dead_keys.json`) only on organization-level errors (account suspended, org restricted). A transient 401 (expired token) rotates to the next key but doesn't blacklist — the key returns to rotation after restart.
 
 ### Confirmation Gate
 
@@ -371,6 +418,12 @@ Destructive agentic commands (`ban`, `mute`, `clear`, `purge`) require explicit 
 2. Bot intercepts it, stores pending, asks: _"Confirm mute on @user for 1h? Reply yes within 30s"_
 3. User replies `yes` → command fires → `✅` react
 4. No reply within 35s → pending expires silently
+
+### Action Self-Check
+
+The capabilities contract (and its `RUN_CMD` syntax) is only injected into the prompt when the message plausibly needs it — a keyword gate keyed off the action verbs she actually supports, `remind`/`reminder` included. This keeps casual chat cheap to generate, but it means any command verb missing from that keyword list would silently fall back to prose instead of a real action for that turn.
+
+As a second layer, whenever she does decide to run one or more commands, she's asked to self-report the number of actions she intended via a hidden `<<ACTIONS_INTENDED: N>>` tag. If the number of `RUN_CMD` tags actually parsed doesn't match, a visible heads-up note is appended so a dropped action never fails silently.
 
 ### Memory Architecture
 
@@ -390,7 +443,7 @@ Global memory (default)          Isolated memory (per /iso guild)
                                          └── reaction_roles
 ```
 
-Servers added to `isolated_servers` get their own memory database, so she maintains completely separate relationship graphs and lore for each.
+Servers with `"isolatedMemory": true` in the `guilds` map (or added live with the `iso` command) get their own memory database, so she maintains completely separate relationship graphs and lore for each.
 
 ---
 
@@ -410,6 +463,7 @@ Servers added to `isolated_servers` get their own memory database, so she mainta
 **Agentic Actions**
 
 - Runs Discord actions autonomously: fetch avatars/banners, create polls/threads, set slowmode, move users in VC, pin messages, manage channels
+- Persistent reminders: set naturally in conversation or via `remind`/`reminder`/`remindme`, survive restarts, poll every 15s
 - All destructive actions go through the confirmation gate
 - Permission-gated: only fires commands the triggering user has permission to run
 
@@ -476,11 +530,11 @@ Open-Dusa uses SQLite with WAL mode. Over months of heavy use, the database file
 | Manual compact | `npm run db:compact`        | Monthly or when `.db` files exceed 500MB           |
 | Check size     | `ls -lh Ai Database/ Logs/` | Weekly                                             |
 | WAL cleanup    | Automatic every 5 minutes   | Always running                                     |
-| Auto-prune     | Automatic every 10 minutes  | Deletes conversations/interests older than 90 days |
+| Auto-prune     | Automatic every 10 minutes  | Deletes conversations/interests older than 30 days |
 
 **What gets pruned automatically:**
 
-- Conversations, interests, personality, aliases, relationships: 90 days of inactivity
+- Conversations, interests, personality, aliases, relationships: 30 days of inactivity
 - Mod logs, resolved warnings: 180 days (configurable in `index.js`)
 - Reaction roles: 90 days
 - Orphaned guild data: when no logs/warnings reference the guild
@@ -501,6 +555,66 @@ Open-Dusa uses SQLite with WAL mode. Over months of heavy use, the database file
 | High memory usage over time                | Normal — LRU caches grow to their limits               | The bot auto-cleans every 10 min. If RSS exceeds ~400MB, check `[Heart] MEMORY LEAK` warnings.                                          |
 | `better-sqlite3` install fails             | Missing build tools                                    | Run `npm install --build-from-source` or install `python3`, `make`, and `g++`                                                           |
 | `npm start` crashes immediately            | Missing native build toolchain for `better-sqlite3@12` | Install `python3`, `make`, `g++` (Alpine: `apk add python3 make g++`), then `npm rebuild better-sqlite3`. Node 20–24 are all supported. |
+
+---
+
+## 🔐 Encryption at Rest
+
+Open-Dusa can encrypt every SQLite database on disk using **SQLCipher** (via `better-sqlite3-multiple-ciphers`, installed automatically).
+
+- Set a passphrase in the **`DB_ENCRYPTION_KEY`** environment variable (e.g. in your Pterodactyl *Startup* variables, or your shell/systemd env). Keep it secret and out of version control.
+- A **`.env`** file in the project root also works — the config loader reads it at boot with no extra dependency. One `KEY=value` per line, `#` comments allowed; real environment variables always take precedence:
+
+    ```bash
+    # generate a 256-bit key
+    node -e "console.log(require('crypto').randomBytes(32).toString('hex'))"
+    # .env
+    DB_ENCRYPTION_KEY=<paste the 64-char hex string>
+    ```
+
+- **Losing the key means losing the database** — there is no recovery. Back it up somewhere off-server. Changing the key (or removing it) will NOT re-encrypt an existing DB: the bot will refuse to open it and tell you why. To rotate keys or encrypt an existing plaintext DB, use a one-time SQLCipher rekey/export, or delete the `.db` files and let the bot rebuild fresh.
+- On the first start after setting the key, the bot **transparently migrates** any existing plaintext databases to encrypted ones and leaves a `*.plain-bak` backup of each original. **Delete those `.plain-bak` files once you've confirmed the bot works** — they are unencrypted.
+- If `DB_ENCRYPTION_KEY` is unset, the bot runs with plaintext storage (unchanged behavior), so existing self-hosters are unaffected.
+- Don't lose the key: without it, encrypted databases cannot be opened.
+
+## 🔒 Privacy Policy
+
+> [!IMPORTANT]
+> This policy covers the publicly hosted **Medusa** instance of Open-Dusa. Self-hosted forks are operated independently by whoever runs them, and that operator is the data controller for their own instance.
+
+### What data is collected
+
+| Data | Why | When |
+| --- | --- | --- |
+| **Message content** | To understand requests and generate relevant AI replies, and to maintain short-term conversational memory | Only from messages that engage Medusa (a mention, a reply to her, or a `med,` prefix command), plus a volatile in-memory buffer of recent channel activity used purely for live context |
+| **Account data** (user ID, username, display name, avatar URL) | To address users by their server nickname and attribute moderation actions | On interaction |
+| **Derived data** (inferred interests, relationship strength, personality notes, per-server "lore") | To make responses contextually aware | Generated from interactions |
+| **Moderation data** (mod-log entries, warnings, automod settings) | To operate moderation features | On moderator action |
+
+### What is NOT collected
+
+- **No presence/status data**, **no voice audio**, and **no bulk message scraping** — the live channel buffer is in-memory only, auto-expires after 10 minutes, and is never persisted.
+- Data is **never sold or shared**. Message context is sent to the configured LLM provider (e.g., Groq) **solely to generate a reply** — it is **not used to train any model**.
+
+### How it's stored
+
+All persistent data lives in **SQLite databases on the bot operator's own server** — never on Discord's infrastructure. Data is **encrypted at rest**.
+
+### Retention
+
+- Conversations, interests, personality, aliases, and relationships: **auto-deleted after 30 days of inactivity**.
+- Moderation logs and resolved warnings: 180 days.
+- The in-memory channel buffer: ~10 minutes.
+
+### Your rights & how to delete your data
+
+- **`/forgetme`** — any user can permanently wipe **all** of their stored data (conversations, profile, interests, relationships, aliases) at any time.
+- **`/aiwipe`** — server administrators can clear all AI memory for their server.
+- Questions or deletion requests can also be sent to the bot operator via the **`/mail`** command.
+
+### Changes
+
+This policy may be updated over time; material changes will be reflected in this document.
 
 ---
 
