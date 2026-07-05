@@ -381,15 +381,15 @@ export async function cmdMpurge(ctx, targetUser, serverWide = false, startFromId
 }
 
 export function registerModeration(client, db, config) {
-    const BOT_OWNER_ID = config.owner_id ? BigInt(config.owner_id) : 0n
+    const BOT_OWNER_ID = config.ownerId ? BigInt(config.ownerId) : 0n
     const ctx_ = { db, BOT_OWNER_ID }
     const isOwner = (id) => BigInt(id) === BOT_OWNER_ID
 
     // Custom keyword trigger phrases — configure in config.json to enable. (for funsies like the old days)
     // e.g. "mute_phrases": ["quiet", "shh"], "ban_phrases": ["get out"]
-    const MUTE_CMDS = config.mute_phrases ?? []
-    const BAN_CMDS = config.ban_phrases ?? []
-    const UNMUTE_CMDS = config.unmute_phrases ?? []
+    const MUTE_CMDS = config.mutePhrases ?? []
+    const BAN_CMDS = config.banPhrases ?? []
+    const UNMUTE_CMDS = config.unmutePhrases ?? []
 
     client.commands.set('ban', async (msg, args) => {
         if (!msg.member.permissions.has(PermissionFlagsBits.BanMembers)) return
