@@ -741,7 +741,7 @@ export async function registerAI(client, db, config) {
         if (!input) {
             const cur = ai.userModes[uid] ?? 0
             return msg.reply(
-                `Your current mode: **${cur === 1 ? 'focused' : 'normal'}** (${cur}). Use \`${prefix}mode focused\` or \`${prefix}mode normal\`.`,
+                `Your current mode: **${cur === 1 ? 'focused' : 'normal'}** (${cur}). Use \`${config.prefix}mode focused\` or \`${config.prefix}mode normal\`.`,
             )
         }
         let newMode = null
