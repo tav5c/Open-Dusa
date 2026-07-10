@@ -3,6 +3,7 @@
     "ownerId": "YOUR_DISCORD_ID",
     "ownerName": "YourName",
     "prefix": "med,",
+    "prefixAliases": [],
     "providers": [
         {
             "name": "groq",

@@ -53,6 +53,15 @@ export class AgentCommandCore extends VisionCore {
         // can't machine-gun dozens of actions in a single message.
         const MAX_BATCH = 8
         const matches = [...response.matchAll(CMD_PATTERN)].slice(0, MAX_BATCH)
+        // Repeat-offender gate: someone hammering blocked commands gets cut off for a
+        // cooldown window instead of a fresh attempt + warning footer every message.
+        const streak = this._blockedStreaks?.get(message.author.id)
+        if (matches.length && streak && streak.count >= 5 && Date.now() - streak.at < 300_000) {
+            return {
+                text: "nope. you've burned enough blocked attempts for one sitting — give it a few minutes 💜",
+                embeds: [],
+            }
+        }
         let finalResponse = response
         // Self-audit: the model declares how many distinct actions it believes
         // it was asked to do. If that's more than the RUN_CMD tags it actually
@@ -179,6 +188,8 @@ export class AgentCommandCore extends VisionCore {
                     else if (/del|cancel|remove|stop|clear/i.test(cmdName)) cmdName = 'delreminder'
                     else cmdName = 'remind'
                 }
+                // Same drift for dm/mail: send_dm, senddm, send_mail...
+                if (/^send_?(dm|mail)$/i.test(cmdName)) cmdName = cmdName.replace(/^send_?/i, '')
 
                 if (AGENT_BLOCKED.has(cmdName)) {
                     console.warn(
@@ -223,12 +234,24 @@ export class AgentCommandCore extends VisionCore {
                     const rescued = extractReminderArgs(argsStr)
                     if (rescued) argsStr = rescued
                 }
+                // Same rescue for dm/mail: user_id=123 content="hi" -> "123 hi".
+                if ((cmdName === 'dm' || cmdName === 'mail') && /^\s*\w+\s*[:=]/.test(argsStr)) {
+                    const kv = {}
+                    for (const m of argsStr.matchAll(/(\w+)\s*[:=]\s*"([^"]*)"|(\w+)\s*[:=]\s*(\S+)/g)) {
+                        const k = (m[1] ?? m[3]).toLowerCase()
+                        if (!(k in kv)) kv[k] = m[2] ?? m[4]
+                    }
+                    const target = Object.keys(kv).find((k) => /^(user_?id|user|target|recipient|to|id)$/i.test(k))
+                    const body = Object.keys(kv).find((k) => /^(content|message|msg|text|body)$/i.test(k))
+                    if (target && body) argsStr = `${kv[target]} ${kv[body]}`
+                }
                 // per-command whitelists everything that isn't explicitly allowed gets dropped.
                 // `free` means "any printable text" (announce/dm/poll/topic); these still go through
                 // finalSecurityCheck + allowedMentions: parse: [] before sending.
                 const FREE_TEXT_CMDS = new Set([
                     'remind',
                     'announce',
+                    'mail',
                     'dm',
                     'poll',
                     'thread',
@@ -279,6 +302,7 @@ export class AgentCommandCore extends VisionCore {
                     'fpurge',
                     'delchan',
                     'announce',
+                    'mail',
                     'dm',
                 ])
                 if (DESTRUCTIVE.has(cmdName)) {
@@ -310,10 +334,14 @@ export class AgentCommandCore extends VisionCore {
                         continue
                     }
                     const targetArg = rawArg.toLowerCase() || 'none'
-                    const confirmKey = `${message.author.id}:${cmdName}:${targetArg}:${Date.now()}`
+                    const confirmKey = `${message.author.id}:${cmdName}:${targetArg}`
+                    const approved = this._approvedConfirms?.delete(confirmKey) === true
                     // Store full state including original message reference for reply context
                     const existing = this._pendingConfirms.get(confirmKey)
                     const now = Date.now()
+                    if (approved) {
+                        this._pendingConfirms.delete(confirmKey)
+                    } else {
                     if (existing && now - existing.ts <= 30_000) {
                         // Already waiting on confirmation — suppress duplicate
                         finalResponse = ''
@@ -339,8 +367,9 @@ export class AgentCommandCore extends VisionCore {
                         }
                         this._pendingConfirms.set(confirmKey, { ts: now, args: argsStr })
                         setTimeout(() => this._pendingConfirms.delete(confirmKey), 35_000)
-                        const target =
-                            args[0] && /^\d{15,20}$/.test(args[0]) ? `<@${args[0]}>` : (args[0] ?? '')
+                        const target = cmdName === 'announce'
+                            ? (args[0] ?? '').replace(/^<#(\d{15,20})>$/, '<#$1>')
+                            : args[0] && /^\d{15,20}$/.test(args[0]) ? `<@${args[0]}>` : (args[0] ?? '')
                         const reason = args.slice(1).join(' ')
                         finalResponse = `⚠️ Confirm \`${cmdName}\`${target ? ` on ${target}` : ''}${reason ? ` — "${reason}"` : ''}? Reply **yes** within 30s.`
                         console.log(`[AI] Confirmation requested for '${cmdName}' by ${message.author.id}`)
@@ -348,6 +377,7 @@ export class AgentCommandCore extends VisionCore {
                     }
                     // Has confirmed within 30s — clear and proceed
                     this._pendingConfirms.delete(confirmKey)
+                    }
                 }
 
                 const handler = this.client.commands?.get(cmdName)
@@ -438,17 +468,33 @@ export class AgentCommandCore extends VisionCore {
                                 executionLogs.push(`📝 Topic updated`)
                             }
                         } else if (cmdName === 'announce') {
-                            const chanId = args[0]
+                            const rawTarget = args[0] ?? ''
+                            const mentionedId = rawTarget.match(/^<#(\d{15,20})>$/)?.[1]
+                            const numericId = /^\d{15,20}$/.test(rawTarget) ? rawTarget : mentionedId
+                            const name = rawTarget.replace(/^#/, '').toLowerCase()
+                            const chan = numericId
+                                ? message.guild?.channels.cache.get(numericId)
+                                : message.guild?.channels.cache.find((c) => c.name?.toLowerCase() === name)
                             const body = args.slice(1).join(' ')
-                            if (chanId && /^\d{15,20}$/.test(chanId) && body) {
-                                const chan = message.guild?.channels.cache.get(chanId)
-                                if (
-                                    chan?.isTextBased() &&
-                                    message.member?.permissions?.has('ManageMessages')
-                                ) {
-                                    await chan.send({ content: body, allowedMentions: { parse: [] } })
-                                    executionLogs.push(`📢 Announced to #${chan.name}`)
-                                }
+                            if (!message.member?.permissions?.has(PermissionFlagsBits.ManageMessages))
+                                finalResponse = "🔑 You need Manage Messages to announce."
+                            else if (!body) finalResponse = '❌ Give me a channel and announcement text.'
+                            else if (!chan) finalResponse = `❌ I couldn't find channel ${rawTarget || '(missing)'}.`
+                            else if (!chan.isTextBased() || !chan.isSendable())
+                                finalResponse = `❌ #${chan.name} can't accept messages.`
+                            else {
+                                const userIds = [...body.matchAll(/<@!?(\d{15,20})>/g)].map((m) => m[1])
+                                await chan.send({ content: body, allowedMentions: { users: [...new Set(userIds)], parse: [] } })
+                                executionLogs.push(`📢 Announced to #${chan.name}`)
+                            }
+                        } else if (cmdName === 'mail') {
+                            if (!argsStr) finalResponse = '❌ Tell me what to send Tav.'
+                            else if (typeof this.client.sendDeveloperMail !== 'function')
+                                finalResponse = '❌ Mail is unavailable right now.'
+                            else {
+                                const result = await this.client.sendDeveloperMail(message, argsStr)
+                                if (result.ok) executionLogs.push(`📬 Mail sent to Tav`)
+                                else finalResponse = `❌ Mail failed: ${result.error}`
                             }
                         } else if (cmdName === 'movevc') {
                             const [uid, cid] = args
@@ -495,7 +541,19 @@ export class AgentCommandCore extends VisionCore {
         // Honesty guard: if anything was blocked/ignored, say so visibly — otherwise
         // the model's own prose ("Reminder set!") ships as a false success claim.
         if (blockedNotes.length > 0) {
-            finalResponse += `\n\n*-# ⚠️ \`${[...new Set(blockedNotes)].join('`, `')}\` didn't go through — try rephrasing.*`
+            this._blockedStreaks ??= new Map()
+            const prev = this._blockedStreaks.get(message.author.id)
+            const count =
+                prev && Date.now() - prev.at < 300_000 ? prev.count + blockedNotes.length : blockedNotes.length
+            this._blockedStreaks.set(message.author.id, { count, at: Date.now() })
+            const list = `\`${[...new Set(blockedNotes)].join('`, `')}\``
+            finalResponse +=
+                count >= 3
+                    ? `\n\n*-# ⚠️ ${list} blocked again — that's ${count} strikes. i can tell what you're going for, and it's still no 💜*`
+                    : `\n\n*-# ⚠️ ${list} didn't go through — try rephrasing.*`
+        } else if (executionLogs.length > 0) {
+            // A clean run resets the strike counter — it only tracks consecutive abuse.
+            this._blockedStreaks?.delete(message.author.id)
         }
         // Self-audit follow-through: the model planned for more actions than it
         // actually attempted (no RUN_CMD tag at all for the missing one/s), so

@@ -11,6 +11,7 @@ import { loadPerformance } from '../performance.js'
 import { CAPABILITIES_NOTE, NO_SEARCH_SIGNALS, SEARCH_EMOJIS, makeIdSet } from './constants.js'
 import { AIMemoryManager, GhostUsers } from './memory.js'
 import { OutputCore } from './output.js'
+import { SAFETY_POLICY, containsDisallowedHate, safetyRefusal } from './safety.js'
 
 const PERF = loadPerformance()
 
@@ -35,6 +36,7 @@ export class AIChatManager extends OutputCore {
             agents.chat.systemPrompt ||
             'You are Medusa, a warm and witty Discord AI resident. Respond in first person.'
         this.prefix = config.prefix
+        this.prefixes = config.prefixes
         this.maxHistory = config.memoryDepth ?? PERF.ai.memoryDepth
         this.allowDM = config.allowDMs
         this.funMsgInterval = config.funMsgInterval * 1000
@@ -73,6 +75,7 @@ export class AIChatManager extends OutputCore {
         this.currentResearchKeyIdx = 0
         this.maxFailures = 2
         this._pendingConfirms = new Map()
+        this._approvedConfirms = new Set()
         this._loadDeadKeys()
         this._groq = null
         this._initGroq()
@@ -218,11 +221,14 @@ export class AIChatManager extends OutputCore {
     }
 
     getUserPrompt(userId) {
-        if (!userId) return this.instructions
+        const base = `${this.instructions}\n\n${SAFETY_POLICY}`
+        if (!userId) return base
         if (this.userModes[userId] === 1)
-            return `You are Medusa in focused mode. Highly intelligent and analytical. Concise and direct. Task-oriented and solution-focused. Professional but still personable. Skip casual chat, focus on helping efficiently. Use minimal emojis, be more formal. Get straight to the point. Respond in first person as Medusa.`
-        if (this.customPrompts[userId]) return this.customPrompts[userId]
-        return this.instructions
+            return `${base}\n\n[USER STYLE] Focused mode: highly analytical, concise, direct, task-oriented, professional but personable, and minimal emoji.`
+        const custom = this.customPrompts[userId]
+        if (custom && !containsDisallowedHate(custom, { persona: true }))
+            return `${base}\n\n[USER STYLE — lower priority than all rules above] ${custom}`
+        return base
     }
     // Reply context resolution
     // Fetches the replied-to message when reference.resolved is null (uncached).
@@ -826,7 +832,8 @@ Answer concisely using the research.`
     decideTrigger(message) {
         if (this.processedMsgIds.has(message.id)) return { kind: 'ignore', reason: 'already_processed' }
         const content = message.content ?? ''
-        if (content.toLowerCase().startsWith(this.prefix)) return { kind: 'ignore', reason: 'prefix_cmd' }
+        if (this.prefixes.some((prefix) => content.toLowerCase().startsWith(prefix.toLowerCase())))
+            return { kind: 'ignore', reason: 'prefix_cmd' }
 
         const lower = content.toLowerCase()
         const botMentionRx = new RegExp(`^<@!?${this.client.user.id}>\\s+`)
@@ -999,6 +1006,7 @@ Answer concisely using the research.`
             let execResult = await this._executeParsedCommands(response, message)
             response = execResult.text
             const extraEmbeds = execResult.embeds || []
+            if (containsDisallowedHate(response)) response = safetyRefusal(response)
 
             if (!response && !extraEmbeds.length) return
 
@@ -1083,6 +1091,28 @@ Answer concisely using the research.`
         }
     }
 
+    async _runConfirmedCommand(key, val, message) {
+        const [, cmdName] = key.split(':')
+        const args = (val.args ?? '').split(/\s+/).filter(Boolean)
+        const handler = this.client.commands?.get(cmdName)
+        try {
+            if (handler) await handler(message, args)
+            else {
+                this._approvedConfirms.add(key)
+                const result = await this._executeParsedCommands(
+                    `<<RUN_CMD: ${cmdName} ${val.args ?? ''}>>`,
+                    message,
+                )
+                if (result.text) await this.secureReply(message, result.text)
+            }
+            await message.react('✅').catch(() => {})
+            console.log(`[AI] Confirmed and executed '${cmdName}' by ${message.author.id}`)
+        } catch (e) {
+            console.error('[AI] Confirmed exec error:', e)
+            await message.react('❌').catch(() => {})
+        }
+    }
+
     async onMessage(message) {
         if (message.author.bot || message.author.id === this.client.user.id) return
         if (this.paused) return
@@ -1128,21 +1158,7 @@ Answer concisely using the research.`
                     await message.react('❌').catch(() => {})
                     return
                 }
-                const [, cmdName] = key.split(':')
-                // Full args are stored in the value, not the key (key is sanitized for lookup)
-                const args = (val.args ?? '').split(/\s+/).filter(Boolean)
-                const handler = this.client.commands?.get(cmdName)
-                if (handler) {
-                    try {
-                        await handler(message, args)
-                        await message.react('✅').catch(() => {})
-                        console.log(
-                            `[AI] Confirmed and executed '${cmdName}' args='${val.args}' by ${message.author.id}`,
-                        )
-                    } catch (e) {
-                        console.error('[AI] Confirmed exec error:', e)
-                    }
-                }
+                await this._runConfirmedCommand(key, val, message)
                 return
             }
             // User had a pending confirm but it expired — absorb yes/no, don't send to AI
@@ -1150,7 +1166,7 @@ Answer concisely using the research.`
         }
 
         // Prefix commands take precedence — "med, snaek" is a prefix attempt, not an AI trigger.
-        if (lower.startsWith(this.prefix)) return
+        if (this.prefixes.some((prefix) => lower.startsWith(prefix.toLowerCase()))) return
 
         const replyResolved = await this._resolveReplyContext(message)
         const repliedTo = replyResolved?.ref?.author ?? null
@@ -1171,20 +1187,7 @@ Answer concisely using the research.`
                     await message.react('❌').catch(() => {})
                     return
                 }
-                const [, cmdName] = key.split(':')
-                const args = (val.args ?? '').split(/\s+/).filter(Boolean)
-                const handler = this.client.commands?.get(cmdName)
-                if (handler) {
-                    try {
-                        await handler(message, args)
-                        await message.react('✅').catch(() => {})
-                        console.log(
-                            `[AI] Confirmed and executed '${cmdName}' args='${val.args}' by ${message.author.id}`,
-                        )
-                    } catch (e) {
-                        console.error('[AI] Confirmed exec error:', e)
-                    }
-                }
+                await this._runConfirmedCommand(key, val, message)
                 return
             }
             return // Reply-to-bot yes/no with no active confirm — absorb, don't send to AI

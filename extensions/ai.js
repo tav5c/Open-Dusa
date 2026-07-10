@@ -17,6 +17,8 @@ import { loadPerformance } from './performance.js'
 import { saveRuntime } from './config.js'
 import { AIChatManager } from './ai/chat.js'
 import { AIMemoryManager } from './ai/memory.js'
+import { containsDisallowedHate, safetyRefusal } from './ai/safety.js'
+import { logAction } from './moderation.js'
 
 export { _undiciAgent } from './ai/providers.js'
 
@@ -153,6 +155,7 @@ export async function registerAI(client, db, config) {
         if (!msg.guild) return
         if (!msg.content?.trim()) return
         if (msg.content.length < 3) return
+        if (containsDisallowedHate(msg.content)) return
         const everyonePerms = msg.channel.permissionsFor(msg.guild.roles.everyone)
         if (!everyonePerms?.has('ViewChannel')) return
 
@@ -228,7 +231,7 @@ export async function registerAI(client, db, config) {
                 if (!response)
                     return interaction.editReply({ content: '✗ All providers failed. Try again shortly.' })
 
-                const safe = ai.finalSecurityCheck(response)
+                const safe = ai.finalSecurityCheck(response, interaction)
                 const chunks = ai.splitResponse(safe, 1900)
                 await interaction.editReply({ content: chunks[0] || '...' })
                 for (let i = 1; i < Math.min(chunks.length, 4); i++) {
@@ -717,8 +720,11 @@ export async function registerAI(client, db, config) {
         const text = args.join(' ')
         if (!text) return msg.reply('Please provide a prompt.')
         const uid = String(msg.author.id)
-        ai.customPrompts[uid] =
-            text + ' + You are Medusa. Respond as yourself in first person, a Discord bot and chatbot.'
+        if (containsDisallowedHate(text, { persona: true })) {
+            if (msg.guild) logAction(db, msg.guild.id, uid, client.user.id, 'AI safety block', 'Unsafe custom persona prompt')
+            return msg.reply(safetyRefusal(text))
+        }
+        ai.customPrompts[uid] = text
         if (ai._promptSaveTimer) clearTimeout(ai._promptSaveTimer)
         ai._promptSaveTimer = setTimeout(() => {
             ai._saveJSON('Ai Database/custom_prompts.json', ai.customPrompts)
@@ -741,7 +747,7 @@ export async function registerAI(client, db, config) {
         if (!input) {
             const cur = ai.userModes[uid] ?? 0
             return msg.reply(
-                `Your current mode: **${cur === 1 ? 'focused' : 'normal'}** (${cur}). Use \`${prefix}mode focused\` or \`${prefix}mode normal\`.`,
+                `Your current mode: **${cur === 1 ? 'focused' : 'normal'}** (${cur}). Use \`${config.prefix}mode focused\` or \`${config.prefix}mode normal\`.`,
             )
         }
         let newMode = null

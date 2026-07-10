@@ -84,7 +84,7 @@ open-dusa/
 
 ### 1. Prerequisites
 
-- Node.js 18 or higher
+- Node.js 20 or higher
 - A Discord bot token ([Discord Developer Portal](https://discord.com/developers/applications))
 - An LLM API key — Groq is recommended and has a free tier ([console.groq.com](https://console.groq.com))
 
@@ -131,6 +131,7 @@ npm run dev      # development (auto-restart on file changes)
     "ownerId": "YOUR_DISCORD_ID", // Your user ID — grants owner-only commands
     "ownerName": "YourName", // How the AI refers to you in her lore
     "prefix": "med,", // Prefix for text commands
+    "prefixAliases": [], // Optional extra prefixes, e.g. ["m.", "m,"] — the main prefix stays canonical in help text
 
     // ─── LLM Providers ───────────────────────────────────────────────────────
     // ONE list for every OpenAI-compatible credential (Groq, NVIDIA NIM,
@@ -323,6 +324,8 @@ npm run start:max      # 6 GB heap, 24 UV threads — 8 GB+ hosts
 | `/iso` / `/uniso`              | Isolate/un-isolate server memory                                 | Owner                   |
 
 ## Prefix Commands (`med,`)
+
+Every command below also works with any alias you add to `prefixAliases` in `config.json`.
 
 ```
 med,p <prompt>        — Set a custom AI persona just for you

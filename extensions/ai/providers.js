@@ -109,8 +109,9 @@ export class ProviderCore {
             }
             try {
                 p.client = new OpenAI({ apiKey: key, baseURL: p.baseUrl, timeout: 12_000, maxRetries: 0 })
-            } catch {
+            } catch (e) {
                 p.client = null
+                if (this._config?.debug) console.warn(`[AI] Provider '${p.name}' client init failed: ${e.message}`)
             }
         }
     }
@@ -144,7 +145,7 @@ export class ProviderCore {
             if (now < p.state.openUntil) continue // breaker open
             try {
                 const payload = {
-                    ...this._buildPayload(p.model ?? this.aiModel, messages, maxTokens, temp, topP),
+                    ...this._buildPayload(p.model ?? this.aiModel, messages, maxTokens, temp, topP, p.baseUrl),
                     stream: false,
                 }
                 const r = await p.client.chat.completions.create(payload)
@@ -156,6 +157,8 @@ export class ProviderCore {
                 this._tripBreaker(p, 'empty response')
             } catch (e) {
                 const err = String(e).toLowerCase()
+                if (this._config?.debug)
+                    console.warn(`[AI] Provider '${p.name}' failed (${e?.status ?? 'no-status'}): ${err.slice(0, 120)}`)
                 if (this._isCapacityError(err)) continue // try next provider, don't trip
                 this._tripBreaker(p, err)
             }
@@ -363,20 +366,20 @@ export class ProviderCore {
         },
     ]
 
-    _detectProvider(model) {
-        const url = this.llmBaseUrl || ''
+    _detectProvider(model, baseUrl = this.llmBaseUrl) {
+        const url = baseUrl || ''
         // ProviderCore owns the static (this file) — the old monolith class name no longer exists here.
         return ProviderCore.PROVIDERS.find((p) => p.match(url, model))
     }
 
-    _buildPayload(model, messages, maxTokens, temp, topP) {
+    _buildPayload(model, messages, maxTokens, temp, topP, baseUrl = this.llmBaseUrl) {
         let payload = {
             model,
             messages,
             temperature: temp ?? this.temperature,
             top_p: topP ?? this.topP,
         }
-        const provider = this._detectProvider(model)
+        const provider = this._detectProvider(model, baseUrl)
         payload = provider.paramMap(payload, maxTokens ?? this.chatTokens)
 
         // Reasoning models (OpenAI o1/o3, DeepSeek-R, gpt-oss)

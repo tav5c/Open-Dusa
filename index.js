@@ -93,6 +93,7 @@ const config = loadConfig()
 // Constants
 const BOT_OWNER_ID = config.ownerId ? BigInt(config.ownerId) : 0n
 const PREFIX = config.prefix
+const PREFIXES = config.prefixes
 const ALLOWED_GUILDS = new Set(config.guildIds.map(BigInt))
 
 // Database
@@ -1163,8 +1164,11 @@ client.on('messageCreate', async (message) => {
         }
 
         // Prefix commands
-        if (!content.startsWith(PREFIX)) return
-        const withoutPrefix = content.slice(PREFIX.length).trim()
+        const matchedPrefix = PREFIXES.find((prefix) =>
+            content.toLowerCase().startsWith(prefix.toLowerCase()),
+        )
+        if (!matchedPrefix) return
+        const withoutPrefix = content.slice(matchedPrefix.length).trim()
         const [cmdName, ...args] = withoutPrefix.split(/\s+/)
         const handler = client.commands.get(cmdName.toLowerCase())
         if (!handler) return

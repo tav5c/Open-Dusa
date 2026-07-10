@@ -5,6 +5,7 @@ import { mkdir, writeFile } from 'fs/promises'
 import { dirname, join } from 'path'
 import { loadPerformance } from '../performance.js'
 import { GHOST_FILE } from './constants.js'
+import { containsDisallowedHate } from './safety.js'
 
 const PERF = loadPerformance()
 
@@ -85,6 +86,7 @@ class AIMemoryManager {
         mkdirSync(base, { recursive: true })
         this.db = dbPool.get(join(base, 'memory.db'))
         this._initSchema()
+        this._purgeUnsafeMemory()
         this._interestsThrottle = new Map()
         this._personalityThrottle = new Map()
     }
@@ -199,6 +201,24 @@ class AIMemoryManager {
         }
     }
 
+
+    _purgeUnsafeMemory() {
+        if (this.db._stub) return
+        try {
+            const tx = this.db.transaction(() => {
+                for (const row of this.db.prepare('SELECT id, message_content, ai_response FROM conversations').iterate())
+                    if (containsDisallowedHate(row.message_content) || containsDisallowedHate(row.ai_response))
+                        this.db.prepare('DELETE FROM conversations WHERE id=?').run(row.id)
+                for (const row of this.db.prepare('SELECT id, fact FROM server_lore').iterate())
+                    if (containsDisallowedHate(row.fact)) this.db.prepare('DELETE FROM server_lore WHERE id=?').run(row.id)
+                for (const row of this.db.prepare('SELECT user_id, traits, preferences, communication_style FROM personality').iterate())
+                    if (containsDisallowedHate([row.traits, row.preferences, row.communication_style].join(' ')))
+                        this.db.prepare('DELETE FROM personality WHERE user_id=?').run(row.user_id)
+            })
+            tx()
+        } catch {}
+    }
+
     updateUser(userId, username, displayName) {
         // Execute immediately to prevent read-after-write race conditions for new users
         try {
@@ -230,6 +250,7 @@ class AIMemoryManager {
     }
 
     addConversation(userId, channelId, msgContent, aiResponse) {
+        if (containsDisallowedHate(msgContent) || containsDisallowedHate(aiResponse)) return false
         const msg = (msgContent ?? '').slice(0, 1000)
         const res = (aiResponse ?? '').slice(0, 2000)
         this._deferWrite(() => {
@@ -264,6 +285,7 @@ class AIMemoryManager {
     }
 
     updateInterests(userId, messageContent) {
+        if (containsDisallowedHate(messageContent)) return
         if (messageContent.split(' ').length < 5) return
         const now = Date.now()
         const last = this._interestsThrottle.get(userId) ?? 0
@@ -385,6 +407,7 @@ class AIMemoryManager {
     }
 
     analyzePersonality(userId, messageContent) {
+        if (containsDisallowedHate(messageContent)) return
         const now = Date.now()
         const last = this._personalityThrottle.get(userId) ?? 0
         if (now - last < 300_000) return
@@ -603,6 +626,7 @@ class AIMemoryManager {
 
     // Server lore
     addLore(fact, source = 'manual') {
+        if (containsDisallowedHate(fact)) return false
         if (!fact?.trim() || fact.length > 120) return false
         try {
             const existing = this.db.prepare('SELECT id FROM server_lore WHERE fact=?').get(fact.trim())
@@ -675,6 +699,7 @@ class AIMemoryManager {
         const phraseUsers = new Map()
         for (const e of entries) {
             const text = (e.content ?? '').trim()
+            if (containsDisallowedHate(text)) continue
             if (text.length < 8 || text.length > 200) continue
             if (LORE_SIGNALS.test(text)) {
                 this.addLore(text.slice(0, 120), 'auto')

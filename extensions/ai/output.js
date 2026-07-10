@@ -3,6 +3,8 @@
 import { MessageFlags } from 'discord.js'
 import { NSFW_TERMS } from './constants.js'
 import { AgentCommandCore } from './agent-commands.js'
+import { containsDisallowedHate, inPersonaRefusal, safetyRefusal } from './safety.js'
+import { logAction } from '../moderation.js'
 
 export class OutputCore extends AgentCommandCore {
     // Degenerate response check
@@ -55,8 +57,23 @@ export class OutputCore extends AgentCommandCore {
     }
 
     // Security / formatting
-    finalSecurityCheck(text) {
+    finalSecurityCheck(text, context = null) {
         if (text === undefined || text === null) return ''
+        if (containsDisallowedHate(text)) {
+            const user = context?.author ?? context?.user
+            const guild = context?.guild
+            if (user?.id && guild?.id && this.db) {
+                this._safetyAuditAt ??= new Map()
+                const key = `${guild.id}:${user.id}`
+                const now = Date.now()
+                if (now - (this._safetyAuditAt.get(key) ?? 0) > 60_000) {
+                    this._safetyAuditAt.set(key, now)
+                    logAction(this.db, guild.id, user.id, this.client.user.id, 'AI safety block', 'Unsafe generated output')
+                }
+            }
+            text = safetyRefusal(text)
+        }
+        text = inPersonaRefusal(text)
         // Strip unrenderable/control/private-use codepoints the model occasionally
         // emits (shows up as □ boxes in Discord) before any other cleanup.
         let text2 = text.replace(/[\u0000-\u0008\u000B-\u001F\u007F-\u009F\uE000-\uF8FF\uFFF0-\uFFFF]/g, '')
@@ -120,7 +137,7 @@ export class OutputCore extends AgentCommandCore {
     }
 
     async secureReply(message, content, opts = {}) {
-        const validated = this.finalSecurityCheck(String(content || ''))
+        const validated = this.finalSecurityCheck(String(content || ''), message)
         const hasContent = !!validated.trim()
         const hasEmbeds = !!opts.embeds?.length
 
