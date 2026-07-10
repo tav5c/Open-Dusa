@@ -169,9 +169,16 @@ export function normalizeConfig(raw) {
     const guilds = normalizeGuilds(raw)
     const guildIds = Object.keys(guilds)
 
+    const prefix = typeof raw.prefix === 'string' && raw.prefix.trim() ? raw.prefix.trim() : 'med,'
+    const prefixes = [...new Set([prefix, ...asArray(raw.prefixAliases ?? raw.prefix_aliases)])]
+        .filter((value) => typeof value === 'string' && value.trim())
+        .map((value) => value.trim())
+        .sort((a, b) => b.length - a.length)
+
     return {
         token: raw.token,
-        prefix: raw.prefix ?? 'med,',
+        prefix,
+        prefixes,
         ownerId: String(raw.ownerId ?? raw.owner_id ?? ''),
         ownerName: raw.ownerName ?? raw.owner_name ?? 'My Developer',
         providers,

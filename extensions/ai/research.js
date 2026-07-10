@@ -19,6 +19,8 @@ export class ResearchCore extends ProviderCore {
         const s = `${err?.code ?? ''} ${err?.message ?? ''} ${err?.error?.message ?? ''}`.toLowerCase()
         return (
             s.includes('tool_use_failed') ||
+            s.includes('tool choice is none') ||
+            s.includes('model called a tool') ||
             s.includes('failed_generation') ||
             s.includes('failed to call a function') ||
             (s.includes('function') && s.includes('adjust your prompt'))
@@ -83,13 +85,15 @@ export class ResearchCore extends ProviderCore {
                 try {
                     r = await runRound(hasSearch)
                 } catch (err) {
-                    // Groq 400 tool_use_failed: the model emitted a malformed tool call. Retry this
-                    // round WITHOUT tools so the research model still answers from context gathered
-                    // so far, instead of crashing out to the primary (search-less) fallback.
-                    if (hasSearch && this._isToolCallError(err)) {
+                    if (!(hasSearch && this._isToolCallError(err))) throw err
+                    // Groq 400 tool_use_failed: the model emitted a malformed tool call. Retry
+                    // WITH tools first — stripping them mid-round makes gpt-oss emit phantom
+                    // calls that 400 as "Tool choice is none, but model called a tool". Only
+                    // fall back to a tool-less round if the with-tools retry fails too.
+                    try {
+                        r = await runRound(true)
+                    } catch {
                         r = await runRound(false)
-                    } else {
-                        throw err
                     }
                 }
 
