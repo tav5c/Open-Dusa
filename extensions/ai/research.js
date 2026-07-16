@@ -27,7 +27,7 @@ export class ResearchCore extends ProviderCore {
         )
     }
 
-    async _callResearch(prompt) {
+    async _callResearch(prompt, _retried = false) {
         if (!this._researchClient) return null
 
         const serperKey = (this._config ?? this.config).search?.serperKey
@@ -55,7 +55,7 @@ export class ResearchCore extends ProviderCore {
             {
                 role: 'system',
                 content:
-                    'You are a precise research assistant. Use the web_search tool to find current information when needed. Synthesize results factually. End with: SOURCES: [Name](url) — max 3 real URLs. Omit if none.',
+                    'You are a precise research assistant. Use the web_search tool to find current information when needed. Synthesize results factually. End with: SOURCES: [Name](url), max 3 real URLs. Omit if none.',
             },
             { role: 'user', content: prompt.slice(0, 800) },
         ]
@@ -63,13 +63,13 @@ export class ResearchCore extends ProviderCore {
         const hasSearch = !!(serperKey || tavilyKey)
         try {
             // Bounded tool-calling loop. Tools stay attached on every round so tool_choice is
-            // never implicitly "none" while the model might still emit a call — that mismatch is
+            // never implicitly "none" while the model might still emit a call, that mismatch is
             // exactly what triggers the provider's 400 tool_use_failed (Tool choice is none, but
             // model called a tool). The round cap prevents runaway search loops.
             const MAX_ROUNDS = 4
             const convo = [...messages]
             for (let round = 0; round < MAX_ROUNDS; round++) {
-                // Lower temp on tool rounds — high temp is the main cause of malformed tool-call JSON.
+                // Lower temp on tool rounds, high temp is the main cause of malformed tool-call JSON.
                 const toolRoundTemp = Math.min(this.researchTemp, 0.3)
                 const runRound = (useTools) =>
                     this._researchClient.chat.completions.create({
@@ -87,7 +87,7 @@ export class ResearchCore extends ProviderCore {
                 } catch (err) {
                     if (!(hasSearch && this._isToolCallError(err))) throw err
                     // Groq 400 tool_use_failed: the model emitted a malformed tool call. Retry
-                    // WITH tools first — stripping them mid-round makes gpt-oss emit phantom
+                    // WITH tools first, stripping them mid-round makes gpt-oss emit phantom
                     // calls that 400 as "Tool choice is none, but model called a tool". Only
                     // fall back to a tool-less round if the with-tools retry fails too.
                     try {
@@ -152,7 +152,7 @@ export class ResearchCore extends ProviderCore {
                             ${snippets}`
                                     : snippets
                             } else {
-                                // No search provider configured — tell the model to answer from knowledge
+                                // No search provider configured, tell the model to answer from knowledge
                                 result =
                                     'No external search tool available. Answer using only your training data and be honest about uncertainty.'
                             }
@@ -172,7 +172,7 @@ export class ResearchCore extends ProviderCore {
                 convo.push(...toolResults)
             }
 
-            // Round cap reached without a plain-text answer — force one final synthesis pass.
+            // Round cap reached without a plain-text answer, force one final synthesis pass.
             const fin = await this._researchClient.chat.completions.create({
                 model: this.researchModel,
                 messages: [
@@ -189,6 +189,13 @@ export class ResearchCore extends ProviderCore {
             return fin.choices?.[0]?.message?.content ?? null
         } catch (e) {
             console.error('[AI] _callResearch failed:', String(e).slice(0, 300))
+            // 429 with spare research keys: rotate and give the whole loop one more shot
+            if (!_retried && this._isKeyError(e) && this.researchKeys.length > 1) {
+                this.currentResearchKeyIdx = (this.currentResearchKeyIdx + 1) % this.researchKeys.length
+                this._initGroq()
+                console.log(`[AI] Research key rotated: -> ${this.currentResearchKeyIdx + 1}`)
+                return this._callResearch(prompt, true)
+            }
             // Last-ditch: ask the primary chat client to answer from its own knowledge
             if (this._groq) {
                 try {
@@ -301,7 +308,7 @@ export class ResearchCore extends ProviderCore {
             isShortCasual
         if (isNever) return 'direct'
 
-        // Classifier round-trip — cache for 2 min so spam of "what's the weather"
+        // Classifier round-trip, cache for 2 min so spam of "what's the weather"
         // doesn't burn 30 LLM calls in a fun channel
         this._routeCache ??= new LRUCache({ max: 500, ttl: 120_000 })
         const cacheKey = lower.slice(0, 200)

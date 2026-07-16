@@ -102,7 +102,6 @@ export class MedusaHeart {
             sizeCalculation: (value) => (typeof value === 'string' ? value.length : 1024),
         })
         this.guildCache = new Map()
-        this.automodCache = new Map()
 
         this.rateLimiter = new GlobalRateLimiter()
         this.retrier = new SmartRetrier()
@@ -138,11 +137,11 @@ export class MedusaHeart {
         )
 
         // auto-expunge hung tasks so they don't leak in the set forever
-        // timeout <= 0 means daemon loop — never expire
+        // timeout <= 0 means daemon loop, never expire
         const timer =
             timeout > 0
                 ? setTimeout(() => {
-                      console.warn(`[Heart] Task '${name}' timed out after ${timeout}ms — forcing cleanup`)
+                      console.warn(`[Heart] Task '${name}' timed out after ${timeout}ms, forcing cleanup`)
                       this._tasks.delete(p)
                   }, timeout).unref()
                 : null
@@ -204,7 +203,7 @@ export class MedusaHeart {
             this.monitor.loopLag = this.loopHistogram.mean / 1e6
             if (this.monitor.loopLag > PERF.maintenance.loopLagWarnMs) {
                 console.warn(
-                    `[Heart] EVENT LOOP LAG: ${this.monitor.loopLag.toFixed(0)}ms — possible blocking operation`,
+                    `[Heart] EVENT LOOP LAG: ${this.monitor.loopLag.toFixed(0)}ms, possible blocking operation`,
                 )
             }
 
@@ -218,7 +217,7 @@ export class MedusaHeart {
                     if (main.use > 90) console.warn(`[Heart] DISK ALMOST FULL: ${main.use.toFixed(0)}%`)
                 }
             } catch {
-                /* fsSize fails in some containers — ignore */
+                /* fsSize fails in some containers, ignore */
             }
 
             // CPU: prefer systeminformation, fallback to last-known (non-blocking)
@@ -249,11 +248,6 @@ export class MedusaHeart {
                     this.guildCache.delete(gid)
                 }
             }
-            for (const [gid, data] of this.automodCache) {
-                if (data.lastAccess && now - data.lastAccess > 7 * 86400000) {
-                    this.automodCache.delete(gid)
-                }
-            }
         }, 60_000).unref()
     }
 
@@ -261,7 +255,7 @@ export class MedusaHeart {
         const shutdown = async (sig) => {
             if (this._closed) return
             this._closed = true
-            console.log(`[Heart] ${sig} — shutting down`)
+            console.log(`[Heart] ${sig}, shutting down`)
             if (this.loopHistogram) this.loopHistogram.disable()
             clearInterval(this._monitorInterval)
             clearInterval(this._cleanupInterval)
@@ -292,14 +286,14 @@ export class MedusaHeart {
         )
         process.on('uncaughtException', (e) => {
             // Discord API errors bubble up as uncaughts from floating promises.
-            // Most are non-fatal (token expired, DM blocked, unknown message) — log and continue.
+            // Most are non-fatal (token expired, DM blocked, unknown message), log and continue.
             // Only bail on genuine runtime crashes.
             const code = e?.code
             const isDiscordSoft = code === 10008 || code === 10062 || code === 40060 ||
                                   code === 50001 || code === 50013 || code === 50035 ||
                                   code === 50007
             if (isDiscordSoft) {
-                console.warn(`[Heart] Soft Discord error (${code}) — continuing`)
+                console.warn(`[Heart] Soft Discord error (${code}), continuing`)
                 this._stats.errors++
                 return
             }

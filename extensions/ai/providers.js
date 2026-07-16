@@ -67,7 +67,7 @@ export class ProviderCore {
             this._researchClient = null
         }
 
-        // Optional Tavily client — wakes up the `else if (this._tavily)` branch in _callResearch.
+        // Optional Tavily client, wakes up the `else if (this._tavily)` branch in _callResearch.
         // Dynamic import via .then() because _initGroq is synchronous (called from constructor).
         const tavilyKey = (this._config ?? this.config).search?.tavilyKey
         if (tavilyKey && !this._tavily) {
@@ -77,7 +77,7 @@ export class ProviderCore {
                     console.log('[AI] Tavily client initialized')
                 })
                 .catch((e) => {
-                    console.warn('[AI] Tavily import failed — run `npm i @tavily/core` to enable:', e.message)
+                    console.warn('[AI] Tavily import failed, run `npm i @tavily/core` to enable:', e.message)
                 })
         }
     }
@@ -102,7 +102,8 @@ export class ProviderCore {
 
     _rebuildProviderClients() {
         for (const p of this._providers) {
-            const key = (p.keys ?? [])[0]
+            p.state.keyIdx ??= 0
+            const key = (p.keys ?? [])[p.state.keyIdx] ?? (p.keys ?? [])[0]
             if (!key) {
                 p.client = null
                 continue
@@ -116,12 +117,12 @@ export class ProviderCore {
         }
     }
 
-    _tripBreaker(p, err) {
+    _tripBreaker(p, err, openMs = 60_000) {
         p.state.failures++
         if (p.state.failures >= 3) {
-            p.state.openUntil = Date.now() + 60_000 // half-open after 1 min
+            p.state.openUntil = Date.now() + openMs // half-open once the window passes
             p.state.failures = 0
-            console.warn(`[AI] Provider '${p.name}' circuit OPEN for 60s (${String(err).slice(0, 80)})`)
+            console.warn(`[AI] Provider '${p.name}' circuit OPEN for ${Math.round(openMs / 1000)}s (${String(err).slice(0, 80)})`)
         }
     }
 
@@ -130,6 +131,57 @@ export class ProviderCore {
             p.state.failures = 0
             p.state.openUntil = 0
         }
+    }
+
+    // Groq 429 bodies say exactly how long to back off ("Please try again in 1m34.608s",
+    // "...in 7.66s", "...in 2h3m"). Believe them instead of guessing a flat cooldown:
+    // a TPD 429 treated like a TPM one just comes straight back after 30s all day.
+    _errorStatus(err) {
+        const direct = Number(err?.status ?? err?.statusCode ?? err?.response?.status)
+        if (Number.isInteger(direct) && direct >= 400 && direct <= 599) return direct
+        const match = String(err).match(/(?:error code:|status(?: code)?[:=]?|\b)(4\d\d|5\d\d)\b/i)
+        return match ? Number(match[1]) : null
+    }
+
+    _parseRetryMs(err) {
+        const headers = err?.headers ?? err?.response?.headers
+        const retryAfter = headers?.get?.('retry-after') ?? headers?.['retry-after']
+        if (retryAfter != null) {
+            const seconds = Number(retryAfter)
+            if (Number.isFinite(seconds)) return Math.min(Math.max(Math.ceil(seconds * 1000) + 1000, 5_000), 6 * 3600_000)
+            const at = Date.parse(retryAfter)
+            if (Number.isFinite(at)) return Math.min(Math.max(at - Date.now() + 1000, 5_000), 6 * 3600_000)
+        }
+        const m = String(err).match(/try again in\s+(?:(\d+)h)?(?:(\d+)m(?!s))?(?:([\d.]+)s)?(?:([\d.]+)ms)?/i)
+        if (!m || (!m[1] && !m[2] && !m[3] && !m[4])) return 60_000
+        const ms =
+            (parseInt(m[1] ?? 0) * 3600 + parseInt(m[2] ?? 0) * 60 + parseFloat(m[3] ?? 0)) * 1000 +
+            parseFloat(m[4] ?? 0)
+        return Math.min(Math.max(Math.ceil(ms) + 1000, 5_000), 6 * 3600_000) // 5s floor, 6h cap
+    }
+
+    // Advance a router provider to its next usable key and rebuild its client.
+    // Returns false when every key is still cooling down.
+    _rotateProviderKey(p, retryMs, reason = 'key error') {
+        const n = p.keys?.length ?? 0
+        if (n < 2) return false
+        p.state.keyIdx ??= 0
+        p.state.keyCooldowns ??= new Map()
+        p.state.keyCooldowns.set(p.state.keyIdx, Date.now() + Math.max(retryMs, 30_000))
+        const now = Date.now()
+        for (let step = 1; step <= n; step++) {
+            const next = (p.state.keyIdx + step) % n
+            if ((p.state.keyCooldowns.get(next) ?? 0) > now) continue
+            try {
+                p.client = new OpenAI({ apiKey: p.keys[next], baseURL: p.baseUrl, timeout: 12_000, maxRetries: 0 })
+                console.log(
+                    `[AI] Provider '${p.name}' key rotated: ${p.state.keyIdx + 1} -> ${next + 1} (${reason}, cooldown ${Math.round(retryMs / 1000)}s)`,
+                )
+                p.state.keyIdx = next
+                return true
+            } catch {}
+        }
+        return false
     }
 
     /**
@@ -143,11 +195,11 @@ export class ProviderCore {
         for (const p of this._providers) {
             if (!p.client) continue
             if (now < p.state.openUntil) continue // breaker open
+            const payload = {
+                ...this._buildPayload(p.model ?? this.aiModel, messages, maxTokens, temp, topP, p.baseUrl),
+                stream: false,
+            }
             try {
-                const payload = {
-                    ...this._buildPayload(p.model ?? this.aiModel, messages, maxTokens, temp, topP, p.baseUrl),
-                    stream: false,
-                }
                 const r = await p.client.chat.completions.create(payload)
                 const out = r.choices?.[0]?.message?.content
                 if (out) {
@@ -159,7 +211,49 @@ export class ProviderCore {
                 const err = String(e).toLowerCase()
                 if (this._config?.debug)
                     console.warn(`[AI] Provider '${p.name}' failed (${e?.status ?? 'no-status'}): ${err.slice(0, 120)}`)
-                if (this._isCapacityError(err)) continue // try next provider, don't trip
+                if (this._isCapacityError(e) || this._isRequestError(e)) continue // changing keys cannot fix these
+                if (this._isKeyError(e)) {
+                    // Burn through the whole key ring before giving up on this provider,
+                    // each org has its own daily pool so the next key is a fresh wallet
+                    let lastErr = e
+                    let stopReason = null // null = walked the ring, every key cooling
+                    const ring = p.keys?.length ?? 1
+                    for (let hop = 1; hop < ring; hop++) {
+                        const retryMs = this._parseRetryMs(lastErr)
+                        const status = this._errorStatus(lastErr)
+                        if (!this._rotateProviderKey(p, retryMs, status ? `HTTP ${status}` : 'key error')) break
+                        try {
+                            const r2 = await p.client.chat.completions.create(payload)
+                            const out2 = r2.choices?.[0]?.message?.content
+                            if (out2) {
+                                this._resetBreaker(p)
+                                return out2
+                            }
+                            stopReason = 'empty response'
+                            break
+                        } catch (e2) {
+                            lastErr = e2
+                            if (!this._isKeyError(e2)) {
+                                stopReason = `non-rate error: ${String(e2).slice(0, 80)}`
+                                break
+                            }
+                        }
+                    }
+                    if (stopReason) {
+                        // Keys aren't the problem here, don't punish the whole provider for it
+                        console.warn(`[AI] Provider '${p.name}' key burn stopped (${stopReason}), trying next provider`)
+                        continue
+                    }
+                    // Every key limited: open the breaker until the soonest key frees up
+                    const cooldowns = [...(p.state.keyCooldowns?.values() ?? [])]
+                    const wait = cooldowns.length ? Math.min(...cooldowns) - Date.now() : this._parseRetryMs(lastErr)
+                    p.state.openUntil = Date.now() + Math.min(Math.max(wait, 30_000), 30 * 60_000)
+                    p.state.failures = 0
+                    console.warn(
+                        `[AI] Provider '${p.name}' circuit OPEN for ${Math.round((p.state.openUntil - Date.now()) / 1000)}s (all keys rate-limited)`,
+                    )
+                    continue // fall through to the next provider right away
+                }
                 this._tripBreaker(p, err)
             }
         }
@@ -186,7 +280,7 @@ export class ProviderCore {
     }
     _saveDeadKeys() {
         try {
-            mkdirSync('Logs', { recursive: true })
+            mkdirSync('data/logs', { recursive: true })
             writeFileSync(DEAD_KEYS_FILE, JSON.stringify({ dead_indices: [...this.deadKeys].sort() }))
         } catch {}
     }
@@ -205,10 +299,11 @@ export class ProviderCore {
                 this.deadKeys.add(old)
                 this._saveDeadKeys()
                 console.log(`[AI] Key ${old + 1} permanently blacklisted`)
-            } else if (this._isRateError(errorMsg)) {
-                // Put the current key on 30s cooldown. If all keys are cooling down,
-                // we'll just wait out the shortest one rather than ping-ponging.
-                this._keyCooldowns.set(old, Date.now() + 30_000)
+            } else if (this._isKeyError(errorMsg)) {
+                // Cool the key down for as long as the provider actually asked for.
+                // If all keys are cooling down, we'll wait out the shortest one
+                // rather than ping-ponging.
+                this._keyCooldowns.set(old, Date.now() + Math.max(this._parseRetryMs(errorMsg), 30_000))
             }
 
             const now = Date.now()
@@ -222,7 +317,7 @@ export class ProviderCore {
                 this._initGroq()
                 if (this._groq) {
                     this.keyFailures[old] = 0
-                    console.log(`[AI] Key rotated: ${old + 1} → ${next + 1}`)
+                    console.log(`[AI] Key rotated: ${old + 1} -> ${next + 1}`)
                     return true
                 }
             }
@@ -234,7 +329,7 @@ export class ProviderCore {
             if (aliveCooldowns.length) {
                 const waitMs = Math.max(0, Math.min(...aliveCooldowns) - Date.now())
                 if (waitMs > 0 && waitMs < 60_000) {
-                    console.log(`[AI] All keys cooling down — waiting ${(waitMs / 1000).toFixed(1)}s`)
+                    console.log(`[AI] All keys cooling down, waiting ${(waitMs / 1000).toFixed(1)}s`)
                     await new Promise((r) => setTimeout(r, waitMs + 100))
                     // Retry once
                     for (let step = 0; step < n; step++) {
@@ -266,11 +361,22 @@ export class ProviderCore {
 
     _isRateError(e) {
         const s = String(e).toLowerCase()
+        const status = this._errorStatus(e)
+        if (status === 429) return true
+        if (status && status !== 429) return false
         return [
             'rate limit',
             'quota exceeded',
             'too many requests',
             'limit exceeded',
+        ].some((x) => s.includes(x))
+    }
+    _isKeyError(e) {
+        if (this._isRateError(e)) return true
+        const status = this._errorStatus(e)
+        if (status === 401 || status === 403) return true
+        const s = String(e).toLowerCase()
+        return [
             'billing',
             'insufficient credits',
             'expired',
@@ -281,12 +387,10 @@ export class ProviderCore {
             'organization has been',
             'account suspended',
             'access denied',
-            '401',
-            '403',
-            '429',
-            '413',
-            '529',
         ].some((x) => s.includes(x))
+    }
+    _isRequestError(e) {
+        return [400, 404, 413, 422].includes(this._errorStatus(e))
     }
     _isDeadKeyError(e) {
         const s = String(e).toLowerCase()
@@ -303,12 +407,15 @@ export class ProviderCore {
     }
     _isCapacityError(e) {
         const s = String(e).toLowerCase()
+        const status = this._errorStatus(e)
         return (
-            (s.includes('503') || s.includes('498')) &&
-            (s.includes('over capacity') ||
+            status === 498 ||
+            status === 529 ||
+            (status === 503 &&
+                (s.includes('over capacity') ||
                 s.includes('service unavailable') ||
                 s.includes('currently unavailable') ||
-                s.includes('capacity'))
+                s.includes('capacity')))
         )
     }
 
@@ -368,7 +475,7 @@ export class ProviderCore {
 
     _detectProvider(model, baseUrl = this.llmBaseUrl) {
         const url = baseUrl || ''
-        // ProviderCore owns the static (this file) — the old monolith class name no longer exists here.
+        // ProviderCore owns the static (this file), the old monolith class name no longer exists here.
         return ProviderCore.PROVIDERS.find((p) => p.match(url, model))
     }
 
@@ -409,14 +516,14 @@ export class ProviderCore {
             return r.choices[0].message.content
         } catch (e) {
             const err = String(e)
-            if (this._isCapacityError(err)) return { capacityError: true }
+            if (this._isCapacityError(e)) return { capacityError: true }
+            if (this._isRequestError(e)) return null
             this.keyFailures[this.currentKeyIdx] = (this.keyFailures[this.currentKeyIdx] ?? 0) + 1
 
-            if (this._isRateError(err) || this.keyFailures[this.currentKeyIdx] >= this.maxFailures) {
+            if (this._isKeyError(e)) {
                 // Check if we have multiple keys to rotate through. If only 1 key, we must respect retry-after.
-                const retryAfterSec = e?.headers?.['retry-after'] ?? e?.response?.headers?.['retry-after']
-                if (this.aiTokens.length <= 1 && retryAfterSec && !this._isDeadKeyError(err)) {
-                    const waitMs = Math.min(parseFloat(retryAfterSec) * 1000, 30_000)
+                if (this.aiTokens.length <= 1 && !this._isDeadKeyError(err)) {
+                    const waitMs = Math.min(this._parseRetryMs(e), 30_000)
                     console.log(`[AI] 429 retry-after: waiting ${waitMs}ms (only 1 key available)`)
                     await new Promise((r) => setTimeout(r, waitMs))
                 }

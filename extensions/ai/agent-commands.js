@@ -49,7 +49,7 @@ export class AgentCommandCore extends VisionCore {
         // Outer <{1,3} / >{1,3} tolerates <<< >>> variants the LLM occasionally emits.
         // Inner \s* before/after args absorbs any extra whitespace the LLM pads in.
         const CMD_PATTERN = /<{2,3}\s*RUN_CMD:\s*([a-zA-Z][a-zA-Z0-9_]*)\s*([\s\S]*?)>{2,3}/g
-        // Batch execution: every tag runs, in order — capped so one jailbroken reply
+        // Batch execution: every tag runs, in order, capped so one jailbroken reply
         // can't machine-gun dozens of actions in a single message.
         const MAX_BATCH = 8
         const matches = [...response.matchAll(CMD_PATTERN)].slice(0, MAX_BATCH)
@@ -58,7 +58,7 @@ export class AgentCommandCore extends VisionCore {
         const streak = this._blockedStreaks?.get(message.author.id)
         if (matches.length && streak && streak.count >= 5 && Date.now() - streak.at < 300_000) {
             return {
-                text: "nope. you've burned enough blocked attempts for one sitting — give it a few minutes 💜",
+                text: "nope. you've burned enough blocked attempts for one sitting, give it a few minutes 💜",
                 embeds: [],
             }
         }
@@ -76,27 +76,21 @@ export class AgentCommandCore extends VisionCore {
         const origReply = message.reply.bind(message)
         const origSend = message.channel.send.bind(message.channel)
 
-        // Commands the AI may NEVER auto-execute — prefix/owner-only actions.
+        // Commands the AI may NEVER auto-execute, prefix/owner-only actions.
         // A hallucinated <<RUN_CMD: p some text>> would overwrite the user's custom prompt,
-        // <<RUN_CMD: aiwipe>> would nuke all memory, etc. Hard block before any handler lookup.
+        // <<RUN_CMD: aihistory>> would dump someone's chat history, etc. Hard block before any handler lookup.
         const AGENT_BLOCKED = new Set([
             'p',
             'prompt',
             'pr',
             'mode',
-            'aipause',
-            'aireinit',
-            'aiwipe',
-            'aimodel',
-            'aiignore',
+            'ai-pause',
             'aihistory',
             'aiclear',
             'aianalyze',
-            'iso',
-            'uniso',
-            'pm',
+            'isolation',
+            'configclean',
             'snake',
-            'userinfo',
             'eval',
             'exec',
             'shell',
@@ -118,7 +112,6 @@ export class AgentCommandCore extends VisionCore {
             'purge',
             'fpurge',
             'mpurge',
-            'filter_purge',
             'createchan',
             'delchan',
             'lockchannel',
@@ -129,7 +122,20 @@ export class AgentCommandCore extends VisionCore {
             'addrole',
             'removerole',
         ])
-        // Per-command permission map — prevents blanket ModerateMembers from granting ban/purge
+        const VIRTUAL_CMDS = new Set([
+            'poll',
+            'thread',
+            'react',
+            'pin',
+            'unpin',
+            'slowmode',
+            'topic',
+            'announce',
+            'mail',
+            'movevc',
+            'dm',
+        ])
+        // Per-command permission map, prevents blanket ModerateMembers from granting ban/purge
         const CMD_PERMS = {
             ban: PermissionFlagsBits.BanMembers,
             kick: PermissionFlagsBits.KickMembers,
@@ -141,7 +147,6 @@ export class AgentCommandCore extends VisionCore {
             purge: PermissionFlagsBits.ManageMessages,
             fpurge: PermissionFlagsBits.ManageMessages,
             mpurge: PermissionFlagsBits.ManageMessages,
-            filter_purge: PermissionFlagsBits.ManageMessages,
             createchan: PermissionFlagsBits.ManageChannels,
             delchan: PermissionFlagsBits.ManageChannels,
             lockchannel: PermissionFlagsBits.ManageRoles,
@@ -193,7 +198,7 @@ export class AgentCommandCore extends VisionCore {
 
                 if (AGENT_BLOCKED.has(cmdName)) {
                     console.warn(
-                        `[AI] Blocked RUN_CMD '${cmdName}' — prefix-only command, not agent-executable`,
+                        `[AI] Blocked RUN_CMD '${cmdName}', prefix-only command, not agent-executable`,
                     )
                     blockedNotes.push(cmdName)
                     continue
@@ -221,9 +226,15 @@ export class AgentCommandCore extends VisionCore {
                     }
                 }
 
+                if (!this.client.commands?.has(cmdName) && !VIRTUAL_CMDS.has(cmdName)) {
+                    console.warn(`[AI] Ignored unknown RUN_CMD '${cmdName}'`)
+                    blockedNotes.push(cmdName)
+                    continue
+                }
+
                 let argsStr = match[2].trim()
-                // Normalize typographic characters LLMs love to emit — smart quotes/dashes →
-                // ASCII — so otherwise-valid commands aren't rejected for cosmetic reasons.
+                // Normalize typographic characters LLMs love to emit, smart quotes/dashes ->
+                // ASCII, so otherwise-valid commands aren't rejected for cosmetic reasons.
                 argsStr = argsStr
                     .replace(/[\u201C\u201D\u201E]/g, '"')
                     .replace(/[\u2018\u2019]/g, "'")
@@ -263,10 +274,10 @@ export class AgentCommandCore extends VisionCore {
                 ])
                 const MODE = FREE_TEXT_CMDS.has(cmdName) ? 'free' : 'strict'
                 if (MODE === 'strict') {
-                    // Strict: IDs, durations, reasons — ASCII word chars + : _ - . , space quotes
+                    // Strict: IDs, durations, reasons, ASCII word chars + : _ - . , space quotes
                     if (!/^[\w\s.,:'"@#<>!&\-]*$/u.test(argsStr)) {
                         console.warn(
-                            `[AI] Blocked RUN_CMD '${cmdName}' — strict arg check failed: ${argsStr.slice(0, 120)}`,
+                            `[AI] Blocked RUN_CMD '${cmdName}', strict arg check failed: ${argsStr.slice(0, 120)}`,
                         )
                         blockedNotes.push(cmdName)
                         continue
@@ -279,13 +290,13 @@ export class AgentCommandCore extends VisionCore {
                         /\.\.\//.test(argsStr) ||
                         /%00/.test(argsStr)
                     ) {
-                        console.warn(`[AI] Blocked RUN_CMD '${cmdName}' — unsafe char in free args`)
+                        console.warn(`[AI] Blocked RUN_CMD '${cmdName}', unsafe char in free args`)
                         blockedNotes.push(cmdName)
                         continue
                     }
                 }
                 if (argsStr.length > 1500) {
-                    console.warn(`[AI] Blocked RUN_CMD '${cmdName}' — args too long (${argsStr.length})`)
+                    console.warn(`[AI] Blocked RUN_CMD '${cmdName}', args too long (${argsStr.length})`)
                     blockedNotes.push(cmdName)
                     continue
                 }
@@ -321,16 +332,16 @@ export class AgentCommandCore extends VisionCore {
                     const rawArg = args[0]?.replace(/[<@!>]/g, '') ?? ''
                     if (needsUserId && !/^\d{15,20}$/.test(rawArg)) {
                         console.warn(
-                            `[AI] Blocked hallucinated ${cmdName} — arg '${rawArg}' is not a user ID`,
+                            `[AI] Blocked hallucinated ${cmdName}, arg '${rawArg}' is not a user ID`,
                         )
-                        finalResponse = `❌ I couldn't \`${cmdName}\` them — give me a real @mention or numeric user ID (not a name or "him/her/them"), then I'll do it.`
+                        finalResponse = `❌ I couldn't \`${cmdName}\` them, give me a real @mention or numeric user ID (not a name or "him/her/them"), then I'll do it.`
                         continue
                     }
                     if (needsInt && !/^\d{1,3}$/.test(rawArg)) {
                         console.warn(
-                            `[AI] Blocked hallucinated ${cmdName} — arg '${rawArg}' is not a valid count`,
+                            `[AI] Blocked hallucinated ${cmdName}, arg '${rawArg}' is not a valid count`,
                         )
-                        finalResponse = `❌ I couldn't \`${cmdName}\` — that wasn't a valid number of messages.`
+                        finalResponse = `❌ I couldn't \`${cmdName}\`, that wasn't a valid number of messages.`
                         continue
                     }
                     const targetArg = rawArg.toLowerCase() || 'none'
@@ -343,7 +354,7 @@ export class AgentCommandCore extends VisionCore {
                         this._pendingConfirms.delete(confirmKey)
                     } else {
                     if (existing && now - existing.ts <= 30_000) {
-                        // Already waiting on confirmation — suppress duplicate
+                        // Already waiting on confirmation, suppress duplicate
                         finalResponse = ''
                         continue
                     }
@@ -361,7 +372,7 @@ export class AgentCommandCore extends VisionCore {
                             const rawId = args[0]?.replace(/[<@!>]/g, '')
                             const targetMember = rawId ? message.guild?.members.cache.get(rawId) : null
                             if (targetMember && !targetMember.moderatable) {
-                                finalResponse = `❌ I can't mute <@${rawId}> — they're above me in the hierarchy.`
+                                finalResponse = `❌ I can't mute <@${rawId}>, they're above me in the hierarchy.`
                                 continue
                             }
                         }
@@ -371,11 +382,11 @@ export class AgentCommandCore extends VisionCore {
                             ? (args[0] ?? '').replace(/^<#(\d{15,20})>$/, '<#$1>')
                             : args[0] && /^\d{15,20}$/.test(args[0]) ? `<@${args[0]}>` : (args[0] ?? '')
                         const reason = args.slice(1).join(' ')
-                        finalResponse = `⚠️ Confirm \`${cmdName}\`${target ? ` on ${target}` : ''}${reason ? ` — "${reason}"` : ''}? Reply **yes** within 30s.`
+                        finalResponse = `⚠️ Confirm \`${cmdName}\`${target ? ` on ${target}` : ''}${reason ? `, "${reason}"` : ''}? Reply **yes** within 30s.`
                         console.log(`[AI] Confirmation requested for '${cmdName}' by ${message.author.id}`)
                         continue
                     }
-                    // Has confirmed within 30s — clear and proceed
+                    // Has confirmed within 30s, clear and proceed
                     this._pendingConfirms.delete(confirmKey)
                     }
                 }
@@ -394,7 +405,7 @@ export class AgentCommandCore extends VisionCore {
                     try {
                         if (cmdName === 'poll') {
                             // <<RUN_CMD: poll "Question?" "Answer1" "Answer2" "Answer3">>
-                            // NOTE: must use origSend, not message.channel.send — the latter is
+                            // NOTE: must use origSend, not message.channel.send, the latter is
                             // monkey-patched for the whole batch to CAPTURE other commands' reply
                             // embeds into the AI's consolidated response, not to actually post. Using
                             // it here silently "succeeded" against a fake object and no poll ever
@@ -520,7 +531,7 @@ export class AgentCommandCore extends VisionCore {
                                 }
                             }
                         } else {
-                            console.warn(`[AI] Ignored RUN_CMD '${cmdName}' — not a recognized command`)
+                            console.warn(`[AI] Ignored RUN_CMD '${cmdName}', not a recognized command`)
                             blockedNotes.push(cmdName)
                         }
                     } catch (e) {
@@ -538,7 +549,7 @@ export class AgentCommandCore extends VisionCore {
         if (executionLogs.length > 0) {
             finalResponse += `\n\n*-# ⚙️ ${executionLogs.join(' · ')}*`
         }
-        // Honesty guard: if anything was blocked/ignored, say so visibly — otherwise
+        // Honesty guard: if anything was blocked/ignored, say so visibly, otherwise
         // the model's own prose ("Reminder set!") ships as a false success claim.
         if (blockedNotes.length > 0) {
             this._blockedStreaks ??= new Map()
@@ -549,10 +560,10 @@ export class AgentCommandCore extends VisionCore {
             const list = `\`${[...new Set(blockedNotes)].join('`, `')}\``
             finalResponse +=
                 count >= 3
-                    ? `\n\n*-# ⚠️ ${list} blocked again — that's ${count} strikes. i can tell what you're going for, and it's still no 💜*`
-                    : `\n\n*-# ⚠️ ${list} didn't go through — try rephrasing.*`
+                    ? `\n\n*-# ⚠️ ${list} blocked again, that's ${count} strikes. i can tell what you're going for, and it's still no 💜*`
+                    : `\n\n*-# ⚠️ ${list} didn't go through, try rephrasing.*`
         } else if (executionLogs.length > 0) {
-            // A clean run resets the strike counter — it only tracks consecutive abuse.
+            // A clean run resets the strike counter, it only tracks consecutive abuse.
             this._blockedStreaks?.delete(message.author.id)
         }
         // Self-audit follow-through: the model planned for more actions than it
@@ -560,7 +571,7 @@ export class AgentCommandCore extends VisionCore {
         // there's nothing in executionLogs/blockedNotes to catch it. Surface the
         // gap explicitly instead of ending the reply looking fully complete.
         if (actionsIntended !== null && actionsIntended > matches.length) {
-            finalResponse += `\n\n*-# 📋 Heads up — I planned ${actionsIntended} action${actionsIntended === 1 ? '' : 's'} but only attempted ${matches.length}. Something may have gotten dropped — let me know what's missing and I'll redo it.*`
+            finalResponse += `\n\n*-# 📋 Heads up, I planned ${actionsIntended} action${actionsIntended === 1 ? '' : 's'} but only attempted ${matches.length}. Something may have gotten dropped, let me know what's missing and I'll redo it.*`
         }
         let cleanedText = finalResponse
             .replace(/<{2,3}\s*RUN_CMD:\s*[\s\S]*?>{2,3}[>\s]*/g, '')

@@ -54,12 +54,12 @@ export class VisionCore extends ResearchCore {
         if (!textAtts.length) return ''
         const totalSize = textAtts.reduce((sum, att) => sum + att.size, 0)
         if (totalSize > 150_000)
-            return `\n\n[${textAtts.length} file(s) skipped — combined size ${(totalSize / 1024).toFixed(0)}KB exceeds limit]`
+            return `\n\n[${textAtts.length} file(s) skipped, combined size ${(totalSize / 1024).toFixed(0)}KB exceeds limit]`
         // Fetch all text attachments in parallel
         const results = await Promise.all(
             textAtts.map(async (att) => {
                 if (att.size > 80_000)
-                    return `\n\n[File: \`${att.name}\` — too large to read (${(att.size / 1024).toFixed(0)}KB)]`
+                    return `\n\n[File: \`${att.name}\`, too large to read (${(att.size / 1024).toFixed(0)}KB)]`
                 try {
                     const res = await fetch(att.url)
                     const text = await res.text()
@@ -125,10 +125,10 @@ export class VisionCore extends ResearchCore {
         const vclient = this._visionClient ?? this._groq
         if (!vclient) return null
         const gifNote = isGif
-            ? "\n\nNote: This is an animated GIF. You can only see the first frame. Describe what you see clearly and precisely — vibe, subject, colours, action. Be honest that it's one frame if movement is implied."
+            ? "\n\nNote: This is an animated GIF. You can only see the first frame. Describe what you see clearly and precisely, vibe, subject, colours, action. Be honest that it's one frame if movement is implied."
             : ''
         const visionSys =
-            'You are a precise image description assistant. Describe exactly what you see — subjects, actions, text, mood, colours, context. Be detailed and factual. No greetings, no fluff. Just the visual content.' +
+            'You are a precise image description assistant. Describe exactly what you see, subjects, actions, text, mood, colours, context. Be detailed and factual. No greetings, no fluff. Just the visual content.' +
             gifNote
         const imageCount = allImages?.length ?? 1
         const userText = (
@@ -216,10 +216,10 @@ export class VisionCore extends ResearchCore {
                 errType = 'expired'
             else if (err.includes('400') || err.includes('invalid image') || err.includes('invalid url'))
                 errType = 'format'
-            else if (this._isCapacityError(err)) return null
+            else if (this._isCapacityError(e) || this._isRequestError(e)) return null
             else {
                 this.keyFailures[this.currentKeyIdx] = (this.keyFailures[this.currentKeyIdx] ?? 0) + 1
-                if (this._isRateError(err) || this.keyFailures[this.currentKeyIdx] >= this.maxFailures) {
+                if (this._isKeyError(e)) {
                     if (await this.rotateKey(err)) {
                         try {
                             const r2 = await vclient.chat.completions.create({
@@ -236,7 +236,7 @@ export class VisionCore extends ResearchCore {
             }
         }
 
-        // On format/400 error, try once more with the raw URL (no base64) — some NVIDIA
+        // On format/400 error, try once more with the raw URL (no base64), some NVIDIA
         // vision endpoints reject data URLs and need a direct link.
         if (errType === 'format' && imageUrl) {
             try {
@@ -267,19 +267,19 @@ export class VisionCore extends ResearchCore {
         if (errType === 'expired') return "that image link seems to have expired or isn't loading for me 😅"
         if (errType === 'format') return "hmm i couldn't process that image format 🤔"
         if (!raw) {
-            // Vision failed but we got a prompt — answer without the image
+            // Vision failed but we got a prompt, answer without the image
             return await this.generateResponse({ prompt: prompt?.trim() || 'Describe what you see.', userId })
         }
 
-        // Stage 2 — rewrite
+        // Stage 2, rewrite
         const mediaLabel = isGif ? 'GIF (first frame)' : 'image'
         const kSys =
             (systemPrompt || this.instructions || '') +
-            '\n\nDISCORD FORMATTING — use purposefully:\n**bold** key things you notice · *italic* for vibe/tone · `code` for any text/numbers in the image · -# for small captions · lists only if genuinely listing multiple distinct things'
+            '\n\nDISCORD FORMATTING, use purposefully:\n**bold** key things you notice · *italic* for vibe/tone · `code` for any text/numbers in the image · -# for small captions · lists only if genuinely listing multiple distinct things'
         const kPrompt =
             `You just saw a ${mediaLabel}. Here's what it contains:\n${'─'.repeat(36)}\n${raw}\n${'─'.repeat(36)}\n\n` +
             (prompt?.trim() ? `The user asked: ${prompt.trim()}\n\n` : '') +
-            `Respond naturally as Medusa — react genuinely to what you see. If it's funny, be amused. If it's beautiful, say so. If it's weird, own that reaction. Use Discord markdown sparingly for key details. Never say 'according to the description' or 'the image shows' — speak as if you're seeing it yourself, in first person.`
+            `Respond naturally as Medusa, react genuinely to what you see. If it's funny, be amused. If it's beautiful, say so. If it's weird, own that reaction. Use Discord markdown sparingly for key details. Never say 'according to the description' or 'the image shows', speak as if you're seeing it yourself, in first person.`
         const final = await this.generateResponse({
             prompt: kPrompt,
             history: null,

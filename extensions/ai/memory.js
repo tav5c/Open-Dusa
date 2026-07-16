@@ -1,6 +1,6 @@
 // Persistence layer: pooled SQLite handles, per-user agentic memory + lore,
 // and the ghost-user list. One AIMemoryManager per memory scope (global/isolated).
-import { existsSync, mkdirSync, readFileSync } from 'fs'
+import { existsSync, mkdirSync, readFileSync, readdirSync } from 'fs'
 import { mkdir, writeFile } from 'fs/promises'
 import { dirname, join } from 'path'
 import { loadPerformance } from '../performance.js'
@@ -76,11 +76,23 @@ class AIMemoryManager {
 
     constructor(guildId = null, guildName = null) {
         ;(globalThis._aiMemManagers ??= new Set()).add(this)
-        let base = 'Ai Database'
+        let base = 'data/ai'
         if (guildId) {
             const safeName = (guildName || guildId).replace(/[/\\]/g, '_')
-            const folder = `${safeName} - ${guildId}`
-            base = join('Ai Database', folder)
+            let folder = `${safeName} - ${guildId}`
+            // if this guild was isolated before (maybe under an old name), pick
+            // its old folder back up so re-isolating resumes the same db
+            this.resumed = false
+            try {
+                const prev = readdirSync('data/ai', { withFileTypes: true }).find(
+                    (d) => d.isDirectory() && d.name.endsWith(` - ${guildId}`),
+                )
+                if (prev) {
+                    folder = prev.name
+                    this.resumed = true
+                }
+            } catch {}
+            base = join('data/ai', folder)
         }
         this._guildId = guildId
         mkdirSync(base, { recursive: true })
@@ -89,6 +101,11 @@ class AIMemoryManager {
         this._purgeUnsafeMemory()
         this._interestsThrottle = new Map()
         this._personalityThrottle = new Map()
+        // Auto-vacuum: each DB compacts on its own schedule so no two files block each
+        // other. The boot delay keeps first-message latency clean; runtime-created
+        // isolated DBs pick this up automatically since it lives in the constructor.
+        setTimeout(() => this.vacuum(), 30_000).unref()
+        setInterval(() => this.vacuum(), (24 + Math.random() * 2) * 3600_000).unref()
     }
 
     _deferWrite(fn) {
@@ -153,6 +170,10 @@ class AIMemoryManager {
                 created_at DATETIME DEFAULT CURRENT_TIMESTAMP
             );
             CREATE INDEX IF NOT EXISTS idx_lore_freq ON server_lore(frequency DESC);
+            CREATE TABLE IF NOT EXISTS user_summaries (
+                user_id TEXT PRIMARY KEY, summary TEXT,
+                covered INTEGER DEFAULT 0, updated_at DATETIME DEFAULT CURRENT_TIMESTAMP
+            );
         `)
 
         // Pre-prepare frequently-used statements to avoid re-parsing SQL on every call
@@ -282,6 +303,54 @@ class AIMemoryManager {
                       'SELECT user_id, message_content, timestamp FROM conversations WHERE channel_id=? AND user_id!=? ORDER BY timestamp DESC LIMIT ?',
                   )
                   .all(channelId, excludeUserId, limit)
+    }
+
+    getSummary(userId) {
+        try {
+            return this.db.prepare('SELECT summary FROM user_summaries WHERE user_id=?').get(userId)?.summary ?? null
+        } catch {
+            return null
+        }
+    }
+
+    usersNeedingSummary(keep = 60, max = 4) {
+        // Only users whose backlog clearly outgrew the keep window, the margin avoids churn
+        return this.db
+            .prepare(
+                'SELECT user_id, COUNT(*) AS backlog FROM conversations GROUP BY user_id HAVING backlog > ? LIMIT ?',
+            )
+            .all(keep + 25, max)
+    }
+
+    oldConversations(userId, keep = 60) {
+        return this.db
+            .prepare(
+                'SELECT id, message_content, ai_response FROM conversations WHERE user_id=? ORDER BY timestamp DESC LIMIT -1 OFFSET ?',
+            )
+            .all(userId, keep)
+    }
+
+    saveSummaryAndPrune(userId, summary, ids) {
+        if (containsDisallowedHate(summary)) return false
+        try {
+            const tx = this.db.transaction(() => {
+                this.db
+                    .prepare(
+                        `INSERT INTO user_summaries (user_id, summary, covered, updated_at)
+                        VALUES (?,?,?,CURRENT_TIMESTAMP)
+                        ON CONFLICT(user_id) DO UPDATE SET summary=excluded.summary,
+                            covered=covered+excluded.covered, updated_at=CURRENT_TIMESTAMP`,
+                    )
+                    .run(userId, String(summary).slice(0, 1500), ids.length)
+                const del = this.db.prepare('DELETE FROM conversations WHERE id=?')
+                for (const id of ids) del.run(id)
+            })
+            tx()
+            return true
+        } catch (e) {
+            console.error('[DB] summary prune error:', e)
+            return false
+        }
     }
 
     updateInterests(userId, messageContent) {
@@ -484,6 +553,9 @@ class AIMemoryManager {
         const personality = this.getPersonality(userId)
         if (personality?.traits) parts.push(`Personality: ${personality.traits}`)
 
+        const summary = this.getSummary(userId)
+        if (summary) parts.push(`Long-term memory: ${summary}`)
+
         const interests = this.getInterests(userId, 10)
         if (interests.length) {
             const top = interests
@@ -502,7 +574,7 @@ class AIMemoryManager {
             })
         }
 
-        // Relationships — who this user talks to most
+        // Relationships, who this user talks to most
         try {
             const rels = (
                 this._stmts?.getRelationships ??
@@ -537,7 +609,7 @@ class AIMemoryManager {
             }
         } catch {}
 
-        // Server lore — cultural context
+        // Server lore, cultural context
         const lore = this.getLore(8)
         if (lore.length) {
             parts.push(`Server culture/lore: ${lore.map((l) => l.fact).join(' | ')}`)
@@ -563,8 +635,21 @@ class AIMemoryManager {
         return parts.join('\n')
     }
 
+    vacuum() {
+        // Deleted rows only mark pages free, VACUUM is what actually shrinks the file
+        if (this.db._stub) return false
+        try {
+            this.db.pragma('wal_checkpoint(TRUNCATE)')
+            this.db.exec('VACUUM')
+            return true
+        } catch (e) {
+            console.error('[DB] vacuum error:', e.message)
+            return false
+        }
+    }
+
     wipeUser(userId) {
-        for (const table of ['conversations', 'interests', 'personality', 'relationships', 'user_aliases']) {
+        for (const table of ['conversations', 'interests', 'personality', 'relationships', 'user_aliases', 'user_summaries']) {
             try {
                 this.db.prepare(`DELETE FROM ${table} WHERE user_id=?`).run(userId)
             } catch {}
@@ -612,7 +697,7 @@ class AIMemoryManager {
             )
             .run(cutoff)
         this.cleanupLore()
-        // Gated VACUUM — defaults to once per 7 days to avoid 3-5s blocking ops
+        // Gated VACUUM, defaults to once per 7 days to avoid 3-5s blocking ops
         const now = Date.now()
         const gapMs = PERF.maintenance.vacuumEveryDays * 86400_000
         this._lastVacuum ??= 0
@@ -712,7 +797,7 @@ class AIMemoryManager {
                 phraseUsers.get(phrase).add(e.userId)
             }
         }
-        // Skip URL fragments, domain names, and generic web noise — these pollute context badly
+        // Skip URL fragments, domain names, and generic web noise, these pollute context badly
         const LORE_URL_JUNK =
             /https?|www\b|\.com|\.net|\.org|\.gg|tenor|giphy|imgur|discord|youtube|twitch|twitter|tiktok/i
         for (const [phrase, users] of phraseUsers) {
@@ -740,7 +825,7 @@ class GhostUsers {
         this._saveTimer = setTimeout(async () => {
             this._saveTimer = null
             try {
-                await mkdir('Ai Database', { recursive: true })
+                await mkdir('data/ai', { recursive: true })
                 await writeFile(GHOST_FILE, JSON.stringify(this._data, null, 2))
             } catch {}
         }, 2000)

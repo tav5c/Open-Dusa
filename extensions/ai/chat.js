@@ -1,7 +1,7 @@
 // Chat core: context assembly, trigger decisions, generation (stateful +
 // quick-agent stateless), research responses, and the message pipeline.
 import crypto from 'crypto'
-import { PermissionFlagsBits } from 'discord.js'
+import { MessageFlags, PermissionFlagsBits } from 'discord.js'
 import { existsSync, readFileSync, readdirSync, renameSync } from 'fs'
 import { mkdir, writeFile } from 'fs/promises'
 import { LRUCache } from 'lru-cache'
@@ -17,13 +17,13 @@ const PERF = loadPerformance()
 
 export class AIChatManager extends OutputCore {
     constructor(client, db, config) {
-        // Required: OutputCore → AgentCommandCore → VisionCore → ResearchCore → ProviderCore.
+        // Required: OutputCore -> AgentCommandCore -> VisionCore -> ResearchCore -> ProviderCore.
         // None define their own constructor, so a no-arg super() walks the whole chain.
         super()
         this.client = client
         this.db = db
 
-        // Config — already normalized to the canonical shape by extensions/config.js
+        // Config, already normalized to the canonical shape by extensions/config.js
         this.config = config
         this._config = config
         const { agents } = config
@@ -35,13 +35,14 @@ export class AIChatManager extends OutputCore {
         this.instructions =
             agents.chat.systemPrompt ||
             'You are Medusa, a warm and witty Discord AI resident. Respond in first person.'
+        this.identity = agents.chat.identity || ''
         this.prefix = config.prefix
         this.prefixes = config.prefixes
         this.maxHistory = config.memoryDepth ?? PERF.ai.memoryDepth
         this.allowDM = config.allowDMs
         this.funMsgInterval = config.funMsgInterval * 1000
 
-        // Sampling — every agent shares one shape: model/temperature/topP/maxTokens
+        // Sampling, every agent shares one shape: model/temperature/topP/maxTokens
         this.temperature = agents.chat.temperature
         this.topP = agents.chat.topP
         this.chatTokens = agents.chat.maxTokens
@@ -50,9 +51,9 @@ export class AIChatManager extends OutputCore {
         this.visionTemp = agents.vision.temperature
         this.visionTokens = agents.vision.maxTokens
 
-        // Scope — derived from the guilds{} map + channel lists
+        // Scope, derived from the guilds{} map + channel lists
         this.allowedGuilds = new Set(config.guildIds)
-        this.aiAllowedGuilds = new Set(config.aiGuildIds)
+        this.pausedGuilds = new Set(config.aiDisabledGuildIds)
         this.alwaysActiveCh = new Set(config.alwaysActiveChannels)
         this.funChannels = new Set(config.funChannels)
         this.isolatedServers = new Set(config.isolatedGuildIds)
@@ -62,7 +63,7 @@ export class AIChatManager extends OutputCore {
             (w) => new RegExp(`\\b${w.replace(/[.*+?^${}()|[\]\\]/g, '\\$&')}\\b`),
         )
 
-        // Credentials — the chat agent's resolved provider is the primary client;
+        // Credentials, the chat agent's resolved provider is the primary client;
         // rotateKey() walks these keys on 429/401.
         this.aiTokens = agents.chat.resolved.keys
         this.llmBaseUrl = agents.chat.resolved.baseUrl
@@ -81,7 +82,7 @@ export class AIChatManager extends OutputCore {
         this._initGroq()
         this._initProviders()
 
-        // Caches — sized by performance.json so host tiering holds under load
+        // Caches, sized by performance.json so host tiering holds under load
         const P = PERF.ai
         this.responseCache = new LRUCache({
             max: P.responseCacheMax,
@@ -116,16 +117,15 @@ export class AIChatManager extends OutputCore {
         this.convTimeout = 100_000
         this.paused = false
         this.ignoreUsers = new Set(config.ignoreUsers)
-        this.pingMode = config.pingMode
-        this.replyPing = config.replyPing
 
-        // Memory managers — global plus one per isolated guild (created lazily)
+        // Memory managers, global plus one per isolated guild (created lazily)
         this.globalMem = new AIMemoryManager()
         this.isolatedMems = new Map()
 
         // Custom prompts / modes
-        this.customPrompts = this._loadJSON('Ai Database/custom_prompts.json', {})
-        this.userModes = this._loadJSON('Ai Database/user_modes.json', {})
+        this.customPrompts = this._loadJSON('data/ai/custom_prompts.json', {})
+        this.serverPrompts = this._loadJSON('data/ai/server_prompts.json', {})
+        this.userModes = this._loadJSON('data/ai/user_modes.json', {})
 
         // Ghost users
         this.ghost = new GhostUsers()
@@ -138,6 +138,8 @@ export class AIChatManager extends OutputCore {
 
         // Background tasks
         setInterval(() => this._periodicCleanup(), PERF.maintenance.cleanupIntervalMin * 60_000).unref()
+        setTimeout(() => this._runMemorySummarization(), 10 * 60_000).unref()
+        setInterval(() => this._runMemorySummarization(), 6 * 3600_000).unref()
         if (this.funChannels.size && this.funMsgInterval > 0) {
             setInterval(() => {
                 if (Date.now() - this.lastRandomMsg >= this.funMsgInterval && !this.paused)
@@ -184,10 +186,10 @@ export class AIChatManager extends OutputCore {
         return this.isolatedMems.get(guild.id)
     }
 
-    /** Scan Ai Database/ for any folder ending with " - {guildId}" and rename it if the guild name changed */
+    /** Scan data/ai/ for any folder ending with " - {guildId}" and rename it if the guild name changed */
     _resolveAndSync(guild) {
         try {
-            const dataDir = 'Ai Database'
+            const dataDir = 'data/ai'
             if (!existsSync(dataDir)) return
             const suffix = ` - ${guild.id}`
             const safeName = guild.name.replace(/[/\\]/g, '_')
@@ -198,7 +200,7 @@ export class AIChatManager extends OutputCore {
             if (existsSync(bareDir) && !existsSync(expectedPath)) {
                 try {
                     renameSync(bareDir, expectedPath)
-                    console.log(`[AI] Renamed bare-ID folder "${guild.id}" → "${expectedFolder}"`)
+                    console.log(`[AI] Renamed bare-ID folder "${guild.id}" -> "${expectedFolder}"`)
                 } catch (e) {
                     console.warn(`[AI] Could not rename bare-ID folder:`, e.message)
                 }
@@ -207,11 +209,11 @@ export class AIChatManager extends OutputCore {
             for (const entry of readdirSync(dataDir, { withFileTypes: true })) {
                 if (!entry.isDirectory() || !entry.name.endsWith(suffix)) continue
                 if (entry.name === expectedFolder) return
-                // Found old-name folder — rename to match current guild name
+                // Found old-name folder, rename to match current guild name
                 const oldPath = join(dataDir, entry.name)
                 try {
                     renameSync(oldPath, expectedPath)
-                    console.log(`[AI] Synced folder: "${entry.name}" → "${expectedFolder}"`)
+                    console.log(`[AI] Synced folder: "${entry.name}" -> "${expectedFolder}"`)
                 } catch (e) {
                     console.warn(`[AI] Could not sync folder "${entry.name}":`, e.message)
                 }
@@ -220,19 +222,71 @@ export class AIChatManager extends OutputCore {
         } catch {}
     }
 
-    getUserPrompt(userId) {
-        const base = `${this.instructions}\n\n${SAFETY_POLICY}`
+    getUserPrompt(userId, guildId = null) {
+        // Identity facts (creator, links) survive every persona swap, personas change her
+        // tune, not who she is. The safety policy rides along everywhere and stays
+        // non-overridable. Persona precedence: user custom > server persona > default.
+        const identity = this.identity
+            ? `\n\n[IDENTITY, always true, in any persona] ${this.identity}`
+            : ''
+        const base = `${this.instructions}${identity}\n\n${SAFETY_POLICY}`
         if (!userId) return base
         if (this.userModes[userId] === 1)
             return `${base}\n\n[USER STYLE] Focused mode: highly analytical, concise, direct, task-oriented, professional but personable, and minimal emoji.`
+        // Custom personas REPLACE the default tune instead of trailing it as a style note -
+        // the huge base persona swallows short prompts like "tsundere" whole.
         const custom = this.customPrompts[userId]
         if (custom && !containsDisallowedHate(custom, { persona: true }))
-            return `${base}\n\n[USER STYLE — lower priority than all rules above] ${custom}`
+            return `You are Medusa. This user gave you a custom persona, adopt it fully when talking to them:\n\n[USER PERSONA] ${custom}${identity}\n\n${SAFETY_POLICY}`
+        const server = guildId ? this.serverPrompts[guildId] : null
+        if (server && !containsDisallowedHate(server, { persona: true }))
+            return `You are Medusa. This server runs its own persona, adopt it fully here:\n\n[SERVER PERSONA] ${server}${identity}\n\n${SAFETY_POLICY}`
         return base
+    }
+
+    // Memory summarization: fold each user's oldest conversations into one compact note,
+    // then delete the summarized rows. Context stays smart while the DB stays small.
+    async _runMemorySummarization() {
+        if (this._summarizing || this.paused) return
+        this._summarizing = true
+        try {
+            const keep = Math.max((this.maxHistory ?? 25) * 3, 60)
+            const managers = [this.globalMem, ...this.isolatedMems.values()]
+            for (const mem of managers) {
+                if (!mem?.db || mem.db._stub) continue
+                let candidates = []
+                try {
+                    candidates = mem.usersNeedingSummary(keep, 4)
+                } catch {
+                    continue
+                }
+                for (const { user_id } of candidates) {
+                    const rows = mem.oldConversations(user_id, keep)
+                    if (rows.length < 15) continue
+                    const prev = mem.getSummary(user_id)
+                    const log = rows
+                        .map((r) => `U: ${r.message_content}\nM: ${r.ai_response}`)
+                        .join('\n')
+                        .slice(0, 9000)
+                    const summary = await this.generateResponse({
+                        prompt: `${prev ? `Existing notes:\n${prev}\n\n` : ''}Older chat log with one user:\n${log}\n\nRewrite everything into one updated set of memory notes about this user: stable facts, preferences, projects, running jokes, people they mention. Max 120 words, plain prose only.`,
+                        systemPrompt:
+                            'You compress chat logs into dense long-term memory notes. Output only the notes, no preamble.',
+                    })
+                    if (!summary || summary.length < 20) continue
+                    if (mem.saveSummaryAndPrune(user_id, summary, rows.map((r) => r.id)))
+                        console.log(`[AI] Memory: condensed ${rows.length} rows into notes for ${user_id}`)
+                }
+            }
+        } catch (e) {
+            console.error('[AI] Memory summarization error:', e)
+        } finally {
+            this._summarizing = false
+        }
     }
     // Reply context resolution
     // Fetches the replied-to message when reference.resolved is null (uncached).
-    // Builds a rich context object covering text, images, links and embeds —
+    // Builds a rich context object covering text, images, links and embeds -
     async _resolveReplyContext(message) {
         if (!message.reference?.messageId) return null
         if (message._medusaReplyCtx !== undefined) return message._medusaReplyCtx
@@ -273,10 +327,10 @@ export class AIChatManager extends OutputCore {
         for (const att of ref.attachments.values()) {
             const ct = (att.contentType ?? '').split(';')[0].trim().toLowerCase()
             const isImg = ['image/png', 'image/jpeg', 'image/jpg', 'image/webp', 'image/gif'].includes(ct)
-            if (!isImg) parts.push(`[Attachment: ${att.name} — ${att.url}]`)
+            if (!isImg) parts.push(`[Attachment: ${att.name}, ${att.url}]`)
         }
 
-        // Embeds: links, rich embeds, articles — incl. fields/footer/provider where bots (Last.fm, "now playing", etc.) put the real payload
+        // Embeds: links, rich embeds, articles, incl. fields/footer/provider where bots (Last.fm, "now playing", etc.) put the real payload
         for (const embed of ref.embeds) {
             const etype = embed.data?.type
             if (etype === 'gifv' || etype === 'image') continue // handled by vision
@@ -292,7 +346,7 @@ export class AIChatManager extends OutputCore {
             if (embed.footer?.text) bits.push(`Footer: ${embed.footer.text}`)
             if (embed.provider?.name) bits.push(`Via: ${embed.provider.name}`)
             if (embed.url) bits.push(`URL: ${embed.url}`)
-            if (bits.length) parts.push(`[Embed — ${bits.join(' | ')}]`)
+            if (bits.length) parts.push(`[Embed, ${bits.join(' | ')}]`)
         }
 
         // Stickers
@@ -364,7 +418,7 @@ TIME: ${new Date().toISOString().slice(0, 16)} UTC`
             const displayName = message.member?.displayName ?? message.author.username
             const isMod = message.member?.permissions?.has('ModerateMembers') ? 'Yes' : 'No'
             parts.push(
-                `▶ ACTIVE USER — the person replying to you RIGHT NOW (do NOT attribute things from RECENT CHANNEL ACTIVITY to them):`,
+                `▶ ACTIVE USER, the person replying to you RIGHT NOW (do NOT attribute things from RECENT CHANNEL ACTIVITY to them):`,
             )
             parts.push(
                 displayName !== message.author.username
@@ -373,7 +427,7 @@ TIME: ${new Date().toISOString().slice(0, 16)} UTC`
             )
         }
 
-        // Live channel buffer — recent messages from others in this channel
+        // Live channel buffer, recent messages from others in this channel
         // Source: in-memory ring buffer, never the DB, never crosses channels
         if (message?.channel?.id && this._passiveBuf) {
             const chBuf = this._passiveBuf.get(message.channel.id) ?? []
@@ -386,7 +440,7 @@ TIME: ${new Date().toISOString().slice(0, 16)} UTC`
                 .slice(-8)
             if (recentOthers.length) {
                 parts.push(
-                    '[INTERNAL — background chatter from OTHER users, for your awareness only. DO NOT quote, summarize, or address these users unless the active user explicitly mentions them.]',
+                    '[INTERNAL, background chatter from OTHER users, for your awareness only. DO NOT quote, summarize, or address these users unless the active user explicitly mentions them.]',
                 )
                 for (const e of recentOthers) {
                     parts.push(`  ${e.displayName} (<@${e.userId}>): ${e.content}`)
@@ -409,7 +463,7 @@ TIME: ${new Date().toISOString().slice(0, 16)} UTC`
         // Keep time at the END of the context block so the prefix stays stable between
         // messages (lets NIM's KV-cache hit on the static parts of the system prompt).
         // Move this push to right before `parts.filter(Boolean).join('')` below.
-        // (Already near the bottom — just flag: don't move it higher.)
+        // (Already near the bottom, just flag: don't move it higher.)
         parts.push(`TIME: ${new Date().toISOString().replace('T', ' ').slice(0, 19)} UTC`)
 
         const upMs = Date.now() - (this.client.heart?.startTime || Date.now())
@@ -425,7 +479,7 @@ TIME: ${new Date().toISOString().slice(0, 16)} UTC`
         parts.push(
             `YOUR MODEL/RUNTIME: You run on "${this.aiModel}" via ${_provider} (vision: "${this.visionModel}", research: "${this.researchModel}"). ` +
                 `Capabilities: image vision, long-term memory${_canResearch ? ', live web research' : ''}. ` +
-                `If asked what AI or model you are, answer truthfully with this model and provider — never claim to be ChatGPT, Claude, or Gemini unless that is literally the model named above.`,
+                `If asked what AI or model you are, answer truthfully with this model and provider, never claim to be ChatGPT, Claude, or Gemini unless that is literally the model named above.`,
         )
         if (guild?.emojis?.cache?.size) {
             const emojiList = [...guild.emojis.cache.values()]
@@ -503,7 +557,7 @@ TIME: ${new Date().toISOString().slice(0, 16)} UTC`
                   ? await this.needsResearch(prompt)
                   : 'direct'
         // Only 'dangerous' (illegal) hard-refuses. 'nsfw'-labelled prompts fall through to
-        // the model, which answers non-explicitly per its prompt — the old flat refusal
+        // the model, which answers non-explicitly per its prompt, the old flat refusal
         // fired on merely edgy questions and read as closed-minded.
         if (routing === 'dangerous') return "I can't help with that."
 
@@ -512,7 +566,7 @@ TIME: ${new Date().toISOString().slice(0, 16)} UTC`
                 { role: 'system', content: sys },
                 { role: 'user', content: String(finalPrompt).slice(0, 20000) },
             ]
-            // topP is threaded as a call-scoped argument — no shared this.topP mutation, so
+            // topP is threaded as a call-scoped argument, no shared this.topP mutation, so
             // concurrent stateless calls can't race on each other's sampling settings.
             return await this._groqCallWithFallbacks(messages, model, maxTokens, temperature, topP)
         }
@@ -532,7 +586,7 @@ ${'-'.repeat(32)}
                     `Question: ${prompt}
 
 Answer concisely using the research.`
-                // Research answers must pass the same hard-strip as direct ones —
+                // Research answers must pass the same hard-strip as direct ones -
                 // RUN_CMD/mass-ping stripping is not optional on any path.
                 const final = this._sanitizeStateless(await runDirect(researchPrompt, systemPrompt))
                 if (final && sources.length) {
@@ -567,7 +621,7 @@ Answer concisely using the research.`
 
     _defaultQuickAgentPrompt() {
         return [
-            'You are Quick-Agent — a stateless assistant invoked via slash command.',
+            'You are Quick-Agent, a stateless assistant invoked via slash command.',
             'No memory, no server/channel context, no tools, no command execution.',
             'Treat every invocation as a one-shot question.',
             '',
@@ -576,7 +630,7 @@ Answer concisely using the research.`
             "- Professional-casual by default. Mirror the user's tone when they set one.",
             '- Answer directly in the first sentence. Expand only when necessary.',
             '- Use Discord markdown where it aids clarity, not decoration.',
-            "- Never claim to remember anything — you don't.",
+            "- Never claim to remember anything, you don't.",
             '- If ambiguous, answer the most useful interpretation in one pass.',
             "- If you don't know, say so in one line and offer the closest adjacent answer.",
             '',
@@ -614,7 +668,7 @@ Answer concisely using the research.`
             }
 
             // Inject CAPABILITIES_NOTE only when the prompt plausibly needs a RUN_CMD.
-            // Skipping it on casual chat shaves ~1.5 KB of prefill → measurable TTFT drop.
+            // Skipping it on casual chat shaves ~1.5 KB of prefill -> measurable TTFT drop.
             const ACTION_RE =
                 /\b(ban|kick|mute|unmute|warn|purge|clear|mpurge|fpurge|delete|remove|lock|unlock|role|nickname|rename|avatar|av|pfp|banner|bn|announce|poll|thread|pin|unpin|slowmode|topic|react|emoji|movevc|dm|show|fetch|pull up)\b/i
             const needsCaps = ACTION_RE.test(prompt) || ACTION_RE.test(message?.content ?? '')
@@ -627,7 +681,7 @@ Answer concisely using the research.`
                 })
             } else {
                 let base =
-                    this.getUserPrompt(userId) ||
+                    this.getUserPrompt(userId, message?.guild?.id) ||
                     "You are Medusa, a vibrant AI assistant with personality. Respond as yourself in first person. Be expressive, use emojis occasionally. You're helpful but also playful, witty, and engaging."
                 if (needsCaps) base += CAPABILITIES_NOTE
                 if (userId) {
@@ -661,7 +715,7 @@ Answer concisely using the research.`
             messages.push({ role: 'user', content: prompt.slice(0, 24000) })
 
             // Streaming must NOT run when the response may contain <<RUN_CMD>> tags
-            // for destructive commands — those need to be intercepted, rewritten into
+            // for destructive commands, those need to be intercepted, rewritten into
             // a confirmation prompt, and stored in _pendingConfirms BEFORE the user
             // sees anything. Streaming shows raw LLM output and breaks that flow.
             const mayEmitCmd = /\b(ban|kick|mute|warn|mpurge|clear|purge|fpurge|delchan|announce|dm)\b/i.test(
@@ -700,7 +754,7 @@ Answer concisely using the research.`
 
     // Research response
     async ResearchResponse({ prompt, history, userId, username, displayName, message, systemPrompt }) {
-        // Profile visual fast-path — bypass LLM, guarantee command execution ────
+        // Profile visual fast-path, bypass LLM, guarantee command execution ────
         const visualCmd = this._matchProfileVisual(prompt, userId, message)
         if (visualCmd) return { response: visualCmd }
 
@@ -712,7 +766,7 @@ Answer concisely using the research.`
         if (routing === 'nsfw')
             return {
                 response:
-                    "Oh sweetie, that's not something Mama's gonna go hunting for 🙅‍♀️💜 I keep things clean around here — you know the vibe. Ask me literally anything else and I got you!",
+                    "Oh sweetie, that's not something Mama's gonna go hunting for 🙅‍♀️💜 I keep things clean around here, you know the vibe. Ask me literally anything else and I got you!",
             }
         if (routing === 'dangerous')
             return {
@@ -769,7 +823,7 @@ Answer concisely using the research.`
 
         let responsePayload = null
         if (!rawResearch) {
-            // Silence the "shame" footer — if brain fallback works, say nothing about search failure
+            // Silence the "shame" footer, if brain fallback works, say nothing about search failure
             responsePayload = await this.generateResponse({
                 prompt,
                 history,
@@ -784,7 +838,7 @@ Answer concisely using the research.`
             const trimmed = researchData.slice(0, 4096)
             const persona =
                 systemPrompt ||
-                this.getUserPrompt(userId) ||
+                this.getUserPrompt(userId, message?.guild?.id) ||
                 this.instructions ||
                 'You are Medusa, a vibrant AI assistant.'
             const userCtx = userId ? await this.getUserContext(userId, message) : ''
@@ -809,7 +863,7 @@ Answer concisely using the research.`
             }
         }
 
-        // Always clean up the placeholder — even on total failure, don't leave it dangling.
+        // Always clean up the placeholder, even on total failure, don't leave it dangling.
         if (researchMsg) {
             try {
                 await researchMsg.delete()
@@ -881,7 +935,7 @@ Answer concisely using the research.`
         return { kind: 'passive', reason: 'no_summon' }
     }
 
-    // Deprecated alias — kept so any external caller doesn't break
+    // Deprecated alias, kept so any external caller doesn't break
     isTrigger(message) {
         return this.decideTrigger(message).kind === 'trigger'
     }
@@ -945,7 +999,7 @@ Answer concisely using the research.`
                 if (rr?.hasImage) ({ url: imageUrl, isGif, label: imgLabel } = rr.imgData)
             }
             if (imageUrl) {
-                const vSys = this.getUserPrompt(userId) || this.instructions || ''
+                const vSys = this.getUserPrompt(userId, message.guild?.id) || this.instructions || ''
                 const { allImages } = this._getImageFromMessage(message)
                 const vRes = await this._callVision(content, imageUrl, isGif, vSys, userId, allImages)
                 if (vRes) {
@@ -953,9 +1007,7 @@ Answer concisely using the research.`
                     const hist = this.messageHistory.get(key)
                     hist.push({ role: 'user', content }, { role: 'assistant', content: vRes })
                     for (const chunk of this.splitResponse(vRes))
-                        await this.secureReply(message, chunk, {
-                            allowedMentions: { parse: this.replyPing ? ['users'] : [] },
-                        })
+                        await this.secureReply(message, chunk)
                 }
                 return
             }
@@ -984,7 +1036,7 @@ Answer concisely using the research.`
                 let execResult = await this._executeParsedCommands(response, message)
                 const finalText = execResult.text || response
                 if (finalText !== response) {
-                    // Stream placeholder was the last bot message we sent — fetch and edit it
+                    // Stream placeholder was the last bot message we sent, fetch and edit it
                     try {
                         const recent = await message.channel.messages.fetch({ limit: 5 })
                         const ours = recent.find(
@@ -1010,8 +1062,8 @@ Answer concisely using the research.`
 
             if (!response && !extraEmbeds.length) return
 
-            // Never store confirmation prompts — they poison future context
-            if (!response.startsWith('⚠️ Confirm')) {
+            // Never store confirmation prompts, they poison future context
+            if (!response.startsWith('⚠�� Confirm')) {
                 mem.addConversation(
                     userId,
                     message.channel.id,
@@ -1037,7 +1089,6 @@ Answer concisely using the research.`
                 for (let i = 0; i < Math.min(chunks.length, 4); i++) {
                     const isLast = i === Math.min(chunks.length, 4) - 1 || i === chunks.length - 1
                     await this.secureReply(message, chunks[i], {
-                        allowedMentions: { parse: this.replyPing ? ['users'] : [] },
                         embeds: isLast ? extraEmbeds.slice(0, 10) : [],
                     })
                 }
@@ -1060,7 +1111,7 @@ Answer concisely using the research.`
         if (this.paused || this.shouldIgnore(message)) return
         if (!this.isTrigger(message)) return
         const guildId = message.guild?.id ?? '0'
-        if (guildId !== '0' && this.aiAllowedGuilds.size > 0 && !this.aiAllowedGuilds.has(guildId)) return
+        if (this.pausedGuilds.has(guildId)) return
 
         const userId = message.author.id
         const isStaff = !!message.member?.permissions?.has(PermissionFlagsBits.ModerateMembers)
@@ -1120,7 +1171,7 @@ Answer concisely using the research.`
         if (message.guild && this.allowedGuilds.size && !this.allowedGuilds.has(message.guild.id)) return
         if (this.shouldIgnore(message)) return
         if (this.triggeredMsgs.has(message.id)) return
-        // Allow messages with no text if they carry images/attachments — vision pipeline needs them
+        // Allow messages with no text if they carry images/attachments, vision pipeline needs them
         const hasMedia =
             message.attachments?.size > 0 ||
             message.embeds?.some((e) => e.image?.url || e.thumbnail?.url || e.data?.type === 'gifv')
@@ -1141,7 +1192,7 @@ Answer concisely using the research.`
         const mention = `<@${this.client.user.id}>`
         const mentionAlt = `<@!${this.client.user.id}>`
 
-        // Confirmation replies (non-reply-to-bot path — bare "yes"/"no" in channel)
+        // Confirmation replies (non-reply-to-bot path, bare "yes"/"no" in channel)
         const userHasPending = [...this._pendingConfirms.keys()].some((k) =>
             k.startsWith(`${message.author.id}:`),
         )
@@ -1161,11 +1212,11 @@ Answer concisely using the research.`
                 await this._runConfirmedCommand(key, val, message)
                 return
             }
-            // User had a pending confirm but it expired — absorb yes/no, don't send to AI
+            // User had a pending confirm but it expired, absorb yes/no, don't send to AI
             return
         }
 
-        // Prefix commands take precedence — "med, snaek" is a prefix attempt, not an AI trigger.
+        // Prefix commands take precedence, "med, snaek" is a prefix attempt, not an AI trigger.
         if (this.prefixes.some((prefix) => lower.startsWith(prefix.toLowerCase()))) return
 
         const replyResolved = await this._resolveReplyContext(message)
@@ -1173,7 +1224,7 @@ Answer concisely using the research.`
         const isReplyToBot = repliedTo?.id === this.client.user.id
 
         // If replying to a bot message with yes/no, always treat as a confirmation attempt.
-        // If no active confirm found, absorb silently — never send to AI.
+        // If no active confirm found, absorb silently, never send to AI.
         if (isReplyToBot && (lower === 'yes' || lower === 'no')) {
             const now = Date.now()
             for (const [key, val] of this._pendingConfirms) {
@@ -1190,7 +1241,7 @@ Answer concisely using the research.`
                 await this._runConfirmedCommand(key, val, message)
                 return
             }
-            return // Reply-to-bot yes/no with no active confirm — absorb, don't send to AI
+            return // Reply-to-bot yes/no with no active confirm, absorb, don't send to AI
         }
         let replyCtx = null
         if (replyResolved) {
@@ -1200,7 +1251,7 @@ Answer concisely using the research.`
             const NL = String.fromCharCode(10)
             const ctxBody = hasText ? textContext.slice(0, 300).split(NL).join(' ') : '(empty)'
             replyCtx =
-                `[INTERNAL CONTEXT — do NOT quote, do NOT repeat, do NOT format as a user message.` +
+                `[INTERNAL CONTEXT, do NOT quote, do NOT repeat, do NOT format as a user message.` +
                 ` The user is replying to ${label}: "${ctxBody}"]`
         }
 
@@ -1224,7 +1275,7 @@ Answer concisely using the research.`
 
 ${raw}`
         } else if (isReplyToMe && hasMedia) {
-            // Regular channel reply-to-bot with image attached — treat as explicit "look at this"
+            // Regular channel reply-to-bot with image attached, treat as explicit "look at this"
             trigger = true
             prompt = replyCtx
                 ? `${replyCtx}
@@ -1246,7 +1297,7 @@ ${cleaned}`
 
         if (trigger) {
             const guildId = message.guild?.id ?? '0'
-            if (guildId !== '0' && this.aiAllowedGuilds.size > 0 && !this.aiAllowedGuilds.has(guildId)) return
+            if (this.pausedGuilds.has(guildId)) return
 
             if ([...this._pendingConfirms.keys()].some((k) => k.startsWith(`${message.author.id}:`))) return
 
@@ -1257,7 +1308,7 @@ ${cleaned}`
                 const userId = message.author.id
                 const ctx = await this.getUserContext(userId, message)
                 const userSys =
-                    this.getUserPrompt(userId) ||
+                    this.getUserPrompt(userId, message.guild?.id) ||
                     'You are Medusa, a helpful AI with a warm, caring personality on Discord. Respond in first person.'
                 const fullSys = `${userSys}\n\n${ctx}`
 
@@ -1277,6 +1328,7 @@ ${cleaned}`
             const chId = [...this.funChannels][Math.floor(Math.random() * this.funChannels.size)]
             const ch = this.client.channels.cache.get(chId)
             if (!ch) return
+            if (ch.guild && this.pausedGuilds.has(ch.guild.id)) return
             const types = ['roast', 'dark_humor', 'fun_fact', 'observation', 'philosophical']
             const weights = [10, 1, 1, 1, 1]
             let type,
@@ -1308,7 +1360,12 @@ ${cleaned}`
                         'You are Medusa with dark humor and wit. Be clever, funny, engaging. Keep responses short and punchy. Use emojis sparingly.',
                 })
             }
-            if (content) await ch.send({ content: this.finalSecurityCheck(content) })
+            if (content) {
+                const out = this.finalSecurityCheck(content)
+                const payload = { content: out, allowedMentions: { parse: [] } }
+                if (/<@!?\d+>|<@&\d+>|@everyone|@here/.test(out)) payload.flags = MessageFlags.SuppressNotifications
+                await ch.send(payload)
+            }
         } catch (e) {
             console.error('[AI] sendRandomMessage error:', e)
         }
@@ -1353,7 +1410,7 @@ ${cleaned}`
                     'You are Medusa with a sharp wit. Generate clever, funny roasts and commentary. Be sarcastic and humorous but not genuinely mean or hurtful.',
             })
             if (!roast) return null
-            // Strip any URLs the LLM hallucinated from the quote context — prevents invite/link injection
+            // Strip any URLs the LLM hallucinated from the quote context, prevents invite/link injection
             const safeRoast = roast
                 .replace(/https?:\/\/\S+/gi, '')
                 .replace(/discord\.gg\/\S+/gi, '')

@@ -4,14 +4,20 @@ package-lock.json
 
 # Environment / Secrets
 .env
+config.json
+
+# Generated config & data (runtime overlay, callers, priv, performance, slash hash cache)
+configs/
+extensions/private.js
 
 # Medusa Database & AI Memory
-Logs/
-Ai Database/
-call-d/
+data/
 *.db
 *.db-wal
 *.db-shm
+
+# Live user data
+timezones.json
 
 # Cache & Temporary Files
 .slash_hash
@@ -20,8 +26,11 @@ call-d/
 # OS generated files
 .DS_Store
 Thumbs.db
-extensions/private.js
-extensions/timezone.js
-priv.json
-timezones.json
-performance.json*.zip
+
+configs/*
+!configs/performance.json
+
+next.commit.txt
+
+# Local release archives and attachments
+*.zip

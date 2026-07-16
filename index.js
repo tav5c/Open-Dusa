@@ -15,7 +15,7 @@ import {
     Routes,
     SlashCommandBuilder,
 } from 'discord.js'
-import { existsSync, mkdirSync, readdirSync, readFileSync, writeFileSync } from 'fs'
+import { existsSync, mkdirSync, readdirSync, readFileSync, renameSync, writeFileSync } from 'fs'
 import http from 'http'
 import os from 'os'
 import { performance } from 'perf_hooks'
@@ -86,7 +86,7 @@ console.error = (...a) => {
     origError(`${clr.light_red}${getTs()} [ERROR]${clr.reset}`, ...a)
 }
 
-// Config — normalized to the canonical camelCase shape by extensions/config.js
+// Config, normalized to the canonical camelCase shape by extensions/config.js
 // (legacy keys are mapped there; runtime-mutable settings live in runtime.json)
 const config = loadConfig()
 
@@ -100,13 +100,27 @@ const ALLOWED_GUILDS = new Set(config.guildIds.map(BigInt))
 let db
 let _dbAttempt = 0
 // Retry loop: on Pterodactyl-style restarts the old process can still be
-// shutting down (holding the EXCLUSIVE lock) when the new one boots — a locked
+// shutting down (holding the EXCLUSIVE lock) when the new one boots, a locked
 // DB must mean "wait and retry", never "silently run without persistence".
+// One-time move into the data/ umbrella: Ai Database/ -> data/ai, Logs/ -> data/logs
+try {
+    mkdirSync('data', { recursive: true })
+    if (!existsSync('data/ai') && existsSync('Ai Database')) {
+        renameSync('Ai Database', 'data/ai')
+        console.log('[Boot] Moved Ai Database/ into data/ai/')
+    }
+    if (!existsSync('data/logs') && existsSync('Logs')) {
+        renameSync('Logs', 'data/logs')
+        console.log('[Boot] Moved Logs/ into data/logs/')
+    }
+} catch (e) {
+    console.error('[Boot] data/ migration failed:', e.message)
+}
 while (true) {
 try {
     await loadSqlite()
-    mkdirSync('Logs', { recursive: true })
-    db = openDb('Logs/medusa.db')
+    mkdirSync('data/logs', { recursive: true })
+    db = openDb('data/logs/medusa.db')
     // Wait up to 10s on locks BEFORE any lock-taking pragma, so an overlapping
     // restart blocks briefly instead of failing with "database is locked".
     db.pragma('busy_timeout = 10000')
@@ -163,12 +177,6 @@ try {
             reason TEXT, timestamp DATETIME DEFAULT CURRENT_TIMESTAMP,
             active BOOLEAN DEFAULT TRUE
         );
-        CREATE TABLE IF NOT EXISTS automod_settings (
-            guild_id INTEGER PRIMARY KEY,
-            anti_spam BOOLEAN DEFAULT FALSE, anti_caps BOOLEAN DEFAULT FALSE,
-            anti_links BOOLEAN DEFAULT FALSE, max_mentions INTEGER DEFAULT 5,
-            spam_threshold INTEGER DEFAULT 5
-        );
         CREATE TABLE IF NOT EXISTS reaction_roles (
             id INTEGER PRIMARY KEY AUTOINCREMENT,
             guild_id INTEGER, message_id INTEGER, emoji TEXT, role_id INTEGER,
@@ -185,7 +193,7 @@ try {
     if (/locked/i.test(e.message) && _dbAttempt < 3) {
         _dbAttempt++
         console.warn(
-            `[DB] Database locked (previous instance still shutting down?) — retry ${_dbAttempt}/3 in 3s`,
+            `[DB] Database locked (previous instance still shutting down?), retry ${_dbAttempt}/3 in 3s`,
         )
         try {
             db?.close?.()
@@ -235,26 +243,23 @@ const client = new Client({
 
 const heart = attachHeart(client)
 
-// Prefix command map — must exist before extensions load
+// Prefix command map, must exist before extensions load
 client.commands = new Collection()
 const addCmd = (name, fn) => client.commands.set(name, fn)
 
-// Core extensions — bootstrapped manually because they export register*() instead of init()
-// and need to share state with each other (automod needs heart, moderation needs config, etc.)
+// Core extensions, bootstrapped manually because they export register*() instead of init()
+// and need to share state with each other (moderation needs config, etc.)
 const CORE_EXTENSIONS = new Set(['ai', 'heart', 'utils'])
 client.extensions = new Collection()
 
 // Load core that needs custom wiring
 const { registerAfk } = await import('./extensions/afk.js')
-const { registerAutomod } = await import('./extensions/automod.js')
 const { registerModeration } = await import('./extensions/moderation.js')
 client.afk = registerAfk(client, db)
-const automod = registerAutomod(client, db, heart)
-client.automod = automod
 client.moderation = registerModeration(client, db, { ...config, memeGuildId: null })
-console.log('[System] Loaded core: afk, automod, moderation')
+console.log('[System] Loaded core: afk, moderation')
 
-// Dynamic loader for contributed extensions (manifest-based — see Part 7)
+// Dynamic loader for contributed extensions (manifest-based, see Part 7)
 const extensionsPath = './extensions'
 const extensionFiles = readdirSync(extensionsPath).filter(
     (file) => file.endsWith('.js') && !CORE_EXTENSIONS.has(file.replace('.js', '')),
@@ -263,7 +268,7 @@ for (const file of extensionFiles) {
     try {
         const mod = await import(`./extensions/${file}`)
         const extName = file.replace('.js', '')
-        // Extension manifest check — tolerates both new-style and legacy init()
+        // Extension manifest check, tolerates both new-style and legacy init()
         if (mod.manifest?.name && mod.manifest.name !== extName) {
             console.warn(
                 `[System] ${file}: manifest.name '${mod.manifest.name}' != filename '${extName}', using filename`,
@@ -276,7 +281,7 @@ for (const file of extensionFiles) {
         }
 
         const { init, handleMessage, handleInteraction } = mod
-        // Library modules (config.js, db.js, performance.js) export helpers, not hooks —
+        // Library modules (config.js, db.js, performance.js) export helpers, not hooks -
         // they're imported directly where needed, not mounted as extensions.
         if (!mod.manifest && !init && !handleMessage && !handleInteraction && !mod.getSlashCommands) continue
         client.extensions.set(extName, { init, handleMessage, handleInteraction, manifest: mod.manifest })
@@ -327,7 +332,7 @@ async function cmdPing(ctx) {
         else await reply.edit({ content })
     } catch (e) {
         // 10062 = token expired (Discord gives ~3s), 40060 = already acknowledged
-        // Both are non-fatal — just log and return so uncaughtException doesn't kill the process
+        // Both are non-fatal, just log and return so uncaughtException doesn't kill the process
         if (e?.code === 10062 || e?.code === 40060) {
             console.warn(`[CMD] ping skipped (${e.code})`)
             return
@@ -397,68 +402,6 @@ async function cmdStats(ctx) {
             },
         )
     isMsg ? await reply.edit({ content: '', embeds: [embed] }) : await ctx.editReply({ embeds: [embed] })
-}
-
-async function cmdGuild(ctx) {
-    const guild = ctx.guild
-    if (!guild) return ctx.reply({ content: 'This command can only be used in a server.' })
-    const owner = await guild.fetchOwner().catch(() => null)
-    const created = `<t:${Math.floor(guild.createdTimestamp / 1000)}:D>`
-    const embed = new EmbedBuilder()
-        .setTitle(`📊 ${guild.name}`)
-        .setThumbnail(guild.iconURL({ size: 256 }))
-        .addFields(
-            {
-                name: '👑 Owner',
-                value: owner ? `${owner.user.username} (\`${owner.id}\`)` : 'Unknown',
-                inline: true,
-            },
-            { name: '👥 Members', value: `\`${guild.memberCount}\``, inline: true },
-            { name: '📅 Created', value: created, inline: true },
-            { name: '🆔 Server ID', value: `\`${guild.id}\``, inline: true },
-        )
-        .setColor(0x378add)
-    await ctx.reply({ embeds: [embed] })
-}
-
-async function cmdUserinfo(ctx, targetArgs) {
-    let member = targetArgs
-    if (!member) member = ctx.member
-    const isRawUser = !member.user
-    const userObj = isRawUser ? member : member.user
-    const displayName = isRawUser ? (userObj.globalName ?? userObj.username) : member.displayName
-    const created = `<t:${Math.floor(userObj.createdTimestamp / 1000)}:D>`
-    const joined =
-        !isRawUser && member.joinedTimestamp ? `<t:${Math.floor(member.joinedTimestamp / 1000)}:D>` : 'N/A'
-    const roles = isRawUser
-        ? []
-        : [...member.roles.cache.values()]
-              .filter((r) => r.id !== ctx.guild?.id)
-              .sort((a, b) => b.position - a.position)
-              .map((r) => `<@&${r.id}>`)
-    const embed = new EmbedBuilder()
-        .setTitle(`👤 ${displayName}`)
-        .setThumbnail(userObj.displayAvatarURL({ size: 256 }))
-        .addFields(
-            { name: '🏷️ Username', value: `@${userObj.username}`, inline: true },
-            { name: '🆔 User ID', value: `\`${userObj.id}\``, inline: true },
-            { name: '📅 Dates', value: `**Created:** ${created}\n**Joined:** ${joined}`, inline: true },
-            {
-                name: `🏷️ Roles (${roles.length})`,
-                value: roles.length
-                    ? roles.slice(0, 15).join(' ') + (roles.length > 15 ? '...' : '')
-                    : 'No roles',
-                inline: false,
-            },
-        )
-        .setColor(!isRawUser && member.displayHexColor !== '#000000' ? member.displayHexColor : 0x378add)
-        .setFooter({
-            text: `Requested by ${ctx.user?.username ?? ctx.author?.username}`,
-            iconURL: ctx.user?.displayAvatarURL() ?? ctx.author?.displayAvatarURL(),
-        })
-        .setTimestamp()
-    if (userObj.bannerURL()) embed.setImage(userObj.bannerURL({ size: 1024, forceStatic: false }))
-    await ctx.reply({ embeds: [embed] })
 }
 
 async function cmdAv(ctx, args) {
@@ -553,8 +496,8 @@ async function cmdEmbed(interaction) {
     const title = interaction.options.getString('title')
     const desc = interaction.options.getString('description')
     const image = interaction.options.getString('image') ?? null
-    const ftText = interaction.options.getString('footer_text') ?? null
-    const ftIcon = interaction.options.getString('footer_icon') ?? null
+    const ftText = interaction.options.getString('footer-text') ?? null
+    const ftIcon = interaction.options.getString('footer-icon') ?? null
     const embed = new EmbedBuilder().setTitle(title).setDescription(desc).setColor(0x378add)
     if (image) embed.setImage(image)
     if (ftText) embed.setFooter({ text: ftText, iconURL: ftIcon ?? undefined })
@@ -562,22 +505,22 @@ async function cmdEmbed(interaction) {
 }
 
 async function cmdMenu(ctx) {
-    // Menu implementation preserved from original — abbreviated here for clarity
+    // Menu implementation preserved from original, abbreviated here for clarity
     const pages = [
         {
-            title: '🐍 Medusa — Main Menu',
+            title: '🐍 Medusa, Main Menu',
             desc: `**Prefix:** \`${PREFIX}\`\nUse the arrows to browse commands.`,
         },
         {
             title: '🛡️ Moderation',
             desc: `\`ban\` \`unban\` \`mute\` \`unmute\` \`warn\` \`warnings\` \`modlog\` \`clearwarns\` \`clear\` \`mpurge\` \`fpurge\``,
         },
-        { title: '👤 Profile', desc: `\`av\` \`mav\` \`bn\` \`mbn\` \`userinfo\` \`guild\`` },
+        { title: '👤 Profile', desc: `\`av\` \`mav\` \`bn\` \`mbn\`` },
         {
             title: '🤖 AI',
-            desc: `Mention Medusa or type her name to chat.\n\`${PREFIX}p\` — Set custom prompt\n\`${PREFIX}pr\` — Reset prompt\n\`${PREFIX}mode\` — focused/normal\n\`/memory\` \`/forgetme\` \`/summarize\` \`/lore\``,
+            desc: `Mention Medusa or type her name to chat.\n\`${PREFIX}p\`, Set custom prompt\n\`${PREFIX}pr\`, Reset prompt\n\`${PREFIX}mode\`, focused/normal\n\`/memory\` \`/forgetme\` \`/summarize\``,
         },
-        { title: '💤 AFK', desc: `\`${PREFIX}afk [reason]\` — Go AFK\n\`${PREFIX}unafk\` — Return` },
+        { title: '💤 AFK', desc: `\`${PREFIX}afk [reason]\`, Go AFK\n\`${PREFIX}unafk\`, Return` },
         { title: '🔧 Utility', desc: `\`ping\` \`stats\` \`menu\` \`help\` \`embed\` \`benchmark\`` },
     ]
     let cur = 0
@@ -620,29 +563,21 @@ async function cmdMenu(ctx) {
 
 // Slash command definitions
 const SLASH_CMDS = [
-    // User-installable + DM-capable utility commands
+    // Server-only utility commands, the profile pair below covers DMs
     new SlashCommandBuilder()
         .setName('ping')
         .setDescription('Check latency')
-        .setIntegrationTypes(0, 1)
-        .setContexts(0, 1, 2),
+        .setContexts(0),
     new SlashCommandBuilder()
         .setName('stats')
         .setDescription('Live performance stats')
-        .setIntegrationTypes(0, 1)
-        .setContexts(0, 1, 2),
-    new SlashCommandBuilder()
-        .setName('userinfo')
-        .setDescription('User information')
-        .setIntegrationTypes(0, 1)
-        .setContexts(0, 1, 2)
-        .addUserOption((o) => o.setName('member').setDescription('Target user')),
+        .setContexts(0),
     new SlashCommandBuilder()
         .setName('av')
         .setDescription("User's server avatar")
-        .setIntegrationTypes(0, 1)
-        .setContexts(0, 1, 2)
+        .setContexts(0)
         .addUserOption((o) => o.setName('member').setDescription('Target user')),
+    // User-installable + DM-capable
     new SlashCommandBuilder()
         .setName('mav')
         .setDescription("User's main profile avatar")
@@ -652,8 +587,7 @@ const SLASH_CMDS = [
     new SlashCommandBuilder()
         .setName('bn')
         .setDescription("User's server banner")
-        .setIntegrationTypes(0, 1)
-        .setContexts(0, 1, 2)
+        .setContexts(0)
         .addUserOption((o) => o.setName('member').setDescription('Target user')),
     new SlashCommandBuilder()
         .setName('mbn')
@@ -664,7 +598,6 @@ const SLASH_CMDS = [
 
     // Guild-only commands
     new SlashCommandBuilder().setName('menu').setDescription("Open Medusa's system menu").setContexts(0),
-    new SlashCommandBuilder().setName('guild').setDescription('Server information').setContexts(0),
     new SlashCommandBuilder()
         .setName('ban')
         .setDescription('Ban a user')
@@ -676,7 +609,7 @@ const SLASH_CMDS = [
         .setName('unban')
         .setDescription('Unban a user by ID')
         .setContexts(0)
-        .addStringOption((o) => o.setName('user_id').setDescription('User ID').setRequired(true))
+        .addStringOption((o) => o.setName('user-id').setDescription('User ID').setRequired(true))
         .setDefaultMemberPermissions(PermissionFlagsBits.BanMembers),
     new SlashCommandBuilder()
         .setName('mute')
@@ -713,74 +646,68 @@ const SLASH_CMDS = [
         .setDefaultMemberPermissions(PermissionFlagsBits.ModerateMembers),
     new SlashCommandBuilder()
         .setName('clear')
-        .setDescription('Purge messages')
+        .setDescription('Delete the last few messages in this channel (default 10)')
         .setContexts(0)
         .addIntegerOption((o) =>
-            o.setName('amount').setDescription('Number of messages').setMinValue(1).setMaxValue(500),
+            o
+                .setName('amount')
+                .setDescription('How many recent messages to delete (up to 500)')
+                .setMinValue(1)
+                .setMaxValue(500),
         ),
     new SlashCommandBuilder()
-        .setName('mpurge')
-        .setDescription('Delete all messages from a member')
+        .setName('erase')
+        .setDescription('Wipe every recent message a member sent')
         .setContexts(0)
-        .addUserOption((o) => o.setName('user').setDescription('Target user').setRequired(true))
-        .addBooleanOption((o) => o.setName('server_wide').setDescription('All channels'))
-        .addStringOption((o) => o.setName('start_from_id').setDescription('Message ID to start from'))
+        .addUserOption((o) =>
+            o.setName('user').setDescription('The member whose messages get wiped').setRequired(true),
+        )
+        .addBooleanOption((o) =>
+            o.setName('everywhere').setDescription('Go through every channel in the server, not just this one'),
+        )
+        .addStringOption((o) =>
+            o.setName('start-from').setDescription('Message ID or link to start wiping from'),
+        )
         .setDefaultMemberPermissions(PermissionFlagsBits.ManageMessages),
     new SlashCommandBuilder()
-        .setName('filter_purge')
-        .setDescription('Delete messages matching text')
+        .setName('sweep')
+        .setDescription('Hunt down and delete recent messages that contain a word or phrase')
         .setContexts(0)
-        .addStringOption((o) => o.setName('text').setDescription('Text to search for').setRequired(true))
-        .addUserOption((o) => o.setName('user').setDescription('Only from this user'))
-        .addIntegerOption((o) =>
-            o.setName('limit').setDescription('Messages to scan').setMinValue(1).setMaxValue(500),
+        .addStringOption((o) =>
+            o.setName('text').setDescription('The word or phrase to look for (optional if you set other filters)'),
         )
-        .addBooleanOption((o) => o.setName('exact').setDescription('Exact match'))
-        .addStringOption((o) => o.setName('after_id').setDescription('After message ID'))
-        .addStringOption((o) => o.setName('before_id').setDescription('Before message ID'))
+        .addUserOption((o) =>
+            o.setName('user').setDescription('Only delete messages sent by this member'),
+        )
+        .addIntegerOption((o) =>
+            o
+                .setName('scan')
+                .setDescription('How many recent messages to check (default 100, max 500)')
+                .setMinValue(1)
+                .setMaxValue(500),
+        )
+        .addBooleanOption((o) =>
+            o.setName('exact').setDescription('Only delete perfect matches, not anything that contains the text'),
+        )
+        .addStringOption((o) =>
+            o.setName('start-from').setDescription('Message ID or link where the sweep starts (newest end)'),
+        )
+        .addStringOption((o) =>
+            o.setName('stop-at').setDescription('Message ID or link where the sweep stops (oldest end)'),
+        )
         .setDefaultMemberPermissions(PermissionFlagsBits.ManageMessages),
     new SlashCommandBuilder()
         .setName('embed')
-        .setDescription('Send a custom embed')
+        .setDescription('Post a custom embed with your own title, text and images')
         .setContexts(0)
         .addStringOption((o) => o.setName('title').setDescription('Embed title').setRequired(true))
         .addStringOption((o) =>
             o.setName('description').setDescription('Embed description').setRequired(true),
         )
         .addStringOption((o) => o.setName('image').setDescription('Image URL'))
-        .addStringOption((o) => o.setName('footer_text').setDescription('Footer text'))
-        .addStringOption((o) => o.setName('footer_icon').setDescription('Footer icon URL'))
+        .addStringOption((o) => o.setName('footer-text').setDescription('Footer text'))
+        .addStringOption((o) => o.setName('footer-icon').setDescription('Footer icon URL'))
         .setDefaultMemberPermissions(PermissionFlagsBits.ManageMessages),
-    new SlashCommandBuilder()
-        .setName('automod')
-        .setDescription('Configure automod')
-        .setContexts(0)
-        .addSubcommand((s) => s.setName('status').setDescription('View settings'))
-        .addSubcommand((s) =>
-            s
-                .setName('anti-spam')
-                .setDescription('Toggle anti-spam')
-                .addBooleanOption((o) =>
-                    o.setName('enabled').setDescription('Enable/disable').setRequired(true),
-                ),
-        )
-        .addSubcommand((s) =>
-            s
-                .setName('anti-caps')
-                .setDescription('Toggle anti-caps')
-                .addBooleanOption((o) =>
-                    o.setName('enabled').setDescription('Enable/disable').setRequired(true),
-                ),
-        )
-        .addSubcommand((s) =>
-            s
-                .setName('anti-links')
-                .setDescription('Toggle anti-links')
-                .addBooleanOption((o) =>
-                    o.setName('enabled').setDescription('Enable/disable').setRequired(true),
-                ),
-        )
-        .setDefaultMemberPermissions(PermissionFlagsBits.ManageGuild),
 ].map((c) => c.toJSON())
 
 // Pull slash commands from dynamic extensions that export getSlashCommands()
@@ -803,12 +730,10 @@ addCmd('av', (msg, args) => cmdAv(msg, args))
 addCmd('bn', (msg, args) => cmdBn(msg, args))
 addCmd('mbn', (msg, args) => cmdMbn(msg, args))
 addCmd('mav', (msg, args) => cmdMav(msg, args))
-addCmd('userinfo', (msg, args) => resolveTarget(msg, args).then((m) => cmdUserinfo(msg, m)))
 addCmd('ping', (msg) => cmdPing(msg))
 addCmd('stats', (msg) => cmdStats(msg))
 addCmd('benchmark', (msg) => cmdStats(msg))
 addCmd('system', (msg) => cmdStats(msg))
-addCmd('guild', (msg) => cmdGuild(msg))
 addCmd('menu', (msg) => cmdMenu(msg))
 addCmd('help', async (msg, args) => {
     const name = args[0]
@@ -938,7 +863,7 @@ addCmd('auditlogs', async (msg, args) => {
         const logs = await msg.guild.fetchAuditLogs(fetchOpts)
         const entries = logs.entries.map(
             (e) =>
-                `• **${e.executor?.username}** → Action \`${e.action}\` on \`${e.target?.username || e.targetId || 'N/A'}\`${e.reason ? ` (${e.reason})` : ''}`,
+                `• **${e.executor?.username}** -> Action \`${e.action}\` on \`${e.target?.username || e.targetId || 'N/A'}\`${e.reason ? ` (${e.reason})` : ''}`,
         )
         await msg.reply({
             embeds: [
@@ -1004,13 +929,19 @@ client.once('clientReady', async () => {
     const currentHash = createHash('md5').update(JSON.stringify(allCmds)).digest('hex')
     let cachedHash = ''
     try {
-        cachedHash = readFileSync('.slash_hash', 'utf8')
+        // lives in configs/ with the other generated files
+        if (existsSync('.slash_hash') && !existsSync('configs/.slash_hash')) {
+            mkdirSync('configs', { recursive: true })
+            renameSync('.slash_hash', 'configs/.slash_hash')
+        }
+        cachedHash = readFileSync('configs/.slash_hash', 'utf8')
     } catch {}
     if (currentHash !== cachedHash) {
         const rest = new REST().setToken(config.token)
         try {
             await rest.put(Routes.applicationCommands(client.user.id), { body: allCmds })
-            writeFileSync('.slash_hash', currentHash)
+            mkdirSync('configs', { recursive: true })
+            writeFileSync('configs/.slash_hash', currentHash)
             console.log(`[Slash] ${allCmds.length} commands synced to Discord API`)
         } catch (e) {
             console.error('[Slash] Registration failed:', e)
@@ -1018,6 +949,16 @@ client.once('clientReady', async () => {
     } else {
         console.log(`[Slash] ${allCmds.length} commands (Cache match, skipped sync)`)
     }
+
+    // main db upkeep: fold the wal + reclaim free pages, same idea as the ai memory dbs
+    const compactMainDb = () => {
+        try {
+            db.pragma('wal_checkpoint(TRUNCATE)')
+            db.exec('VACUUM')
+        } catch {}
+    }
+    setTimeout(compactMainDb, 60_000).unref()
+    setInterval(compactMainDb, (24 + Math.random() * 2) * 3600 * 1000).unref()
 
     try {
         const { registerAI } = await import('./extensions/ai.js')
@@ -1072,27 +1013,14 @@ client.on('interactionCreate', async (interaction) => {
     if (!interaction.isChatInputCommand()) return
 
     // Let core extensions claim the interaction first
-    if (client.automod && (await client.automod.handleInteraction(interaction))) return
     if (client.moderation && (await client.moderation.handleInteraction(interaction))) return
 
     const { commandName } = interaction
-    const uid = BigInt(interaction.user.id)
-
-    if (client.COMMANDS_BLOCKED && uid !== BOT_OWNER_ID) return
 
     // Core commands
     if (commandName === 'ping') return cmdPing(interaction)
     if (commandName === 'stats') return cmdStats(interaction)
     if (commandName === 'menu') return cmdMenu(interaction)
-    if (commandName === 'guild') return cmdGuild(interaction)
-    if (commandName === 'userinfo')
-        return cmdUserinfo(
-            interaction,
-            interaction.options.getMember('member') ??
-                interaction.options.getUser('member') ??
-                interaction.member ??
-                interaction.user,
-        )
     if (commandName === 'av')
         return cmdAv(
             interaction,
@@ -1135,13 +1063,6 @@ client.on('messageCreate', async (message) => {
         if (ALLOWED_GUILDS.size && !ALLOWED_GUILDS.has(BigInt(message.guild.id))) return
 
         const content = message.content.trim()
-
-        // Automod runs first — it may delete the message before the AI ever sees it
-        try {
-            await client.automod?.runAutomod(message)
-        } catch (e) {
-            console.error('[Automod]', e)
-        }
 
         // Core extension message handlers (afk auto-unafk + mention notices; moderation keyword triggers)
         try {

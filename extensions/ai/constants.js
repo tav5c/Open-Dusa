@@ -2,8 +2,8 @@
 // capabilities contract injected into the system prompt.
 import { LRUCache } from 'lru-cache'
 
-const DEAD_KEYS_FILE = 'Logs/dead_keys.json'
-const GHOST_FILE = 'Ai Database/ghost_users.json'
+const DEAD_KEYS_FILE = 'data/logs/dead_keys.json'
+const GHOST_FILE = 'data/ai/ghost_users.json'
 const ALWAYS_LIVE = new Set([
     'price',
     'prices',
@@ -229,7 +229,7 @@ const NO_SEARCH_SIGNALS = [
     'how many servers',
     'warns',
     'stats',
-    // User profile / appearance — resolved via RUN_CMD, not web
+    // User profile / appearance, resolved via RUN_CMD, not web
     'my avatar',
     'my banner',
     'my discord avatar',
@@ -306,21 +306,21 @@ const DANGEROUS_TERMS = new Set([
 const CAPABILITIES_NOTE =
     `\n\n[AGENT CAPABILITIES & STRICT BEHAVIOR]\n` +
     `• FIRM RULE: DO NOT emit a <<RUN_CMD>> tag unprompted! Only emit a tag if the user EXPLICITLY asks for an action that matches one of the commands below. For casual chat, reply in plain text ONLY.\n` +
-    `• PERSISTENCE: If the user DOES ask for a command below, you MUST execute the matching <<RUN_CMD>> tag. NEVER say "I already did that" as an excuse to skip it. And NEVER announce that an action already succeeded (e.g. "Muted X", "Banned them") in your own words — each command posts its own confirmation embed; just say you're doing it, then append the tag.\n` +
-    `• SELF-CHECK: Whenever the user's message asks you to perform ANY agent command (even just one — e.g. a single reminder, poll, or role change), after ALL your <<RUN_CMD>> tags append exactly one <<ACTIONS_INTENDED: N>> tag, where N is an honest count of how many distinct actions you were asked to perform in that message — NOT the number of tags you happened to emit. This is used to catch anything you accidentally skip or forget to tag, so count what was ASKED, not what you DID. Omit this tag entirely for casual chat with no action request at all.\n` +
-    `• NO INVENTING: You may ONLY use the exact commands listed below. NEVER invent, guess, or approximate command names — the reminder command is named 'remind', NOT 'reminder', 'set_reminder', or anything similar. Args are plain space-separated text EXACTLY like the examples below: NEVER subcommands (e.g. 'create'), NEVER key=value or key:value pairs (user_id=, time=, message=, delay=), NEVER --flags, and NEVER JSON.\n` +
+    `• PERSISTENCE: If the user DOES ask for a command below, you MUST execute the matching <<RUN_CMD>> tag. NEVER say "I already did that" as an excuse to skip it. And NEVER announce that an action already succeeded (e.g. "Muted X", "Banned them") in your own words, each command posts its own confirmation embed; just say you're doing it, then append the tag.\n` +
+    `• SELF-CHECK: Whenever the user's message asks you to perform ANY agent command (even just one, e.g. a single reminder, poll, or role change), after ALL your <<RUN_CMD>> tags append exactly one <<ACTIONS_INTENDED: N>> tag, where N is an honest count of how many distinct actions you were asked to perform in that message, NOT the number of tags you happened to emit. This is used to catch anything you accidentally skip or forget to tag, so count what was ASKED, not what you DID. Omit this tag entirely for casual chat with no action request at all.\n` +
+    `• NO INVENTING: You may ONLY use the exact commands listed below. NEVER invent, guess, or approximate command names, the reminder command is named 'remind', NOT 'reminder', 'set_reminder', or anything similar. Args are plain space-separated text EXACTLY like the examples below: NEVER subcommands (e.g. 'create'), NEVER key=value or key:value pairs (user_id=, time=, message=, delay=), NEVER --flags, and NEVER JSON.\n` +
     `• AGENT POWERS (use ONLY when requested!):\n` +
     `   - Fetch Avatars/Banners: <<RUN_CMD: av 123456789>> | <<RUN_CMD: mav 123456789>> | <<RUN_CMD: bn 123456789>> | <<RUN_CMD: mbn 123456789>>\n` +
-    `   - Moderation (use the target's <@id> mention or numeric ID — NEVER a username or "him/her/them" — and include the duration): <<RUN_CMD: mute 123456789 1h reason>> | <<RUN_CMD: unmute 123456789>> | <<RUN_CMD: warn 123456789 reason>> | <<RUN_CMD: clearwarns 123456789>>\n` +
+    `   - Moderation (use the target's <@id> mention or numeric ID, NEVER a username or "him/her/them", and include the duration): <<RUN_CMD: mute 123456789 1h reason>> | <<RUN_CMD: unmute 123456789>> | <<RUN_CMD: warn 123456789 reason>> | <<RUN_CMD: clearwarns 123456789>>\n` +
     `   - Delete Messages: <<RUN_CMD: mpurge 123456789>> | <<RUN_CMD: clear 10>>\n` +
     `   - Manage Server: <<RUN_CMD: createchan text channel-name>> | <<RUN_CMD: delchan 123456789>> | <<RUN_CMD: lockchannel>> | <<RUN_CMD: unlockchannel>> | <<RUN_CMD: auditlogs>>\n` +
     `   - Roles: <<RUN_CMD: addrole 123456789 987654321>> | <<RUN_CMD: removerole 123456789 987654321>> | <<RUN_CMD: listroles>>\n` +
     `   - Self: <<RUN_CMD: setnickname name>> | <<RUN_CMD: renameserver name>> | <<RUN_CMD: addemoji name URL>>\n` +
     `   - Extended: <<RUN_CMD: poll "Question?" "Ans1" "Ans2">> | <<RUN_CMD: thread Name>> | <<RUN_CMD: react 👍>> | <<RUN_CMD: pin ID>> | <<RUN_CMD: unpin ID>> | <<RUN_CMD: slowmode 5>> | <<RUN_CMD: topic new topic>> | <<RUN_CMD: announce CHANNEL_ID_OR_MENTION message>> | <<RUN_CMD: mail message for Tav>> | <<RUN_CMD: movevc USER_ID CHAN_ID>> | <<RUN_CMD: dm USER_ID message>>\n` +
-    `   - Reminders: <<RUN_CMD: remind 1h30m take the pizza out>> (units s/m/h/d/w, combos like 1d12h ok). For an exact date/time instead of a relative duration, use ISO format with a T (no space): <<RUN_CMD: remind 2026-01-12T18:00 take the pizza out>> — if the user gives an ambiguous slash date (e.g. "01/12/2026"), resolve it as DAY/MONTH/YEAR, and if that date would already be in the past, do NOT guess a different one — ask the user to confirm the exact date instead | list: <<RUN_CMD: reminders>> | cancel: <<RUN_CMD: delreminder 3>>\n` +
-    `• EXECUTION FORMAT: If an action is requested, talk organically FIRST, then cleanly append the <<RUN_CMD>> tag. NEVER write raw prefix commands. Silently let the backend catch and confirm each tag — never narrate the raw command syntax to the user.\n` +
+    `   - Reminders: <<RUN_CMD: remind 1h30m take the pizza out>> (units s/m/h/d/w, combos like 1d12h ok). For an exact date/time instead of a relative duration, use ISO format with a T (no space): <<RUN_CMD: remind 2026-01-12T18:00 take the pizza out>>, if the user gives an ambiguous slash date (e.g. "01/12/2026"), resolve it as DAY/MONTH/YEAR, and if that date would already be in the past, do NOT guess a different one, ask the user to confirm the exact date instead | list: <<RUN_CMD: reminders>> | cancel: <<RUN_CMD: delreminder 3>>\n` +
+    `• EXECUTION FORMAT: If an action is requested, talk organically FIRST, then cleanly append the <<RUN_CMD>> tag. NEVER write raw prefix commands. Silently let the backend catch and confirm each tag, never narrate the raw command syntax to the user.\n` +
     `• CHAINING: You can chain multiple <<RUN_CMD>> tags in one reply when the user asks for compound/multi-part actions.\n` +
-    `• PERMISSIONS: Never promise or imply an action will happen if the invoking user likely lacks the Discord permission for it — the backend will still block it, so don't set false expectations.\n` +
+    `• PERMISSIONS: Never promise or imply an action will happen if the invoking user likely lacks the Discord permission for it, the backend will still block it, so don't set false expectations.\n` +
     `• PINGS: ALWAYS ping using the <@123456789> format. NEVER use plaintext @username.`
 
 const SEARCH_EMOJIS = ['🌐', '📖', '🔍']

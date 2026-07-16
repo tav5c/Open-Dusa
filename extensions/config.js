@@ -2,14 +2,14 @@
 //
 // config.json is authored in ONE canonical shape: camelCase keys, a providers[]
 // array for LLM credentials, per-agent blocks under agents{}, and a guilds{} map.
-// Legacy (pre-overhaul) snake_case / flat-key configs still load — every old key
+// Legacy (pre-overhaul) snake_case / flat-key configs still load, every old key
 // is mapped here, and only here, with a deprecation warning at boot.
 //
-// runtime.json is a small mutable overlay for values the bot changes while
-// running (/aimodel, /pm, iso, aiignore). The base config file is never
-// rewritten at runtime, so authored formatting and secrets stay untouched.
+// configs/runtime.json is a small mutable overlay for values the bot changes
+// while running (/isolation). config.json itself is only touched by
+// /ai-pause (per-guild ai flag) and /configclean.
 
-import { existsSync, readFileSync, writeFileSync } from 'fs'
+import { existsSync, mkdirSync, readFileSync, renameSync, writeFileSync } from 'fs'
 
 // Zero-dependency .env support, loaded once at import time so every later
 // process.env read (notably db.js's DB_ENCRYPTION_KEY) sees it. Real
@@ -24,9 +24,15 @@ if (existsSync('.env')) {
 }
 
 const CONFIG_PATH = 'config.json'
-const RUNTIME_PATH = 'runtime.json'
+const RUNTIME_PATH = 'configs/runtime.json'
 
-// Discord snowflakes overflow Number.MAX_SAFE_INTEGER — quote bare 15+ digit
+// One-time move of generated files that used to live in the repo root.
+try {
+    mkdirSync('configs', { recursive: true })
+    if (existsSync('runtime.json') && !existsSync(RUNTIME_PATH)) renameSync('runtime.json', RUNTIME_PATH)
+} catch {}
+
+// Discord snowflakes overflow Number.MAX_SAFE_INTEGER, quote bare 15+ digit
 // numbers before parsing so unquoted IDs can't get silently corrupted.
 const parseSnowflakeSafe = (raw) =>
     JSON.parse(raw.replace(/(?<=:\s*|\[\s*|,\s*)\b(\d{15,})\b(?=\s*[,}\]])/g, '"$1"'))
@@ -39,7 +45,7 @@ function normalizeProviders(raw) {
     const entries = asArray(raw.providers).map((p) => ({
         name: p.name ?? 'provider',
         baseUrl: p.baseUrl ?? p.base_url ?? '',
-        keys: realKeys(p.keys ?? p.key),
+        keys: [...new Set(realKeys(p.keys ?? p.key))], // dupes collapse to one slot, they share the same org quota anyway
         model: p.model,
         priority: p.priority ?? 99,
     }))
@@ -78,7 +84,7 @@ function resolveAgentProvider(providers, providerName, legacyUrl, legacyKeys) {
 }
 
 function normalizeGuilds(raw) {
-    // Canonical: one map — { "<guildId>": { ai?: bool, isolatedMemory?: bool } }
+    // Canonical: one map, { "<guildId>": { ai?: bool, isolatedMemory?: bool } }
     if (raw.guilds && typeof raw.guilds === 'object' && !Array.isArray(raw.guilds)) {
         const out = {}
         for (const [id, g] of Object.entries(raw.guilds))
@@ -111,7 +117,7 @@ export function normalizeConfig(raw) {
     const legacyUsed = LEGACY_KEYS.filter((k) => raw[k] !== undefined)
     if (legacyUsed.length)
         console.warn(
-            `[Config] Legacy config keys detected (${legacyUsed.slice(0, 6).join(', ')}${legacyUsed.length > 6 ? ', …' : ''}) — still supported, but see README for the current shape`,
+            `[Config] Legacy config keys detected (${legacyUsed.slice(0, 6).join(', ')}${legacyUsed.length > 6 ? ', …' : ''}), still supported, but see README for the current shape`,
         )
 
     const providers = normalizeProviders(raw)
@@ -125,6 +131,7 @@ export function normalizeConfig(raw) {
         topP: a.chat?.topP ?? raw.topP ?? 1,
         maxTokens: a.chat?.maxTokens ?? raw.chatTokens ?? 1024,
         systemPrompt: asPrompt(a.chat?.systemPrompt ?? raw.systemPrompt),
+        identity: asPrompt(a.chat?.identity ?? raw.identity),
     }
     chat.resolved =
         resolveAgentProvider(providers, chat.provider, raw.llmBaseUrl ?? raw.llm_base_url, raw.llmKeys ?? raw.llm_keys) ??
@@ -148,13 +155,22 @@ export function normalizeConfig(raw) {
     }
     vision.resolved = resolveAgentProvider(providers, vision.provider)
 
+    // The classifier rides the NIM provider by default when one is configured:
+    // YES/NO routing is tiny but frequent, no reason to let it nibble the primary's
+    // daily token budget. The 2.5s race in research.js caps any latency cost, a
+    // timeout just means "answer without searching". Explicit config still wins.
+    const clfProvider = a.classifier?.provider ?? providers.find((p) => p.baseUrl?.includes('nvidia'))?.name
+    const clfResolved = resolveAgentProvider(providers, clfProvider)
     const classifier = {
-        provider: a.classifier?.provider,
-        model: a.classifier?.model ?? raw.classifier_model ?? 'llama-3.1-8b-instant',
+        provider: clfProvider,
+        model:
+            a.classifier?.model ??
+            raw.classifier_model ??
+            (clfResolved?.baseUrl?.includes('nvidia') ? 'meta/llama-3.1-8b-instruct' : 'llama-3.1-8b-instant'),
         temperature: a.classifier?.temperature ?? 0,
         maxTokens: a.classifier?.maxTokens ?? 5,
     }
-    classifier.resolved = resolveAgentProvider(providers, classifier.provider)
+    classifier.resolved = clfResolved
 
     const qa = a.quickAgent ?? raw.quickAgent ?? {}
     const quickAgent = {
@@ -198,8 +214,6 @@ export function normalizeConfig(raw) {
         allowDMs: raw.allowDMs === true,
         memoryDepth: raw.memoryDepth,
         funMsgInterval: raw.funMsgInterval ?? raw.FunMsgInterval ?? 5400,
-        pingMode: raw.pingMode ?? raw.ping_mode ?? true,
-        replyPing: raw.replyPing ?? raw.reply_ping ?? true,
         stopSequences: asArray(raw.stopSequences ?? raw.stop_sequences),
         ignoreUsers: asArray(raw.ignoreUsers ?? raw.ignore_users).map(String),
         mutePhrases: asArray(raw.mutePhrases ?? raw.mute_phrases),
@@ -207,7 +221,7 @@ export function normalizeConfig(raw) {
         unmutePhrases: asArray(raw.unmutePhrases ?? raw.unmute_phrases),
         guilds,
         guildIds,
-        aiGuildIds: guildIds.filter((id) => guilds[id].ai),
+        aiDisabledGuildIds: guildIds.filter((id) => !guilds[id].ai),
         isolatedGuildIds: guildIds.filter((id) => guilds[id].isolatedMemory),
         alwaysActiveChannels: asArray(raw.alwaysActiveChannels ?? raw.always_active_channels).map(String),
         funChannels: asArray(raw.funChannels ?? raw.fun_channels).map(String),
@@ -218,8 +232,8 @@ export function normalizeConfig(raw) {
     }
 }
 
-const RUNTIME_MUTABLE = ['chatModel', 'pingMode', 'ignoreUsers', 'isolatedGuilds', 'temperature', 'topP']
-const RUNTIME_LEGACY = { aiModel: 'chatModel', ping_mode: 'pingMode', ignore_users: 'ignoreUsers', isolated_servers: 'isolatedGuilds' }
+const RUNTIME_MUTABLE = ['chatModel', 'isolatedGuilds', 'temperature', 'topP']
+const RUNTIME_LEGACY = { aiModel: 'chatModel', isolated_servers: 'isolatedGuilds' }
 
 function readRuntime() {
     try {
@@ -245,6 +259,35 @@ export function saveRuntime(patch) {
     }
 }
 
+export function readConfigRaw() {
+    return parseSnowflakeSafe(readFileSync(CONFIG_PATH, 'utf8'))
+}
+
+export function writeConfigRaw(raw) {
+    writeFileSync(CONFIG_PATH, JSON.stringify(raw, null, 2) + '\n', 'utf8')
+}
+
+// Flip per-guild flags (like /ai-pause's { ai: false }) in the authored config.
+// Pass undefined to drop a key; empty guild entries fall off entirely.
+export function setConfigGuild(guildId, patch) {
+    try {
+        const raw = readConfigRaw()
+        const guilds = raw.guilds && typeof raw.guilds === 'object' && !Array.isArray(raw.guilds) ? raw.guilds : {}
+        const entry = { ...(guilds[String(guildId)] ?? {}) }
+        for (const [k, v] of Object.entries(patch)) {
+            if (v === undefined) delete entry[k]
+            else entry[k] = v
+        }
+        if (Object.keys(entry).length) guilds[String(guildId)] = entry
+        else delete guilds[String(guildId)]
+        if (Object.keys(guilds).length) raw.guilds = guilds
+        else delete raw.guilds
+        writeConfigRaw(raw)
+    } catch (e) {
+        console.error('[Config] config.json update failed:', e)
+    }
+}
+
 let _cached = null
 
 export function loadConfig() {
@@ -260,15 +303,14 @@ export function loadConfig() {
     if (runtime.chatModel) config.agents.chat.model = runtime.chatModel
     if (runtime.temperature !== undefined) config.agents.chat.temperature = runtime.temperature
     if (runtime.topP !== undefined) config.agents.chat.topP = runtime.topP
-    if (runtime.pingMode !== undefined) config.pingMode = runtime.pingMode
-    if (Array.isArray(runtime.ignoreUsers)) config.ignoreUsers = runtime.ignoreUsers.map(String)
     if (Array.isArray(runtime.isolatedGuilds)) {
         for (const id of runtime.isolatedGuilds.map(String))
             (config.guilds[id] ??= { ai: true }).isolatedMemory = true
         config.isolatedGuildIds = Object.keys(config.guilds).filter((id) => config.guilds[id].isolatedMemory)
     }
     if (Object.keys(runtime).length) console.log('[Config] Applied runtime.json overrides')
-    console.log(`[Config] ${config.providers.length} provider(s), ${config.guildIds.length} guild(s) in scope`)
+    const keyCounts = config.providers.map((p) => `${p.name}: ${p.keys.length} key${p.keys.length === 1 ? '' : 's'}`).join(', ')
+    console.log(`[Config] ${config.providers.length} provider(s) [${keyCounts}], ${config.guildIds.length} guild(s) in scope`)
     _cached = config
     return config
 }
