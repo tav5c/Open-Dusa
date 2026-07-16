@@ -1,4 +1,4 @@
-// Medusa AI — extension entry point. The engine lives in extensions/ai/ as a
+// Medusa AI, extension entry point. The engine lives in extensions/ai/ as a
 // layered class chain (providers -> research -> vision -> commands -> output -> chat);
 // this file wires it into the client and owns slash/prefix registration.
 import {
@@ -11,10 +11,10 @@ import {
     PermissionFlagsBits,
     SlashCommandBuilder,
 } from 'discord.js'
-import { existsSync, readFileSync, readdirSync, statSync, writeFileSync } from 'fs'
+import { existsSync, readdirSync, statSync } from 'fs'
 import { join } from 'path'
 import { loadPerformance } from './performance.js'
-import { saveRuntime } from './config.js'
+import { readConfigRaw, saveRuntime, setConfigGuild, writeConfigRaw } from './config.js'
 import { AIChatManager } from './ai/chat.js'
 import { AIMemoryManager } from './ai/memory.js'
 import { containsDisallowedHate, safetyRefusal } from './ai/safety.js'
@@ -38,10 +38,10 @@ export async function registerAI(client, db, config) {
             globalThis._sqlite3 = { default: mod.default ?? mod }
         }
     } catch (e) {
-        console.error('[AI] better-sqlite3 not available — install on host:', e.message)
+        console.error('[AI] better-sqlite3 not available, install on host:', e.message)
     }
     try {
-        const dataDir = 'Ai Database'
+        const dataDir = 'data/ai'
         const sentinel = join(dataDir, '.migrated-v1')
         if (existsSync(dataDir) && !existsSync(sentinel)) {
             const folderPattern = /^(.+) - (\d{17,20})$/
@@ -72,7 +72,7 @@ export async function registerAI(client, db, config) {
 
             for (const [guildId, folders] of byGuild) {
                 if (folders.length <= 1 && !folders[0]?.isBareId) continue
-                // Sort by DB size descending — keep the largest as the primary
+                // Sort by DB size descending, keep the largest as the primary
                 folders.sort((a, b) => {
                     const aDb = join(a.path, 'memory.db')
                     const bDb = join(b.path, 'memory.db')
@@ -109,7 +109,7 @@ export async function registerAI(client, db, config) {
                         `)
                         dst.exec('DETACH DATABASE src')
                         dst.close()
-                        console.log(`[AI] Merged "${other.name}" → "${primary.name}"`)
+                        console.log(`[AI] Merged "${other.name}" -> "${primary.name}"`)
                         const { rmSync } = await import('fs')
                         rmSync(other.path, { recursive: true, force: true })
                     } catch (e) {
@@ -209,8 +209,14 @@ export async function registerAI(client, db, config) {
         const uid = interaction.user.id
         const isOwner = uid === OWNER_ID
 
-        // /medusa (Quick Agent) — stateless, user-installable, DM-allowed
+        // /medusa (Quick Agent), stateless, DMs and group chats only
         if (commandName === 'medusa') {
+            if (interaction.inGuild()) {
+                return interaction.reply({
+                    content: '💜 /medusa only works in DMs and group chats.',
+                    flags: MessageFlags.Ephemeral,
+                })
+            }
             const prompt = interaction.options.getString('prompt')
             const forceSearch = interaction.options.getBoolean('search') ?? false
             const isPrivate = interaction.options.getBoolean('private') ?? false
@@ -263,7 +269,7 @@ export async function registerAI(client, db, config) {
                         const m = Math.floor(rem / 60000),
                             s = Math.floor((rem % 60000) / 1000)
                         return interaction.reply({
-                            content: `⏳ Cooldown — wait **${m}m ${s}s** before summarizing again.`,
+                            content: `⏳ Cooldown, wait **${m}m ${s}s** before summarizing again.`,
                             flags: MessageFlags.Ephemeral,
                         })
                     }
@@ -278,7 +284,8 @@ export async function registerAI(client, db, config) {
             }
 
             await interaction.deferReply()
-            const startFrom = interaction.options.getString('start_from')
+            const startRaw = interaction.options.getString('start-from')
+            const startFrom = startRaw ? (startRaw.match(/(\d{15,20})\s*$/)?.[1] ?? startRaw) : null
             let startMsg = null
             if (startFrom) {
                 try {
@@ -310,16 +317,25 @@ export async function registerAI(client, db, config) {
                         ts: startMsg.createdAt,
                     })
             } else {
-                const fetched = await interaction.channel.messages.fetch({ limit: 200 })
-                for (const [, m] of fetched) {
-                    if (!m.author.bot && m.content.trim()) {
-                        messages.push({
-                            author: m.member?.displayName ?? m.author.username,
-                            content: m.content,
-                            ts: m.createdAt,
-                        })
-                        if (messages.length >= 100) break
+                // discord caps a single fetch at 100, walk two pages so busy channels still fill up
+                let cursor = null
+                for (let page = 0; page < 2 && messages.length < 100; page++) {
+                    const opts = { limit: 100 }
+                    if (cursor) opts.before = cursor
+                    const fetched = await interaction.channel.messages.fetch(opts)
+                    if (!fetched.size) break
+                    for (const [, m] of fetched) {
+                        cursor = m.id
+                        if (!m.author.bot && m.content.trim()) {
+                            messages.push({
+                                author: m.member?.displayName ?? m.author.username,
+                                content: m.content,
+                                ts: m.createdAt,
+                            })
+                            if (messages.length >= 100) break
+                        }
                     }
+                    if (fetched.size < 100) break
                 }
                 messages.reverse()
             }
@@ -342,7 +358,7 @@ export async function registerAI(client, db, config) {
 
             const first = messages[0].ts,
                 last = messages[messages.length - 1].ts
-            const header = `> 📋 **Conversation Summary**${startMsg ? ` (from message \`${startMsg.id}\`)` : ` (last ${messages.length} messages)`}\n> \`🕒| ${first.toISOString().slice(0, 16)}\` **__→__** \`${last.toISOString().slice(0, 16)} UTC\`\n> 👥| **${participants.length} users**\n${'─'.repeat(40)}`
+            const header = `> 📋 **Conversation Summary**${startMsg ? ` (from message \`${startMsg.id}\`)` : ` (last ${messages.length} messages)`}\n> \`🕒| ${first.toISOString().slice(0, 16)}\` **__->__** \`${last.toISOString().slice(0, 16)} UTC\`\n> 👥| **${participants.length} users**\n${'─'.repeat(40)}`
             const full = `${header}\n${summary}`.slice(0, 2000)
             await interaction.editReply({ content: full })
 
@@ -359,44 +375,66 @@ export async function registerAI(client, db, config) {
             const userId = interaction.user.id
             const mem = ai.getMem(interaction.guild)
             const user = mem.getUser(userId)
-            const ints = mem.getInterests(userId, 8)
+            const ints = mem.getInterests(userId, 10)
             const pers = mem.getPersonality(userId)
+            const summary = mem.getSummary(userId)
+            const scope = mem === ai.globalMem ? '🌐 shared across servers' : '🔒 isolated to this server'
             const embed = new EmbedBuilder()
-                .setTitle(`🧠 Medusa's Memory — ${interaction.user.displayName}`)
+                .setTitle(`🧠 Medusa's Memory, ${interaction.user.displayName}`)
                 .setColor(0x7f77dd)
+                .setThumbnail(interaction.user.displayAvatarURL({ size: 128 }))
+                .setDescription(`Memory scope: ${scope}`)
             if (user) {
+                const count = user.conversation_count ?? 0
                 const level =
-                    user.conversation_count > 50
-                        ? '🔥 active'
-                        : user.conversation_count > 10
-                          ? '👋 regular'
-                          : '🌱 new'
+                    count > 200
+                        ? '💜 inner circle'
+                        : count > 50
+                          ? '🔥 active'
+                          : count > 10
+                            ? '👋 regular'
+                            : '🌱 new'
                 embed.addFields({
                     name: '📊 Profile',
-                    value: `Conversations: \`${user.conversation_count}\` (${level})\nLast seen: \`${String(user.last_interaction ?? 'never').slice(0, 10)}\``,
+                    value: `Conversations: \`${count}\` (${level})\nLast seen: \`${String(user.last_interaction ?? 'never').slice(0, 10)}\``,
                     inline: false,
                 })
             } else {
                 embed.addFields({
                     name: '📊 Profile',
-                    value: 'No profile stored yet — say hi!',
+                    value: 'No profile stored yet, say hi!',
                     inline: false,
                 })
             }
-            if (ints.length)
+            if (ints.length) {
+                const top = ints[0]?.frequency ?? 1
+                const bar = (f) => {
+                    const filled = Math.max(1, Math.round(((f ?? 1) / top) * 5))
+                    return '▰'.repeat(filled) + '▱'.repeat(5 - filled)
+                }
                 embed.addFields({
                     name: '🎯 Top Interests',
-                    value:
-                        ints
-                            .slice(0, 6)
-                            .map((r) => `\`${r.topic}\``)
-                            .join(', ') || 'None yet',
+                    value: ints
+                        .slice(0, 6)
+                        .map((r) => `\`${bar(r.frequency)}\` ${r.topic}`)
+                        .join('\n'),
                     inline: false,
                 })
+            }
             if (pers?.traits)
-                embed.addFields({ name: '🎭 Detected Personality', value: pers.traits, inline: false })
+                embed.addFields({
+                    name: '🎭 Detected Personality',
+                    value: String(pers.traits).slice(0, 1024),
+                    inline: false,
+                })
+            if (summary)
+                embed.addFields({
+                    name: '📝 Long-term Notes',
+                    value: String(summary).slice(0, 1024),
+                    inline: false,
+                })
             embed.setFooter({
-                text: 'Use /forgetme to wipe this data. • Medusa',
+                text: '/forgetme wipes all of this • Medusa',
                 iconURL: interaction.user.displayAvatarURL(),
             })
             return interaction.reply({ embeds: [embed], flags: MessageFlags.Ephemeral })
@@ -440,7 +478,7 @@ export async function registerAI(client, db, config) {
                 col.stop()
                 if (i.customId === 'fm_cancel')
                     return i.update({
-                        content: 'Cancelled — your memory is safe 💜',
+                        content: 'Cancelled, your memory is safe 💜',
                         embeds: [],
                         components: [],
                     })
@@ -456,12 +494,12 @@ export async function registerAI(client, db, config) {
                     delete ai.customPrompts[userId]
                     if (ai._promptSaveTimer) clearTimeout(ai._promptSaveTimer)
                     ai._promptSaveTimer = setTimeout(() => {
-                        ai._saveJSON('Ai Database/custom_prompts.json', ai.customPrompts)
+                        ai._saveJSON('data/ai/custom_prompts.json', ai.customPrompts)
                         ai._promptSaveTimer = null
                     }, 500)
                 }
                 await i.update({
-                    content: '✅ Done — Medusa has forgotten everything about you. Fresh start 🌸',
+                    content: '✅ Done, Medusa has forgotten everything about you. Fresh start 🌸',
                     embeds: [],
                     components: [],
                 })
@@ -483,7 +521,7 @@ export async function registerAI(client, db, config) {
             }
             if (['focused', '1'].includes(input)) {
                 ai.userModes[uid2] = 1
-                ai._saveJSON('Ai Database/user_modes.json', ai.userModes)
+                ai._saveJSON('data/ai/user_modes.json', ai.userModes)
                 return interaction.reply({
                     content: '✅ Switched to **focused mode** - task-oriented responses',
                     flags: MessageFlags.Ephemeral,
@@ -491,7 +529,7 @@ export async function registerAI(client, db, config) {
             }
             if (['normal', '0'].includes(input)) {
                 ai.userModes[uid2] = 0
-                ai._saveJSON('Ai Database/user_modes.json', ai.userModes)
+                ai._saveJSON('data/ai/user_modes.json', ai.userModes)
                 return interaction.reply({
                     content: '✅ Switched to **normal mode** - Full personality and casual responses',
                     flags: MessageFlags.Ephemeral,
@@ -503,214 +541,115 @@ export async function registerAI(client, db, config) {
             })
         }
 
-        // lore
-        if (commandName === 'lore') {
-            if (!interaction.guild)
+
+        if (commandName === 'ai-pause') {
+            const guild = interaction.guild
+            if (!guild)
                 return interaction.reply({ content: 'Server only.', flags: MessageFlags.Ephemeral })
-            const mem = ai.getMem(interaction.guild)
-            const sub = interaction.options.getSubcommand()
-            const isMod =
-                interaction.member?.permissions?.has('ManageGuild') || interaction.user.id === OWNER_ID
-            if (sub === 'list') {
-                const lore = mem.getLore(20)
-                if (!lore.length)
+            if (!isOwner && !interaction.memberPermissions?.has(PermissionFlagsBits.Administrator))
+                return interaction.reply({ content: 'Administrator only.', flags: MessageFlags.Ephemeral })
+            const action = interaction.options.getString('action')
+            const pausedNow = ai.pausedGuilds.has(guild.id)
+            if (action === 'pause') {
+                if (pausedNow)
                     return interaction.reply({
-                        content: '📖 No server lore recorded yet.',
+                        content: `AI is already paused in **${guild.name}**.`,
                         flags: MessageFlags.Ephemeral,
                     })
-                const lines = lore.map((l) => `\`${l.id}\` [${l.source}×${l.frequency}] ${l.fact}`)
+                ai.pausedGuilds.add(guild.id)
+                setConfigGuild(guild.id, { ai: false })
                 return interaction.reply({
-                    content: `📖 **Server Lore:**\n${lines.join('\n')}`,
-                    flags: MessageFlags.Ephemeral,
+                    content: `\u23f8\ufe0f AI paused in **${guild.name}**. Any admin can bring her back with \`/ai-pause resume\`.`,
                 })
             }
-            if (!isMod)
+            if (!pausedNow)
                 return interaction.reply({
-                    content: '❌ Manage Guild permission required.',
+                    content: `AI isn't paused in **${guild.name}**.`,
                     flags: MessageFlags.Ephemeral,
                 })
-            if (sub === 'add') {
-                const fact = interaction.options.getString('fact')
-                const ok = mem.addLore(fact, 'manual')
-                return interaction.reply({
-                    content: ok ? `✅ Lore added: "${fact}"` : '❌ Invalid or too long (max 120 chars).',
-                    flags: MessageFlags.Ephemeral,
-                })
-            }
-            if (sub === 'remove') {
-                const id = interaction.options.getInteger('id')
-                mem.removeLore(id)
-                return interaction.reply({
-                    content: `✅ Lore entry #${id} removed.`,
-                    flags: MessageFlags.Ephemeral,
-                })
-            }
-            if (sub === 'clear') {
-                mem.db.prepare(`DELETE FROM server_lore WHERE source='auto'`).run()
-                return interaction.reply({
-                    content: '✅ All auto-extracted lore cleared.',
-                    flags: MessageFlags.Ephemeral,
-                })
-            }
-        }
-
-        // ghost
-        if (commandName === 'ghost') {
-            const sub = interaction.options.getSubcommand()
-            const scope = `${interaction.guild?.id ?? 'dm'}:${interaction.user.id}`
-            if (sub === 'add') {
-                const target = interaction.options.getUser('user')
-                ai.ghost.add(scope, target.id)
-                return interaction.reply({
-                    content: `👻 Ghosted **${target.username}** — their messages won't influence your AI context.`,
-                    flags: MessageFlags.Ephemeral,
-                })
-            }
-            if (sub === 'remove') {
-                const target = interaction.options.getUser('user')
-                ai.ghost.remove(scope, target.id)
-                return interaction.reply({
-                    content: `✅ Removed **${target.username}** from ghost list.`,
-                    flags: MessageFlags.Ephemeral,
-                })
-            }
-            if (sub === 'list') {
-                const list = ai.ghost.list(scope)
-                if (!list.length)
-                    return interaction.reply({ content: 'No ghosted users.', flags: MessageFlags.Ephemeral })
-                const lines = list.map((id) => {
-                    const u = client.users.cache.get(id)
-                    return u ? `${u.username} (\`${id}\`)` : `\`${id}\``
-                })
-                return interaction.reply({
-                    content: `👻 **Ghost list:**\n${lines.join('\n')}`,
-                    flags: MessageFlags.Ephemeral,
-                })
-            }
-            if (sub === 'clear') {
-                ai.ghost.clear(scope)
-                return interaction.reply({ content: '✅ Ghost list cleared.', flags: MessageFlags.Ephemeral })
-            }
+            ai.pausedGuilds.delete(guild.id)
+            setConfigGuild(guild.id, { ai: undefined })
+            return interaction.reply({ content: `\u25b6\ufe0f AI resumed in **${guild.name}**, she's listening again.` })
         }
 
         // owner-only commands
         if (!isOwner) return
-
-        if (commandName === 'aipause') {
-            ai.paused = !ai.paused
-            return interaction.reply({
-                content: `AI ${ai.paused ? 'paused' : 'unpaused'}`,
-                flags: MessageFlags.Ephemeral,
-            })
-        }
-        if (commandName === 'aireinit') {
-            ai._initGroq()
-            return interaction.reply({
-                content: `Reinitialized. Success: ${!!ai._groq}`,
-                flags: MessageFlags.Ephemeral,
-            })
-        }
-        if (commandName === 'aimodel') {
-            const model = interaction.options.getString('model')
-            if (!model) {
-                await interaction.deferReply({ flags: MessageFlags.Ephemeral })
-                try {
-                    const key = ai.aiTokens[ai.currentKeyIdx]
-                    const res = await fetch('https://api.groq.com/openai/v1/models', {
-                        headers: { Authorization: `Bearer ${key}` },
-                    })
-                    const data = await res.json()
-                    const models = (data.data || [])
-                        .filter((m) => m.active)
-                        .map((m) => `\`${m.id}\``)
-                        .join(', ')
-                    return interaction.editReply({
-                        content: `Current: \`${ai.aiModel}\`\n\n**Available Models:**\n${models || 'Could not fetch list.'}`,
-                    })
-                } catch (e) {
-                    return interaction.editReply({
-                        content: `Current: \`${ai.aiModel}\`\nFailed to fetch models from API.`,
-                    })
-                }
-            }
-            ai.aiModel = model
-            // Runtime state lives in memory never mutate source config
-            try {
-                const runtimePath = 'runtime.json'
-                let runtime = {}
-                if (existsSync(runtimePath)) {
-                    runtime = JSON.parse(readFileSync(runtimePath, 'utf8'))
-                }
-                runtime.aiModel = model
-                writeFileSync(runtimePath, JSON.stringify(runtime, null, 2))
-            } catch (e) {
-                console.error('[AI] Failed to persist runtime state:', e)
-            }
-            return interaction.reply({ content: `Model set to: \`${model}\``, flags: MessageFlags.Ephemeral })
-        }
-        if (commandName === 'iso') {
+        if (commandName === 'isolation') {
             const guild = interaction.guild
             if (!guild)
+                return interaction.reply({ content: 'Server only.', flags: MessageFlags.Ephemeral })
+            const wantIsolated = interaction.options.getBoolean('active')
+            const isIsolated = ai.isolatedServers.has(guild.id)
+            if (wantIsolated === isIsolated)
                 return interaction.reply({
-                    content: 'Must be used in a server.',
+                    content: isIsolated
+                        ? `**${guild.name}** is already isolated.`
+                        : `**${guild.name}** isn't isolated.`,
                     flags: MessageFlags.Ephemeral,
                 })
-            if (ai.isolatedServers.has(guild.id))
+            if (wantIsolated) {
+                const mem = new AIMemoryManager(guild.id, guild.name)
+                ai.isolatedServers.add(guild.id)
+                ai.isolatedMems.set(guild.id, mem)
+                saveRuntime({ isolatedGuilds: [...ai.isolatedServers] })
                 return interaction.reply({
-                    content: `**${guild.name}** is already isolated.`,
+                    content: mem.resumed
+                        ? `🔒 **${guild.name}** isolated, picked its old memory folder back up.`
+                        : `🔒 **${guild.name}** isolated, it now has its own AI memory.`,
                     flags: MessageFlags.Ephemeral,
                 })
-            ai.isolatedServers.add(guild.id)
-            ai.isolatedMems.set(guild.id, new AIMemoryManager(guild.id, guild.name))
-            saveRuntime({ isolatedGuilds: [...ai.isolatedServers] })
-            return interaction.reply({
-                content: `✅ **${guild.name}** isolated — now has its own AI memory.`,
-                flags: MessageFlags.Ephemeral,
-            })
-        }
-        if (commandName === 'uniso') {
-            const guild = interaction.guild
-            if (!guild)
-                return interaction.reply({
-                    content: 'Must be used in a server.',
-                    flags: MessageFlags.Ephemeral,
-                })
-            if (!ai.isolatedServers.has(guild.id))
-                return interaction.reply({
-                    content: `**${guild.name}** is not isolated.`,
-                    flags: MessageFlags.Ephemeral,
-                })
+            }
             ai.isolatedServers.delete(guild.id)
             ai.isolatedMems.delete(guild.id)
             saveRuntime({ isolatedGuilds: [...ai.isolatedServers] })
             return interaction.reply({
-                content: `✅ **${guild.name}** un-isolated — using global memory now.`,
+                content: `🔓 **${guild.name}** un-isolated, back on global memory. Its folder stays on disk, so isolating again resumes where it left off.`,
                 flags: MessageFlags.Ephemeral,
             })
         }
-        if (commandName === 'aiwipe') {
-            ai.messageHistory.clear()
-            for (const m of [ai.globalMem, ...ai.isolatedMems.values()]) {
-                try {
-                    m.db.exec(
-                        'DELETE FROM conversations; DELETE FROM interests; DELETE FROM personality; DELETE FROM users; DELETE FROM relationships; DELETE FROM user_aliases;',
-                    )
-                } catch {}
+        if (commandName === 'configclean') {
+            await interaction.deferReply({ flags: MessageFlags.Ephemeral })
+            const removed = []
+            const liveChannel = async (id) => {
+                if (client.channels.cache.has(id)) return true
+                return !!(await client.channels.fetch(id).catch(() => null))
             }
-            return interaction.reply({ content: 'AI memory wiped', flags: MessageFlags.Ephemeral })
-        }
-        if (commandName === 'pm') {
-            const mode = interaction.options.getString('mode')
-            if (!mode)
-                return interaction.reply({
-                    content: `Ping mode: **${ai.pingMode ? 'enabled' : 'disabled'}**`,
-                    flags: MessageFlags.Ephemeral,
-                })
-            ai.pingMode = ['on', 'enable', 'true', '1'].includes(mode.toLowerCase())
-            saveRuntime({ pingMode: ai.pingMode })
-            return interaction.reply({
-                content: `Ping mode **${ai.pingMode ? 'enabled' : 'disabled'}**`,
-                flags: MessageFlags.Ephemeral,
+            try {
+                const raw = readConfigRaw()
+                if (raw.guilds && typeof raw.guilds === 'object' && !Array.isArray(raw.guilds)) {
+                    for (const id of Object.keys(raw.guilds)) {
+                        if (!client.guilds.cache.has(String(id))) {
+                            delete raw.guilds[id]
+                            removed.push(`guild \`${id}\``)
+                        }
+                    }
+                    if (!Object.keys(raw.guilds).length) delete raw.guilds
+                }
+                for (const key of ['alwaysActiveChannels', 'funChannels', 'always_active_channels', 'fun_channels']) {
+                    if (!Array.isArray(raw[key])) continue
+                    const keep = []
+                    for (const id of raw[key].map(String)) {
+                        if (/^\d{15,20}$/.test(id) && (await liveChannel(id))) keep.push(id)
+                        else removed.push(`${key} \`${id}\``)
+                    }
+                    raw[key] = keep
+                }
+                if (removed.length) writeConfigRaw(raw)
+            } catch (e) {
+                return interaction.editReply({ content: `Cleanup failed: ${e.message}` })
+            }
+            const staleIso = [...ai.isolatedServers].filter((id) => !client.guilds.cache.has(id))
+            for (const id of staleIso) {
+                ai.isolatedServers.delete(id)
+                ai.isolatedMems.delete(id)
+                removed.push(`isolation \`${id}\``)
+            }
+            if (staleIso.length) saveRuntime({ isolatedGuilds: [...ai.isolatedServers] })
+            for (const id of [...ai.pausedGuilds]) if (!client.guilds.cache.has(id)) ai.pausedGuilds.delete(id)
+            if (!removed.length)
+                return interaction.editReply({ content: 'Config is clean, nothing stale in there.' })
+            return interaction.editReply({
+                content: `🧽 Cleaned ${removed.length} stale entr${removed.length === 1 ? 'y' : 'ies'}:\n${removed.map((r) => `• ${r}`).join('\n')}`.slice(0, 1900),
             })
         }
     })
@@ -727,19 +666,53 @@ export async function registerAI(client, db, config) {
         ai.customPrompts[uid] = text
         if (ai._promptSaveTimer) clearTimeout(ai._promptSaveTimer)
         ai._promptSaveTimer = setTimeout(() => {
-            ai._saveJSON('Ai Database/custom_prompts.json', ai.customPrompts)
+            ai._saveJSON('data/ai/custom_prompts.json', ai.customPrompts)
             ai._promptSaveTimer = null
         }, 500)
-        await msg.reply(`✅ Custom prompt set for ${msg.author.displayName}`)
+        const modeNote =
+            ai.userModes[uid] === 1
+                ? `, heads up, focused mode overrides it (\`${config.prefix}mode normal\` to switch back)`
+                : ''
+        await msg.reply(`✅ Custom prompt set for ${msg.author.displayName}${modeNote}`)
     })
     client.commands.set('prompt', client.commands.get('p'))
     client.commands.set('pr', async (msg) => {
         const uid = String(msg.author.id)
         if (ai.customPrompts[uid]) {
             delete ai.customPrompts[uid]
-            ai._saveJSON('Ai Database/custom_prompts.json', ai.customPrompts)
+            ai._saveJSON('data/ai/custom_prompts.json', ai.customPrompts)
             await msg.reply(`✅ Prompt reset to default for ${msg.author.displayName}`)
         } else await msg.reply("You don't have a custom prompt set.")
+    })
+    client.commands.set('serverp', async (msg, args) => {
+        if (!msg.guild) return msg.reply('Server personas only work in a server.')
+        const canManage =
+            String(msg.author.id) === String(config.ownerId) ||
+            msg.member?.permissions?.has(PermissionFlagsBits.ManageGuild)
+        if (!canManage) return msg.reply('You need **Manage Server** to change the server persona.')
+        const text = args.join(' ')
+        if (!text) {
+            const cur = ai.serverPrompts[msg.guild.id]
+            return msg.reply(cur ? `Current server persona: ${cur.slice(0, 600)}` : 'No server persona set.')
+        }
+        if (containsDisallowedHate(text, { persona: true })) {
+            logAction(db, msg.guild.id, String(msg.author.id), client.user.id, 'AI safety block', 'Unsafe server persona')
+            return msg.reply(safetyRefusal(text))
+        }
+        ai.serverPrompts[msg.guild.id] = text
+        ai._saveJSON('data/ai/server_prompts.json', ai.serverPrompts)
+        await msg.reply(`✅ Server persona set for ${msg.guild.name}`)
+    })
+    client.commands.set('serverpr', async (msg) => {
+        if (!msg.guild) return msg.reply('Server personas only work in a server.')
+        const canManage =
+            String(msg.author.id) === String(config.ownerId) ||
+            msg.member?.permissions?.has(PermissionFlagsBits.ManageGuild)
+        if (!canManage) return msg.reply('You need **Manage Server** to reset the server persona.')
+        if (!ai.serverPrompts[msg.guild.id]) return msg.reply('This server has no custom persona.')
+        delete ai.serverPrompts[msg.guild.id]
+        ai._saveJSON('data/ai/server_prompts.json', ai.serverPrompts)
+        await msg.reply('✅ Server persona reset to default')
     })
     client.commands.set('mode', async (msg, args) => {
         const input = args[0]?.toLowerCase()
@@ -759,74 +732,12 @@ export async function registerAI(client, db, config) {
         // Async save with debounce to prevent disk thrashing
         if (ai._modeSaveTimer) clearTimeout(ai._modeSaveTimer)
         ai._modeSaveTimer = setTimeout(() => {
-            ai._saveJSON('Ai Database/user_modes.json', ai.userModes)
+            ai._saveJSON('data/ai/user_modes.json', ai.userModes)
             ai._modeSaveTimer = null
         }, 500)
         return msg.reply(`✅ Switched to **${newMode === 1 ? 'focused' : 'normal'} mode**`)
     })
 
-    client.commands.set(
-        'aipause',
-        ownerOnly(async (msg) => {
-            ai.paused = !ai.paused
-            await msg.reply(`AI ${ai.paused ? 'paused' : 'unpaused'}`)
-        }),
-    )
-    client.commands.set(
-        'aireinit',
-        ownerOnly(async (msg) => {
-            ai._initGroq()
-            await msg.reply(`Reinitialized. Success: ${!!ai._groq}`)
-        }),
-    )
-    client.commands.set(
-        'aiwipe',
-        ownerOnly(async (msg) => {
-            ai.messageHistory.clear()
-            for (const m of [ai.globalMem, ...ai.isolatedMems.values()])
-                try {
-                    m.db.exec(
-                        'DELETE FROM conversations; DELETE FROM interests; DELETE FROM personality; DELETE FROM users; DELETE FROM relationships; DELETE FROM user_aliases;',
-                    )
-                } catch {}
-            await msg.reply('AI memory wiped')
-        }),
-    )
-    client.commands.set(
-        'aimodel',
-        ownerOnly(async (msg, args) => {
-            if (!args[0]) return msg.reply(`Current: \`${ai.aiModel}\``)
-            ai.aiModel = args[0]
-            saveRuntime({ chatModel: args[0] })
-            await msg.reply(`Model set to: \`${args[0]}\``)
-        }),
-    )
-    client.commands.set(
-        'aiignore',
-        ownerOnly(async (msg, args) => {
-            const [action, user] = args
-            if (!action) return msg.reply(`Ignored users: ${[...ai.ignoreUsers].join(', ') || 'none'}`)
-            if (action === 'add') {
-                if (user === 'all') {
-                    ai.ignoreUsers.add('all')
-                } else {
-                    const id = user?.replace(/[<@!>]/g, '')
-                    if (id) ai.ignoreUsers.add(id)
-                }
-                saveRuntime({ ignoreUsers: [...ai.ignoreUsers] })
-                await msg.reply('✅ Added')
-            } else if (action === 'remove') {
-                const id = user?.replace(/[<@!>]/g, '') ?? 'all'
-                ai.ignoreUsers.delete(id)
-                saveRuntime({ ignoreUsers: [...ai.ignoreUsers] })
-                await msg.reply('✅ Removed')
-            } else if (action === 'clear') {
-                ai.ignoreUsers.clear()
-                saveRuntime({ ignoreUsers: [] })
-                await msg.reply('✅ Cleared')
-            }
-        }),
-    )
     client.commands.set(
         'aihistory',
         ownerOnly(async (msg, args) => {
@@ -886,36 +797,6 @@ export async function registerAI(client, db, config) {
             for (const chunk of ai.splitResponse(lines.join('\n\n'))) await msg.reply(chunk)
         }),
     )
-    client.commands.set(
-        'iso',
-        ownerOnly(async (msg) => {
-            if (!msg.guild) return
-            ai.isolatedServers.add(msg.guild.id)
-            ai.isolatedMems.set(msg.guild.id, new AIMemoryManager(msg.guild.id, msg.guild.name))
-            saveRuntime({ isolatedGuilds: [...ai.isolatedServers] })
-            await msg.reply(`✅ **${msg.guild.name}** isolated — separate AI memory.`)
-        }),
-    )
-    client.commands.set(
-        'uniso',
-        ownerOnly(async (msg) => {
-            if (!msg.guild) return
-            ai.isolatedServers.delete(msg.guild.id)
-            ai.isolatedMems.delete(msg.guild.id)
-            saveRuntime({ isolatedGuilds: [...ai.isolatedServers] })
-            await msg.reply(`✅ **${msg.guild.name}** un-isolated.`)
-        }),
-    )
-    client.commands.set(
-        'pm',
-        ownerOnly(async (msg, args) => {
-            const m = args[0]?.toLowerCase()
-            if (!m) return msg.reply(`Ping mode: **${ai.pingMode ? 'enabled' : 'disabled'}**`)
-            ai.pingMode = ['on', 'enable', 'true', '1'].includes(m)
-            saveRuntime({ pingMode: ai.pingMode })
-            await msg.reply(`Ping mode **${ai.pingMode ? 'enabled' : 'disabled'}**`)
-        }),
-    )
 
     console.log('[AI] Manager initialized, listeners registered')
     return ai
@@ -925,31 +806,8 @@ export async function registerAI(client, db, config) {
 export function buildAISlashCommands() {
     return [
         new SlashCommandBuilder()
-            .setName('lore')
-            .setContexts(0)
-
-            .setDescription('Manage server lore Medusa learns from')
-            .addSubcommand((s) => s.setName('list').setDescription('View all recorded server lore'))
-            .addSubcommand((s) =>
-                s
-                    .setName('add')
-                    .setDescription('Add a lore fact (mods)')
-                    .addStringOption((o) =>
-                        o.setName('fact').setDescription('Fact to add (max 120 chars)').setRequired(true),
-                    ),
-            )
-            .addSubcommand((s) =>
-                s
-                    .setName('remove')
-                    .setDescription('Remove a lore entry (mods)')
-                    .addIntegerOption((o) =>
-                        o.setName('id').setDescription('ID from /lore list').setRequired(true),
-                    ),
-            )
-            .addSubcommand((s) => s.setName('clear').setDescription('Clear all auto-extracted lore (mods)')),
-        new SlashCommandBuilder()
             .setName('memory')
-            .setDescription('See what Medusa remembers about you')
+            .setDescription('Peek at everything Medusa remembers about you')
             .setContexts(0),
         new SlashCommandBuilder()
             .setName('forgetme')
@@ -966,73 +824,43 @@ export function buildAISlashCommands() {
                     .addChoices({ name: 'focused', value: 'focused' }, { name: 'normal', value: 'normal' }),
             ),
         new SlashCommandBuilder()
-            .setName('ghost')
+            .setName('ai-pause')
+            .setDescription('Pause or resume the AI in this server (admins)')
             .setContexts(0)
-            .setDescription('Manage ghost user filter')
-            .addSubcommand((s) =>
-                s
-                    .setName('add')
-                    .setDescription('Ghost a user')
-                    .addUserOption((o) =>
-                        o.setName('user').setDescription('User to ghost').setRequired(true),
-                    ),
-            )
-            .addSubcommand((s) =>
-                s
-                    .setName('remove')
-                    .setDescription('Unghost a user')
-                    .addUserOption((o) =>
-                        o.setName('user').setDescription('User to remove').setRequired(true),
-                    ),
-            )
-            .addSubcommand((s) => s.setName('list').setDescription('List ghosted users'))
-            .addSubcommand((s) => s.setName('clear').setDescription('Clear ghost list')),
-        // Owner-only (hidden by not setting defaultMemberPermissions, ephemeral responses guard access)
-        new SlashCommandBuilder().setName('aipause').setDescription('Toggle AI pause (owner)').setContexts(0),
-        new SlashCommandBuilder()
-            .setName('aireinit')
-            .setDescription('Reinitialize Groq client (owner)')
-            .setContexts(0),
-        new SlashCommandBuilder()
-            .setName('aimodel')
-            .setContexts(0)
-            .setDescription('Get/set AI model (owner)')
-            .addStringOption((o) => o.setName('model').setDescription('Model string')),
-        new SlashCommandBuilder()
-            .setName('aiwipe')
-            .setDescription('Wipe all AI memory (owner)')
-            .setContexts(0),
-        new SlashCommandBuilder()
-            .setName('pm')
-            .setContexts(0)
-            .setDescription('Toggle ping mode (owner)')
+            .setDefaultMemberPermissions(PermissionFlagsBits.Administrator)
             .addStringOption((o) =>
                 o
-                    .setName('mode')
-                    .setDescription('on or off')
-                    .addChoices({ name: 'on', value: 'on' }, { name: 'off', value: 'off' }),
+                    .setName('action')
+                    .setDescription('pause or resume')
+                    .setRequired(true)
+                    .addChoices({ name: 'pause', value: 'pause' }, { name: 'resume', value: 'resume' }),
+            ),
+        // Owner-only. Locked to admins at the API level so regular members never
+        // see them, and the handlers hard-gate on the owner id anyway.
+        new SlashCommandBuilder()
+            .setName('isolation')
+            .setDescription('Give this server its own AI memory (owner)')
+            .setContexts(0)
+            .setDefaultMemberPermissions('0')
+            .addBooleanOption((o) =>
+                o.setName('active').setDescription('true isolates, false goes back to global memory').setRequired(true),
             ),
         new SlashCommandBuilder()
-            .setName('iso')
-            .setDescription('Isolate server AI memory (owner)')
-            .setContexts(0),
-        new SlashCommandBuilder()
-            .setName('uniso')
-            .setDescription('Un-isolate server AI memory (owner)')
-            .setContexts(0),
+            .setName('configclean')
+            .setDescription('Sweep dead server/channel ids out of config.json (owner)')
+            .setContexts(0)
+            .setDefaultMemberPermissions('0'),
         new SlashCommandBuilder()
             .setName('summarize')
             .setDescription('Summarize recent conversation')
             .setIntegrationTypes(0, 1)
             .setContexts(0, 1, 2)
-            .addStringOption((o) => o.setName('start_from').setDescription('Message ID to start from')),
+            .addStringOption((o) => o.setName('start-from').setDescription('Message ID or link to start from')),
         new SlashCommandBuilder()
             .setName('medusa')
-            .setDescription(
-                'Quick Agent — stateless AI query, no memory, no commands. Works in DMs and any server.',
-            )
+            .setDescription('Ask Medusa one quick question, nothing gets remembered. DMs and group chats only.')
             .setIntegrationTypes(0, 1)
-            .setContexts(0, 1, 2)
+            .setContexts(1, 2)
             .addStringOption((o) =>
                 o
                     .setName('prompt')

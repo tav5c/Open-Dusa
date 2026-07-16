@@ -1,4 +1,4 @@
-// extensions/reminders.js — persistent reminders that survive restarts.
+// extensions/reminders.js, persistent reminders that survive restarts.
 //
 // Reminders live in SQLite, not in setTimeout: a 20s poll tick fires anything
 // due, and on boot anything that came due while the bot was offline fires
@@ -12,7 +12,7 @@ const MAX_PER_USER = 25
 const MAX_TEXT = 300
 const UNITS = { s: 1_000, m: 60_000, h: 3_600_000, d: 86_400_000, w: 604_800_000 }
 
-// "1h30m", "45m", "2d12h" → ms (null when nothing parseable)
+// "1h30m", "45m", "2d12h" -> ms (null when nothing parseable)
 export function parseDuration(str) {
     let ms = 0
     for (const [, n, u] of String(str ?? '').matchAll(/(\d+)\s*([smhdw])/gi))
@@ -23,7 +23,7 @@ export function parseDuration(str) {
 // Accepts either a relative duration ("1h30m") or a single-token absolute
 // date/datetime ("2026-01-12", "2026-01-12T18:00"). Returns ms-from-now, or
 // null if unparseable or already in the past. Space-separated dates
-// ("2026-01-12 18:00") must use T instead of a space — a bare space is
+// ("2026-01-12 18:00") must use T instead of a space, a bare space is
 // ambiguous with "<duration> <message>" in the plain-text command syntax.
 export function parseWhen(str) {
     const rel = parseDuration(str)
@@ -74,7 +74,7 @@ export async function init(client, db) {
 
     async function fire(row) {
         // Original channel first; DM fallback covers deleted channels / lost perms.
-        const late = Date.now() - row.due_at > 90_000 ? " *(sorry I'm late — I was offline ⏰)*" : ''
+        const late = Date.now() - row.due_at > 90_000 ? " *(sorry I'm late, I was offline ⏰)*" : ''
         const payload = {
             content: `⏰ <@${row.user_id}> reminder: **${row.message}**${late}`,
             allowedMentions: { users: [row.user_id] },
@@ -99,7 +99,7 @@ export async function init(client, db) {
 
     const create = ({ userId, guildId, channelId, message, dueAt }) => {
         if (q.countUser.get(userId).n >= MAX_PER_USER)
-            return { error: `you already have ${MAX_PER_USER} reminders — clear some first` }
+            return { error: `you already have ${MAX_PER_USER} reminders, clear some first` }
         const info = q.insert.run(
             userId,
             guildId ?? null,
@@ -125,7 +125,7 @@ export async function init(client, db) {
             })
         if (dur > 365 * UNITS.d)
             return msg.reply({
-                content: "⏰ That's more than a year out — pick something shorter.",
+                content: "⏰ That's more than a year out, pick something shorter.",
                 allowedMentions: { parse: [] },
             })
         const res = create({
@@ -137,11 +137,11 @@ export async function init(client, db) {
         })
         if (res.error) return msg.reply({ content: `⏰ ${res.error}`, allowedMentions: { parse: [] } })
         await msg.reply({
-            content: `⏰ Got it — reminder **#${res.id}** set for <t:${Math.floor(res.dueAt / 1000)}:R>: **${text.slice(0, 100)}**`,
+            content: `⏰ Got it, reminder **#${res.id}** set for <t:${Math.floor(res.dueAt / 1000)}:R>: **${text.slice(0, 100)}**`,
             allowedMentions: { parse: [] },
         })
     })
-    // Aliases — people (and the AI) reach for these names constantly.
+    // Aliases, people (and the AI) reach for these names constantly.
     client.commands.set('reminder', client.commands.get('remind'))
     client.commands.set('remindme', client.commands.get('remind'))
 
@@ -151,7 +151,7 @@ export async function init(client, db) {
             return msg.reply({ content: '⏰ You have no pending reminders.', allowedMentions: { parse: [] } })
         const lines = rows
             .slice(0, 15)
-            .map((r) => `**#${r.id}** — <t:${Math.floor(r.due_at / 1000)}:R> — ${r.message.slice(0, 80)}`)
+            .map((r) => `**#${r.id}**, <t:${Math.floor(r.due_at / 1000)}:R>, ${r.message.slice(0, 80)}`)
         await msg.reply({
             content: `⏰ Your reminders:\n${lines.join('\n')}`,
             allowedMentions: { parse: [] },

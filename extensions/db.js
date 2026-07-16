@@ -19,7 +19,7 @@ export async function loadSqlite() {
             _isCipher = true
         } catch (e) {
             console.warn(
-                '[DB] better-sqlite3-multiple-ciphers unavailable — falling back to better-sqlite3 with NO at-rest encryption:',
+                '[DB] better-sqlite3-multiple-ciphers unavailable, falling back to better-sqlite3 with NO at-rest encryption:',
                 e.message,
             )
             const mod = await import('better-sqlite3')
@@ -55,21 +55,21 @@ export function openDb(path) {
     if (!_Database) throw new Error('[DB] loadSqlite() must be awaited before openDb()')
     const key = process.env.DB_ENCRYPTION_KEY || ''
 
-    // No key, or a driver without cipher support → plain open (backward compatible).
+    // No key, or a driver without cipher support -> plain open (backward compatible).
     if (!key || !_isCipher) {
         return new _Database(path)
     }
 
     const fileExists = existsSync(path)
 
-    // Brand-new database → encrypted from the very first byte.
+    // Brand-new database -> encrypted from the very first byte.
     if (!fileExists) {
         const conn = new _Database(path)
         conn.pragma(`key = '${_quote(key)}'`)
         return conn
     }
 
-    // Existing database → try to open it as already-encrypted with this key.
+    // Existing database -> try to open it as already-encrypted with this key.
     let probe
     try {
         probe = new _Database(path)
@@ -77,8 +77,8 @@ export function openDb(path) {
         probe.prepare('SELECT count(*) FROM sqlite_master').get() // probe
         return probe
     } catch {
-        // Probe failed → most likely a legacy plaintext DB. Close the probe handle —
-        // leaking it keeps the file open and can contribute to "database is locked" —
+        // Probe failed -> most likely a legacy plaintext DB. Close the probe handle -
+        // leaking it keeps the file open and can contribute to "database is locked" -
         // then migrate once below.
         try {
             probe?.close()
@@ -112,7 +112,7 @@ export function openDb(path) {
         plain.exec(`DETACH DATABASE encrypted;`)
         plain.close()
     } catch (e) {
-        // Encryption isn't usable on this host — almost always because the native build
+        // Encryption isn't usable on this host, almost always because the native build
         // of better-sqlite3-multiple-ciphers didn't run its install scripts (Pterodactyl
         // and similar hosts block them by default), so `sqlcipher_export` isn't registered.
         // A failed migration must NEVER take the whole DB down: close the temp attempt,
@@ -126,19 +126,19 @@ export function openDb(path) {
             if (existsSync(tmp)) unlinkSync(tmp)
         } catch {}
         console.warn(
-            `[DB] At-rest encryption unavailable (${e.message}). Running UNENCRYPTED on ${path} — ` +
+            `[DB] At-rest encryption unavailable (${e.message}). Running UNENCRYPTED on ${path}, ` +
                 `your data is intact and the bot is fully functional, but DB_ENCRYPTION_KEY is being ignored. ` +
                 `To enable encryption, allow native install scripts (e.g. npm approve-scripts better-sqlite3-multiple-ciphers) so the cipher module builds, then restart.`,
         )
         return new _Database(path)
     }
 
-    // Swap plaintext → encrypted, keeping a one-time backup of the original.
+    // Swap plaintext -> encrypted, keeping a one-time backup of the original.
     renameSync(path, `${path}.plain-bak`)
     _rmSidecars(path)
     renameSync(tmp, path)
     console.log(
-        `[DB] Encrypted ${path} at rest (SQLCipher). Plaintext backup saved as ${path}.plain-bak — ` +
+        `[DB] Encrypted ${path} at rest (SQLCipher). Plaintext backup saved as ${path}.plain-bak, ` +
             `delete it once you've confirmed the bot works.`,
     )
 

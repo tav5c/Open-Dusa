@@ -32,7 +32,7 @@ export function safetyRefusal(seed = '') {
     return REFUSALS[hash % REFUSALS.length]
 }
 // Models sometimes ship a flat "I'm sorry, but I can't comply with that." that ignores
-// the persona entirely. Swap whole-message canned refusals for one in her voice —
+// the persona entirely. Swap whole-message canned refusals for one in her voice -
 // longer replies that merely contain a refusal phrase are left alone.
 const CANNED_REFUSAL =
     /^[\s"'*_~`]*(?:i['’]?m sorry[,.]?(?:\s*but)?\s*i can(?:['’]?t|not)|sorry[,.]?(?:\s*but)?\s*i can(?:['’]?t|not)|i can(?:['’]?t|not)\s+(?:comply|help with|assist with|do)\b|i['’]?m (?:unable|not able) to (?:comply|help|assist|do)|as an ai\b)/i
@@ -40,7 +40,7 @@ const PERSONA_REFUSALS = [
     'nah, not doing that one 💜',
     "that's a no from me. next.",
     'nice try 💀 still no.',
-    "i'll pass — ask me something else.",
+    "i'll pass, ask me something else.",
 ]
 export function inPersonaRefusal(text, seed = '') {
     const s = String(text ?? '').trim()

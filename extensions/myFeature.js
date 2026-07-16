@@ -1,4 +1,4 @@
-// extensions/myFeature.js — example extension using the manifest-based loader.
+// extensions/myFeature.js, example extension using the manifest-based loader.
 // Copy this file, rename the manifest, and drop it in /extensions to activate.
 
 export const manifest = {
@@ -9,7 +9,7 @@ export const manifest = {
     apiVersion: 1,
     slashCommands: [], // array of SlashCommandBuilder().toJSON() shapes
     permissions: [], // e.g. ['ManageMessages']
-    dependencies: [], // ['ai', 'automod', ...]
+    dependencies: [], // ['ai', 'moderation', ...]
 }
 
 export async function init(client, db, heart) {

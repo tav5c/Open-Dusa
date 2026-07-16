@@ -299,42 +299,64 @@ export async function cmdClear(ctx, amount = 10) {
     await send({ embeds: [embed] })
 }
 
+// accepts a raw message ID or a full message link, returns the ID or null
+function parseMessageRef(ref) {
+    if (!ref) return null
+    const m = String(ref).trim().match(/(\d{15,20})\s*$/)
+    return m ? m[1] : null
+}
+
 export async function cmdFpurge(
     ctx,
     text,
     user = null,
     exact = false,
     limit = 100,
-    afterId = null,
-    beforeId = null,
+    startFrom = null,
+    stopAt = null,
 ) {
     const send = ctx.deferred || ctx.replied ? (data) => ctx.editReply(data) : (data) => ctx.reply(data)
+    const startId = parseMessageRef(startFrom)
+    const stopId = parseMessageRef(stopAt)
+    if ((startFrom && !startId) || (stopAt && !stopId))
+        return send({ content: '❌ That message ID or link does not look right.' })
+    if (startId && stopId && BigInt(startId) <= BigInt(stopId))
+        return send({ content: '❌ start-from has to be newer than stop-at.' })
     try {
-        let found = 0,
-            checked = 0
-        let lastId = null
+        let found = 0
+        let checked = 0
+        let done = false
+        // bump the cursor one snowflake up so the start message itself gets checked too
+        let cursor = startId ? (BigInt(startId) + 1n).toString() : null
         const targetId = user?.id ?? null
         const searchText = (text ?? '').toLowerCase()
-        while (checked < limit) {
-            const fetchOpts = { limit: Math.min(100, limit - checked) }
-            if (afterId && !lastId) fetchOpts.after = afterId
-            if (beforeId && !lastId) fetchOpts.before = beforeId
-            if (lastId) fetchOpts.before = lastId
+        while (checked < limit && !done) {
+            const batch = Math.min(100, limit - checked)
+            const fetchOpts = { limit: batch }
+            if (cursor) fetchOpts.before = cursor
             const msgs = await ctx.channel.messages.fetch(fetchOpts)
             if (!msgs.size) break
-            checked += msgs.size
-            lastId = msgs.last()?.id
-            const toDelete = msgs.filter((m) => {
-                if (targetId && m.author.id !== targetId) return false
+            const toDelete = []
+            for (const m of msgs.values()) {
+                if (stopId && BigInt(m.id) < BigInt(stopId)) {
+                    done = true
+                    break
+                }
+                checked++
+                cursor = m.id
+                if (targetId && m.author.id !== targetId) continue
                 const content = m.content.toLowerCase()
-                return exact ? content === searchText : content.includes(searchText)
-            })
-            if (toDelete.size) {
-                await ctx.channel.bulkDelete(toDelete, true)
-                found += toDelete.size
+                if (exact ? content === searchText : content.includes(searchText)) toDelete.push(m)
             }
+            if (toDelete.length) {
+                await ctx.channel.bulkDelete(toDelete, true)
+                found += toDelete.length
+            }
+            if (msgs.size < batch) break
         }
-        await send({ content: `✅ Deleted **${found}** matching messages (scanned ${checked}).` })
+        await send({
+            content: `🧹 Deleted **${found}** matching message${found === 1 ? '' : 's'} (checked ${checked}).`,
+        })
     } catch (e) {
         await send({ content: `❌ Failed: ${e.message}` })
     }
@@ -385,7 +407,7 @@ export function registerModeration(client, db, config) {
     const ctx_ = { db, BOT_OWNER_ID }
     const isOwner = (id) => BigInt(id) === BOT_OWNER_ID
 
-    // Custom keyword trigger phrases — configure in config.json to enable. (for funsies like the old days)
+    // Custom keyword trigger phrases, configure in config.json to enable. (for funsies like the old days)
     // e.g. "mute_phrases": ["quiet", "shh"], "ban_phrases": ["get out"]
     const MUTE_CMDS = config.mutePhrases ?? []
     const BAN_CMDS = config.banPhrases ?? []
@@ -464,8 +486,8 @@ export function registerModeration(client, db, config) {
             user === msg.author ? null : user,
             exact,
             limitM ? parseInt(limitM[1]) : 100,
-            afterM?.[1],
             beforeM?.[1],
+            afterM?.[1],
         )
     })
     client.commands.set('mpurge', async (msg, args) => {
@@ -489,7 +511,7 @@ export function registerModeration(client, db, config) {
             return true
         }
         if (commandName === 'unban') {
-            await cmdUnban(interaction, interaction.options.getString('user_id'), ctx_)
+            await cmdUnban(interaction, interaction.options.getString('user-id'), ctx_)
             return true
         }
         if (commandName === 'mute') {
@@ -523,25 +545,36 @@ export function registerModeration(client, db, config) {
             await cmdModlog(interaction, interaction.options.getUser('user') ?? null, ctx_)
             return true
         }
-        if (commandName === 'mpurge') {
+        if (commandName === 'erase') {
             await cmdMpurge(
                 interaction,
                 interaction.options.getUser('user'),
-                interaction.options.getBoolean('server_wide') ?? false,
-                interaction.options.getString('start_from_id') ?? null,
+                interaction.options.getBoolean('everywhere') ?? false,
+                parseMessageRef(interaction.options.getString('start-from')),
             )
             return true
         }
-        if (commandName === 'filter_purge') {
+        if (commandName === 'sweep') {
+            const text = interaction.options.getString('text')
+            const user = interaction.options.getUser('user')
+            const startFrom = interaction.options.getString('start-from')
+            const stopAt = interaction.options.getString('stop-at')
+            if (!text && !user && !startFrom && !stopAt) {
+                await interaction.reply({
+                    content: '❌ Give me at least one filter: text, user, start-from or stop-at.',
+                    flags: MessageFlags.Ephemeral,
+                })
+                return true
+            }
             await interaction.deferReply({})
             await cmdFpurge(
                 interaction,
-                interaction.options.getString('text'),
-                interaction.options.getUser('user'),
+                text,
+                user,
                 interaction.options.getBoolean('exact') ?? false,
-                interaction.options.getInteger('limit') ?? 100,
-                interaction.options.getString('after_id'),
-                interaction.options.getString('before_id'),
+                interaction.options.getInteger('scan') ?? 100,
+                startFrom,
+                stopAt,
             )
             return true
         }

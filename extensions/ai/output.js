@@ -86,18 +86,10 @@ export class OutputCore extends AgentCommandCore {
         out = out.replace(/<\/?reply_context[^>]*>/g, '')
         out = out.replace(/^\s*User['’]s message:\s*"[^"]*"\s*$/gim, '').trim()
         out = out.replace(/^\s*\w+:\s*"User is replying to your message:[\s\S]*?"\s*$/gim, '').trim()
-        // Strip malformed <@username> where LLM wrote a name instead of a numeric ID — leaves valid <@123456789> untouched
+        // Strip malformed <@username> where LLM wrote a name instead of a numeric ID, leaves valid <@123456789> untouched
         out = out.replace(/<@!?([^0-9>\s][^>]{0,50})>/g, (_, name) => `@${name.trim()}`)
-        if (this.pingMode) {
-            out = out.replace(/<@&(\d+)>/g, '@role-$1')
-        } else {
-            out = out.replace(/<@!?(\d+)>/g, (_, id) => {
-                const u = this.client.users.cache.get(id)
-                return u?.displayName ?? `User${id}`
-            })
-            out = out.replace(/<@&(\d+)>/g, 'role$1')
-            out = out.replace(/@/g, '')
-        }
+        // role pings never survive, user mentions stay but every send goes out silent
+        out = out.replace(/<@&(\d+)>/g, '@role-$1')
         return out
     }
 
@@ -144,7 +136,7 @@ export class OutputCore extends AgentCommandCore {
         if (!hasContent && !hasEmbeds) return null
 
         const safe = validated.length > 2000 ? validated.slice(0, 1997) + '...' : validated
-        const payload = { allowedMentions: { parse: ['users'], repliedUser: true }, ...opts }
+        const payload = { allowedMentions: { parse: ['users'], repliedUser: false }, ...opts }
         if (hasContent) payload.content = safe
 
         if (/<@!?\d+>|<@&\d+>|@everyone|@here/.test(safe)) {
@@ -152,8 +144,8 @@ export class OutputCore extends AgentCommandCore {
         }
 
         // Try reply first (keeps the thread visual). Fall back to plain channel send on:
-        //   50035 MESSAGE_REFERENCE_UNKNOWN_MESSAGE — original was deleted (e.g. by purge)
-        //   10008 Unknown Message — same situation, different endpoint
+        //   50035 MESSAGE_REFERENCE_UNKNOWN_MESSAGE, original was deleted (e.g. by purge)
+        //   10008 Unknown Message, same situation, different endpoint
         try {
             return await message.reply(payload)
         } catch (e) {
@@ -175,14 +167,14 @@ export class OutputCore extends AgentCommandCore {
         }
     }
 
-    // Cache keys are `${userId}_${guildId}` — scan and drop all guild buckets for one user
+    // Cache keys are `${userId}_${guildId}`, scan and drop all guild buckets for one user
     _invalidateUserCache(userId) {
         if (!this.userCache) return
         const prefix = `${userId}_`
         for (const k of this.userCache.keys()) if (k.startsWith(prefix)) this.userCache.delete(k)
     }
-    // Resolve :emojiName: shortcodes → full <:name:ID> Discord format
-    // LLMs habitually write :name: even when given the full format — handle it here instead of trusting the prompt
+    // Resolve :emojiName: shortcodes -> full <:name:ID> Discord format
+    // LLMs habitually write :name: even when given the full format, handle it here instead of trusting the prompt
     _resolveCustomEmojis(text, guild) {
         if (!guild?.emojis?.cache?.size || !text) return text
         return text.replace(/:([a-zA-Z0-9_]{2,32}):/g, (match, name) => {
@@ -192,13 +184,13 @@ export class OutputCore extends AgentCommandCore {
         })
     }
 
-    // Expressive media — stickers, server emojis, GIFs
+    // Expressive media, stickers, server emojis, GIFs
     // Called after response is finalized. Returns { sticker, gif } or null.
     // Never fires on serious/mod/research-heavy responses.
     async _pickExpressiveMedia(response, message) {
         if (!message?.guild) return null
         const text = response.toLowerCase()
-        // Hard blocks — never attach media on these
+        // Hard blocks, never attach media on these
         const SERIOUS = /\b(ban|mute|warn|kick|purge|moderat|you are (now|hereby)|action has been|case #)\b/i
         const NSFW_BLOCK = /\b(nsfw|porn|nude|sex|hentai|lewd|explicit)\b/i
         if (SERIOUS.test(response) || NSFW_BLOCK.test(response)) return null
@@ -215,7 +207,7 @@ export class OutputCore extends AgentCommandCore {
         const anythingTriggered = isFunny || isHype || isConfused || isChaos
 
         if (!anythingTriggered) return null
-        // 40% chance even when triggered — keeps it rare and earned
+        // 40% chance even when triggered, keeps it rare and earned
         if (Math.random() > 0.4) return null
 
         const result = {}

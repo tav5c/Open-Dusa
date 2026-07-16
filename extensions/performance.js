@@ -1,12 +1,18 @@
 // Performance tuning loader.
-// Reads performance.json from repo root; merges with defaults.
-// Missing file is NOT an error — defaults apply.
+// Reads configs/performance.json; merges with defaults.
+// Missing file is fine, defaults apply.
 
-import { existsSync, readFileSync, writeFileSync } from 'fs'
+import { existsSync, mkdirSync, readFileSync, renameSync, writeFileSync } from 'fs'
 
-const PERF_PATH = 'performance.json'
+const PERF_PATH = 'configs/performance.json'
 
-// Hard defaults — match the project's original tuning for a 256MB/shared-host budget.
+// One-time move from the old repo-root location.
+try {
+    mkdirSync('configs', { recursive: true })
+    if (existsSync('performance.json') && !existsSync(PERF_PATH)) renameSync('performance.json', PERF_PATH)
+} catch {}
+
+// Hard defaults, match the project's original tuning for a 256MB/shared-host budget.
 const DEFAULTS = {
     node: {
         uvThreadpoolSize: null,
@@ -69,7 +75,7 @@ export function loadPerformance() {
         // Write example + default file so first-time users see the knobs
         try {
             writeFileSync(PERF_PATH, JSON.stringify(DEFAULTS, null, 2))
-            console.log('[Perf] Created default performance.json — edit to tune')
+            console.log('[Perf] Created default performance.json, edit to tune')
         } catch (e) {
             console.warn('[Perf] Could not create performance.json:', e.message)
         }
@@ -83,12 +89,12 @@ export function loadPerformance() {
         // Advise on Node flag mismatches (can't change them at runtime)
         const n = _cached.node ?? {}
         if (n.uvThreadpoolSize && process.env.UV_THREADPOOL_SIZE !== String(n.uvThreadpoolSize)) {
-            console.warn(`[Perf] performance.json wants UV_THREADPOOL_SIZE=${n.uvThreadpoolSize} but process has ${process.env.UV_THREADPOOL_SIZE || 'default(4)'} — set via npm script or env`)
+            console.warn(`[Perf] performance.json wants UV_THREADPOOL_SIZE=${n.uvThreadpoolSize} but process has ${process.env.UV_THREADPOOL_SIZE || 'default(4)'}, set via npm script or env`)
         }
         if (n.maxOldSpaceSizeMB) {
             const cur = process.execArgv.join(' ') + ' ' + (process.env.NODE_OPTIONS || '')
             if (!cur.includes('--max-old-space-size')) {
-                console.warn(`[Perf] performance.json wants --max-old-space-size=${n.maxOldSpaceSizeMB}MB but it's not set — start with NODE_OPTIONS or npm script`)
+                console.warn(`[Perf] performance.json wants --max-old-space-size=${n.maxOldSpaceSizeMB}MB but it's not set, start with NODE_OPTIONS or npm script`)
             }
         }
         console.log('[Perf] Loaded performance.json')
