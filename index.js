@@ -257,7 +257,9 @@ const { registerAfk } = await import('./extensions/afk.js')
 const { registerModeration } = await import('./extensions/moderation.js')
 client.afk = registerAfk(client, db)
 client.moderation = registerModeration(client, db, { ...config, memeGuildId: null })
-console.log('[System] Loaded core: afk, moderation')
+const { registerVoice } = await import('./extensions/voice.js')
+registerVoice(client, config.ownerId)
+console.log('[System] Loaded core: afk, moderation, voice')
 
 // Dynamic loader for contributed extensions (manifest-based, see Part 7)
 const extensionsPath = './extensions'
@@ -611,6 +613,13 @@ const SLASH_CMDS = [
         .setContexts(0)
         .addStringOption((o) => o.setName('user-id').setDescription('User ID').setRequired(true))
         .setDefaultMemberPermissions(PermissionFlagsBits.BanMembers),
+    new SlashCommandBuilder()
+        .setName('kick')
+        .setDescription('Kick a user')
+        .setContexts(0)
+        .addUserOption((o) => o.setName('member').setDescription('Member to kick').setRequired(true))
+        .addStringOption((o) => o.setName('reason').setDescription('Reason'))
+        .setDefaultMemberPermissions(PermissionFlagsBits.KickMembers),
     new SlashCommandBuilder()
         .setName('mute')
         .setDescription('Timeout a user')

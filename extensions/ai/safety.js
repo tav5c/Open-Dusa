@@ -16,6 +16,10 @@ function normalize(text) {
     return String(text ?? '').normalize('NFKD').replace(/[\u0300-\u036f\u200b-\u200f\u202a-\u202e\u2060\ufeff]/g, '').toLowerCase().replace(/[@4]/g, 'a').replace(/[3]/g, 'e').replace(/[1!|]/g, 'i').replace(/[0]/g, 'o').replace(/[5$]/g, 's').replace(/[7+]/g, 't')
 }
 export function containsDisallowedHate(text, { persona = false } = {}) {
+    // Censor toggle (config.json "nsfw", mirrored to a global by the config
+    // loader): when true, the models judge content themselves and every
+    // code-level hate/refusal check below is bypassed. Defaults to false.
+    if (globalThis._medusaNsfw === true) return false
     const normalized = normalize(text)
     if (TARGETED_HATE.test(normalized) && (!persona || DIRECTIVE.test(normalized))) return true
     if (DIRECT_RE.test(normalized)) return true
@@ -30,6 +34,18 @@ export function safetyRefusal(seed = '') {
     let hash = 0
     for (const c of String(seed)) hash = (hash * 31 + c.charCodeAt(0)) >>> 0
     return REFUSALS[hash % REFUSALS.length]
+}
+// Identity tripwire: catches the model presenting as a different model
+// ("actually, I'm Qwen3.8") or denying being Medusa ("not a Node.js bot").
+// Tight by design: requires a first-person claim adjacent to the model name,
+// so "is qwen good?" style questions never trip it.
+const OTHER_MODELS = 'qwen|chatgpt|gpt-?\\d|claude|gemini|mistral|llama|deepseek|grok|kimi|mythos|fable|opus|sonnet'
+const SELF_CLAIM_RE = new RegExp(`\\b(?:i['\u2019]?m|i\\s+am)\\s+(?:actually\\s+|really\\s+|just\\s+)?(?:${OTHER_MODELS})\\b`, 'i')
+const DENY_MEDUSA_RE = /\bnot\s+(?:a\s+|an\s+|the\s+)?(?:node\.js\s+bot(?:\s+named\s+medusa)?|medusa|named\s+medusa)\b/i
+export function claimsWrongIdentity(text) {
+    const s = String(text ?? '')
+    if (!s) return false
+    return SELF_CLAIM_RE.test(s) || DENY_MEDUSA_RE.test(s)
 }
 // Models sometimes ship a flat "I'm sorry, but I can't comply with that." that ignores
 // the persona entirely. Swap whole-message canned refusals for one in her voice -

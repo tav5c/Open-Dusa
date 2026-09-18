@@ -1,7 +1,6 @@
 // Output layer: degenerate-response detection, INTERNAL-context leak guard,
 // message splitting, safe replies, and expressive media (stickers/GIFs).
 import { MessageFlags } from 'discord.js'
-import { NSFW_TERMS } from './constants.js'
 import { AgentCommandCore } from './agent-commands.js'
 import { containsDisallowedHate, inPersonaRefusal, safetyRefusal } from './safety.js'
 import { logAction } from '../moderation.js'
@@ -93,6 +92,37 @@ export class OutputCore extends AgentCommandCore {
         return out
     }
 
+    // Math presentation: math-dense answers get Discord quote treatment — one
+    // step per quoted line, key equation bolded:
+    //   > **x^6 - 7 = (x - r)(x + r)...**
+    //   > where r = 7^(1/6)
+    // Fires ONLY on unformatted multi-equation text (2+ equation lines, no code
+    // fences, no existing quotes) so normal chat — including single "a = b"
+    // asides — is never touched.
+    _formatMathBlock(text) {
+        if (!text || text.includes('```')) return text
+        const lines = String(text).split('\n')
+        if (lines.some((l) => /^\s*>/.test(l))) return text
+        const MATH = /[=^√∫∑∏πθωαβ∞≠≤≥×÷²³½¼→⇒∀∃∈∂λΔΣΠφψΩ]/
+        const eqIdx = []
+        lines.forEach((l, i) => {
+            if (MATH.test(l) && /[a-zA-Z0-9]\s*=\s*\S/.test(l)) eqIdx.push(i)
+        })
+        if (eqIdx.length < 2) return text
+        // Answer = longest equation line (usually the boxed final result).
+        let ans = eqIdx[0]
+        for (const i of eqIdx) {
+            if (lines[i].length > lines[ans].length) ans = i
+        }
+        return lines
+            .map((l, i) => {
+                const t = l.trim()
+                if (!t) return t
+                return `> ${i === ans ? `**${t}**` : t}`
+            })
+            .join('\n')
+    }
+
     splitResponse(text, max = 2000) {
         if (text.length <= max) return [text]
         const chunks = []
@@ -155,13 +185,23 @@ export class OutputCore extends AgentCommandCore {
                 const { message_reference, ...safePayload } = payload
                 try {
                     return await message.channel.send(safePayload)
-                } catch {
+                } catch (e2) {
+                    console.error(
+                        `[AI] secureReply total failure in #${message.channel?.id} for ${message.id}:`,
+                        String(e2?.message ?? e2).slice(0, 160),
+                    )
                     return null
                 }
             }
             try {
                 return await message.channel.send(payload)
-            } catch {
+            } catch (e2) {
+                // Never fail silently: a swallowed confirm note looks exactly like
+                // "she doesn't send confirms". Log it loud with routing info.
+                console.error(
+                    `[AI] secureReply total failure in #${message.channel?.id} for ${message.id}:`,
+                    String(e2?.message ?? e2).slice(0, 160),
+                )
                 return null
             }
         }

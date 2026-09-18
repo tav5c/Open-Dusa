@@ -58,11 +58,13 @@ open-dusa/
 │   │   ├── vision.js         - Image/attachment understanding
 │   │   ├── agent-commands.js - AI-invoked moderation: parsing, permission gates
 │   │   ├── output.js         - Leak guard, degenerate checks, splitting, media
+│   │   ├── safety.js           - Shared hate/harassment guard (bypassed when `nsfw:true`)
 │   │   └── chat.js           - AIChatManager: context, triggers, generation pipeline
 │   ├── config.js             - Config normalizer + runtime.json overlay (single source of truth)
 │   ├── db.js                 - SQLite open helper with at-rest encryption (SQLCipher)
 │   ├── heart.js              - System monitor, rate limiter, graceful shutdown
-│   ├── moderation.js         - Full mod suite: ban/mute/warn/purge/logs
+│   ├── moderation.js         - Full mod suite: ban/kick/mute/warn/purge/logs
+├── voice.js              - Voice presence: join/leave VC on request (presence only)
 │   ├── afk.js                - AFK system with nick patching
 │   ├── reminders.js          - Persistent reminders: natural-language + slash/prefix, restart-safe
 │   ├── utils.js              - Shared helpers: parseTime, formatDuration, resolveTarget
@@ -97,7 +99,8 @@ npm install
 ### 3. Configure
 
 ```bash
-cp config.json config.json.bak   # optional backup
+cp config.example.json config.json   # create your config from the example
+cp config.json config.json.bak       # optional backup
 # Then edit config.json directly with your token, owner ID, and API keys
 ```
 
@@ -169,13 +172,13 @@ npm run dev      # development (auto-restart on file changes)
         },
         "research": {
             "provider": "groq",
-            "model": "groq/compound-mini", // ⚠️ 250 RPD free-tier limit - research ONLY
+            "model": "openai/gpt-oss-120b", // Reasoning research model - give it token headroom (free tier: 1K req/day)
             "temperature": 0.6, // Lower = more factual
             "topP": 1.0,
             "maxTokens": 1500
         },
         "vision": {
-            "model": "meta-llama/llama-4-scout-17b-16e-instruct", // Image understanding
+            "model": "nvidia/nemotron-nano-12b-v2-vl", // Image understanding (matches config.example.json)
             "temperature": 0.4,
             "topP": 1.0,
             "maxTokens": 1024
@@ -197,11 +200,27 @@ npm run dev      # development (auto-restart on file changes)
         }
     },
     "fallbackModels": [
-        // Tried in order on 503 capacity errors
-        "llama-3.3-70b-versatile",
-        "qwen/qwen3-32b",
-        "llama-3.1-8b-instant"
+        // LEGACY: plain model IDs tried on the CHAT provider only, after every
+        // other fallback is exhausted. Prefer per-agent "fallbacks" (below) —
+        // each entry carries its own provider, so a dead provider/model is
+        // walked past instead of retried. List kept for backwards compatibility
+        // and merged into the chat chain automatically.
+        "openai/gpt-oss-20b",
+        "qwen/qwen3.6-27b"
     ],
+    // ─── Per-agent fallback chains ──────────────────────────────────────────
+    // Add "fallback" (compact string) and/or "fallbacks" (array) inside any
+    // agents.chat/research/vision/classifier entry (quickAgent too). Walked in
+    // order when that agent's primary fails; a 404 or billing block on one
+    // entry never stops the rest. Compact form is "provider/model" pairs,
+    // comma-separated — the head must name a provider from providers[] above,
+    // otherwise the whole string is treated as a model ID on the agent's own
+    // provider. Both spellings combine ("fallback" first):
+    //   "fallback": "groq/compound,groq/compound-mini",
+    //   "fallbacks": [
+    //     { "provider": "groq", "model": "openai/gpt-oss-120b" },
+    //     "mistralai/mistral-small-4-119b-2603"
+    //   ]
 
     // ─── Optional Integrations ───────────────────────────────────────────────
     "search": {
@@ -213,6 +232,8 @@ npm run dev      # development (auto-restart on file changes)
     // ─── Behavior ────────────────────────────────────────────────────────────
     "triggers": "meddy,medusa,med", // Words that wake her up (comma-separated)
     "allowDMs": false, // Whether she responds to DMs
+    "streaming": false, // Live-edit replies token-by-token as they generate
+    "nsfw": false, // Censor toggle: true disables ALL code-level NSFW/dangerous/hate refusals (routing + canned replies + slur guard) so the models judge content themselves. Defaults to false (safe)
     "memoryDepth": 25, // Conversation turns included in history
     "funMsgInterval": 5400, // Seconds between unprompted messages (0 to disable)
     "stopSequences": [], // Extra stop sequences passed to the LLM
@@ -234,10 +255,10 @@ npm run dev      # development (auto-restart on file changes)
 
 > [!NOTE]
 > `research_model` is intended for research-only use and is not suitable as the main chat model on the free tier.
-> **Critical model note:** the research model (`groq/compound-mini`) has a hard limit of 250 requests/day on Groq's free tier. If you set it as the chat model, the bot will exhaust its quota in hours. Keep it research-only.
+> **Critical model note:** the research model (`openai/gpt-oss-120b`) has a limit of 1K requests/day on Groq's free tier. If you set it as the chat model, the bot will exhaust its quota in hours. Keep it research-only.
 
 > [!TIP]
-> **Recommended stack:** NVIDIA NIM for chat (`mistralai/mistral-small-4-119b-2603`) + Groq compound-mini for research + Serper.dev for live web search results. Get a free Serper key at [serper.dev](https://serper.dev) (2500 searches/month, no card needed).
+> **Recommended stack:** NVIDIA NIM for chat (`mistralai/mistral-small-4-119b-2603`) + Groq gpt-oss-120b for research + Serper.dev for live web search results. Get a free Serper key at [serper.dev](https://serper.dev) (2500 searches/month, no card needed).
 
 > [!TIP]
 > **Multi-provider setup:** list every provider in `providers[]`, then pin agents where you want them: `"agents": { "chat": { "provider": "nvidia" }, "research": { "provider": "groq" } }`. Agents without a `provider` use the highest-priority entry, and everything falls back gracefully if a provider is down.
@@ -312,7 +333,9 @@ npm run start:max      # 6 GB heap, 24 UV threads - 8 GB+ hosts
 | `/mode`                        | Switch between `focused` (analytical) and `normal` (casual) mode | Everyone                |
 | `/summarize`                   | Summarize recent channel conversation                            | Everyone (rate-limited) |
 | `/medusa`                      | Quick one-shot AI answer. No memory. DMs and group chats only.   | Everyone                |
-| `/ban`, `/mute`, `/warn`, etc. | Standard moderation suite                                        | Mods                    |
+| `/recall`                      | Look up what she remembers about a member. Fully private (only you see it). Self + mods. | Everyone (self) / Mods (others) |
+| `/kick`                        | Kick a user                                                      | Mods (Kick Members)       |
+| `/ban`, `/mute`, `/warn`, etc. | Standard moderation suite (`/warnings` and `/modlog` reply privately) | Mods                    |
 | `/ai-pause pause/resume`       | Pause or resume the AI in this server (saved to config.json)     | Admins                  |
 | `/isolation true/false`        | Give a server its own AI memory (resumable)                      | Owner                   |
 | `/configclean`                 | Sweep dead server/channel ids out of config.json                 | Owner                   |
@@ -330,7 +353,10 @@ med,mode focused/normal
 med,afk [reason]      - Go AFK with a timestamped reason
 med,unafk
 med,ping / med,stats / med,menu
-med,ban / med,mute / med,warn / med,clear / med,mpurge
+med,ban / med,kick / med,unban / med,mute / med,unmute / med,warn / med,clear / med,mpurge
+med,whois <name>        - Look up a member's @mention + ID by name
+med,recall <name>       - Look up what she remembers (self + mods, auto-deletes in 60s)
+med,joinvc / med,leavevc / med,vc  - Voice presence (needs Manage Channels or mod)
 med,remind <1h30m|ISO datetime> <text>  - Set a reminder (units: s/m/h/d/w, or an exact date/time)
 ```
 
@@ -395,15 +421,16 @@ Drop the file in `/extensions/` and restart. That's it.
 Every incoming message goes through a classifier before hitting the main LLM:
 
 ```
-message -> needsResearch()
-    ├─ ALWAYS_LIVE keywords  -> "research"  (price, weather, news, etc.)
-    ├─ NEVER_RESEARCH signals -> "direct"   (vibes, greetings, emotional)
+message -> needsResearch()            (order matters; first match wins)
     ├─ NO_SEARCH signals     -> "nosearch"  (explicitly told not to search)
-    ├─ NSFW/dangerous terms  -> blocked
-    └─ ambiguous             -> classifier LLM (YES/NO, 2.5s timeout)
+    ├─ NSFW/dangerous terms  -> blocked     (word-boundaried; skipped entirely when `nsfw:true`)
+    ├─ ALWAYS_LIVE keywords  -> "research"  (price, weather, news, events, reveals, "research", "look it up", ...)
+    ├─ greeting-led, no question mark, no live signal -> "direct" (never burns a classifier call)
+    ├─ NEVER_RESEARCH signals -> "direct"   (vibes, greetings, emotional)
+    └─ ambiguous             -> classifier LLM (YES/NO, 2.5s timeout -> heuristic fallback)
 ```
 
-The classifier uses a cheap fast model to avoid burning chat quota on conversational messages. When an NVIDIA NIM provider is configured it rides that by default (`meta/llama-3.1-8b-instruct`) so routing calls never touch the primary provider's daily token budget; otherwise it falls back to `llama-3.1-8b-instant` on the primary. The 2.5s classification timeout means a slow round-trip can never block a reply.
+The classifier uses a cheap fast model to avoid burning chat quota on conversational messages. If it times out or errors, a heuristic takes over (question-mark or version/year -> research, opinion frames stay direct) instead of silently going dumb. When an NVIDIA NIM provider is configured it rides that by default (`meta/llama-3.1-8b-instruct`) so routing calls never touch the primary provider's daily token budget; otherwise it falls back to `llama-3.1-8b-instant` on the primary. The 2.5s classification timeout means a slow round-trip can never block a reply.
 
 ### Key Rotation
 
@@ -411,12 +438,14 @@ Keys within each `providers[]` entry rotate automatically on 429/401/403 key err
 
 ### Confirmation Gate
 
-Destructive agentic commands (`ban`, `mute`, `clear`, `purge`) require explicit user confirmation before executing:
+Destructive agentic commands (`ban`, `unban`, `kick`, `mute`, `unmute`, `clear`, `delchan`, `announce`, `mail`, `dm`) require explicit user confirmation before executing:
 
 1. AI decides to mute someone -> emits `<<RUN_CMD: mute 123456789 1h reason>>`
-2. Bot intercepts it, stores pending, asks: _"Confirm mute on @user for 1h? Reply yes within 30s"_
-3. User replies `yes` -> command fires -> `✅` react
-4. No reply within 35s -> pending expires silently
+2. Bot intercepts it, stores pending, and posts BOTH: an in-character text note AND a personal embed (action, target mention, what-it-does consequence) with ✅ Confirm / ❌ Cancel / ✏️ Reason buttons, restricted to the invoker
+3. User replies `yes` (or taps ✅, `no`/`nvm`/`cancel` work too) -> permissions re-checked at execution time -> command fires -> `✅` react
+4. The ✏️ button pops a reason modal; submitting rewrites the pending args (mute durations preserved) and refreshes the embed in place
+5. Bare `yes` with several actions pending offers a pick-menu instead of firing the oldest; replying `yes` to a specific confirm note resolves that one
+6. No reply within 35s -> pending expires, buttons disarm silently
 
 ### Action Self-Check
 
@@ -459,15 +488,19 @@ Servers with `"isolatedMemory": true` in the `guilds` map (or isolated live with
 
 **Agentic Actions**
 
-- Runs Discord actions autonomously: fetch avatars/banners, create polls/threads, set slowmode, move users in VC, pin messages, manage channels
+- Runs Discord actions autonomously: fetch avatars/banners, create polls/threads, set slowmode, move users in VC, pin messages, manage channels, join/leave voice
+- Moderation targets resolve from names, reply-pronouns ("mute him"), learned aliases, fuzzy spellings, and live roster search — not just mentions
+- Confirm flow: personal embed with ✅/❌/✏️ buttons, reason modals, pick-menus for stacked confirms
+- Second thoughts: hedged or sourceless answers get a silent re-check; only corrections speak up
+- Situational vibe + room climate: her tone follows the message and the room, cold mode forced on moderation asks
 - Persistent reminders: set naturally in conversation or via `remind`/`reminder`/`remindme`, survive restarts, poll every 15s
 - All destructive actions go through the confirmation gate
 - Permission-gated: only fires commands the triggering user has permission to run
 
 **Moderation Suite**
 
-- Slash + prefix: `ban`, `unban`, `mute`, `unmute`, `warn`, `warnings`, `modlog`, `clearwarns`, `clear`, `erase` (`med,mpurge`), `sweep` (`med,fpurge`)
-- Automod: anti-spam (configurable threshold), anti-caps (>70% uppercase), anti-links (with whitelist)
+- Slash + prefix: `ban`, `unban`, `kick`, `mute`, `unmute`, `warn`, `warnings`, `modlog`, `clearwarns`, `clear`, `erase` (`med,mpurge`), `sweep` (`med,fpurge`)
+- `/warnings` and `/modlog` reply privately (ephemeral); warnings list paginates
 - DM notifications sent to targets before action lands
 
 **Expressive Media**
@@ -478,7 +511,7 @@ Servers with `"isolatedMemory": true` in the `guilds` map (or isolated live with
 
 **System**
 
-- Health endpoint: `GET :8080/` -> `{status, uptime, guilds, ping, memory}`
+- Health endpoint: `GET :1350/` -> `{status, uptime, guilds, ping, memory}` (override with `HEALTH_PORT`)
 - Paginated mod log viewer with button navigation
 - Configurable fun messages with weighted roast/fact/philosophical types
 - AFK system with nickname prefixing and mention notifications
@@ -492,6 +525,7 @@ Open-Dusa is built to survive on cheap shared hosts, VPS boxes, and container pl
 ### Shared Hosting / Pterodactyl / Ephemeral Storage
 
 - **SQLite WAL mode** is enabled by default. The `-wal` and `-shm` files are normal and required while the bot is running.
+- **Pterodactyl blocks native install scripts by default.** After every fresh `npm install`, run `npm install-scripts approve better-sqlite3 better-sqlite3-multiple-ciphers && npm rebuild better-sqlite3 better-sqlite3-multiple-ciphers` or the bot runs memory-less (it will say so at boot).
 - If your host wipes the working directory on restart, place `data/` on a persistent mount (e.g., `/home/container/persist/`). Change the paths in `config.json` if your host requires it.
 - The bot auto-checks disk space. If you see `[Heart] DISK ALMOST FULL`, clear old logs or reduce `journal_size_limit`.
 
@@ -533,7 +567,6 @@ Open-Dusa uses SQLite with WAL mode. Over months of heavy use, the database file
 
 - Conversations, interests, personality, aliases, relationships: 30 days of inactivity
 - Mod logs, resolved warnings: 180 days (configurable in `index.js`)
-- Reaction roles: 90 days
 - Orphaned guild data: when no logs/warnings reference the guild
 
 **What grows forever (intentionally):**
@@ -551,6 +584,9 @@ Open-Dusa uses SQLite with WAL mode. Over months of heavy use, the database file
 | Bot starts but doesn't respond to mentions | `Message Content Intent` disabled                      | Enable it in the [Discord Developer Portal](https://discord.com/developers/applications) -> Bot -> Privileged Gateway Intents             |
 | High memory usage over time                | Normal - LRU caches grow to their limits               | The bot auto-cleans every 10 min. If RSS exceeds ~400MB, check `[Heart] MEMORY LEAK` warnings.                                          |
 | `better-sqlite3` install fails             | Missing build tools                                    | Run `npm install --build-from-source` or install `python3`, `make`, and `g++`                                                           |
+| Native bindings missing on Pterodactyl  | Host blocks install scripts (`allowScripts`)           | `npm install-scripts approve better-sqlite3 better-sqlite3-multiple-ciphers && npm rebuild better-sqlite3 better-sqlite3-multiple-ciphers`, then restart. Until then she runs memory-less (AI still works, nothing persists) |
+| She answers but never researches         | Classifier voting NO, or all search keys exhausted       | Check for a 🔍 footer (researched) vs none (direct); classifier misses improve by adding signal words to `ALWAYS_LIVE` in `extensions/ai/constants.js` |
+| Confirms never arrive                    | Reply send failing silently, or cropped view            | Look for `[AI] secureReply total failure` in logs; confirm notes + button embeds post as separate messages |
 | `npm start` crashes immediately            | Missing native build toolchain for `better-sqlite3@12` | Install `python3`, `make`, `g++` (Alpine: `apk add python3 make g++`), then `npm rebuild better-sqlite3`. Node 20–24 are all supported. |
 
 ---
@@ -587,6 +623,7 @@ Open-Dusa can encrypt every SQLite database on disk using **SQLCipher** (via `be
 | **Account data** (user ID, username, display name, avatar URL) | To address users by their server nickname and attribute moderation actions | On interaction |
 | **Derived data** (inferred interests, relationship strength, personality notes, per-server "lore") | To make responses contextually aware | Generated from interactions |
 | **Moderation data** (mod-log entries, warnings) | To operate moderation features | On moderator action |
+| **Recall lookups** | `med,recall` / `/recall` shows stored profile data | Self-lookup for anyone; others mods-only; outputs auto-delete (prefix) or stay private (slash) |
 
 ### What is NOT collected
 

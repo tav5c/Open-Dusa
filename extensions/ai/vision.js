@@ -74,11 +74,17 @@ export class VisionCore extends ResearchCore {
     }
     _getImageFromMessage(message) {
         const IMAGE_TYPES = new Set(['image/png', 'image/jpeg', 'image/jpg', 'image/webp', 'image/gif'])
+        // Mobile/CDN uploads sometimes arrive without a content type — trust the extension then.
+        const isImageAtt = (att) => {
+            const ct = (att.contentType ?? '').split(';')[0].trim().toLowerCase()
+            if (IMAGE_TYPES.has(ct)) return true
+            return /\.(png|jpe?g|webp|gif)$/i.test(att.name ?? '')
+        }
         // Collect ALL images, not just the first
         const images = []
         for (const att of message.attachments.values()) {
             const ct = (att.contentType ?? '').split(';')[0].trim().toLowerCase()
-            if (!IMAGE_TYPES.has(ct)) continue
+            if (!isImageAtt(att)) continue
             const isGif = ct === 'image/gif' || att.name?.toLowerCase().endsWith('.gif')
             let url = att.proxyURL ?? att.url
             if (isGif && url) url += (url.includes('?') ? '&' : '?') + 'format=webp&width=960'
@@ -104,7 +110,7 @@ export class VisionCore extends ResearchCore {
         if (ref) {
             for (const att of ref.attachments.values()) {
                 const ct = (att.contentType ?? '').split(';')[0].trim().toLowerCase()
-                if (!IMAGE_TYPES.has(ct)) continue
+                if (!isImageAtt(att)) continue
                 const isGif = ct === 'image/gif' || att.name?.toLowerCase().endsWith('.gif')
                 let url = att.proxyURL ?? att.url
                 if (isGif && url) url += (url.includes('?') ? '&' : '?') + 'format=webp&width=960'
@@ -121,16 +127,96 @@ export class VisionCore extends ResearchCore {
         return { url: null, isGif: false, label: null }
     }
 
+    // Stage-1 describe against one specific client+model. Returns {raw, errType};
+    // errType 'expired'/'format' are terminal answers, null raw + null errType
+    // means "try the next fallback". Key rotation only for the primary.
+    async _describeWith(client, model, s1msgs, userText, imageUrl, allowRotate) {
+        let raw = null
+        let errType = null
+        try {
+            const r = await client.chat.completions.create({
+                model,
+                messages: s1msgs,
+                max_completion_tokens: this.visionTokens,
+                temperature: this.visionTemp,
+                top_p: this.topP,
+            })
+            raw = r.choices[0].message.content
+            this.keyFailures[this.currentKeyIdx] = 0
+        } catch (e) {
+            const err = String(e).toLowerCase()
+            if (err.includes('404') && (err.includes('retrieve media') || err.includes('failed to retrieve')))
+                errType = 'expired'
+            else if (err.includes('400') || err.includes('invalid image') || err.includes('invalid url'))
+                errType = 'format'
+            else if (this._isCapacityError(e) || this._isRequestError(e)) return { raw: null, errType: null }
+            else if (allowRotate) {
+                this.keyFailures[this.currentKeyIdx] = (this.keyFailures[this.currentKeyIdx] ?? 0) + 1
+                if (this._isKeyError(e)) {
+                    if (await this.rotateKey(err)) {
+                        try {
+                            const r2 = await client.chat.completions.create({
+                                model,
+                                messages: s1msgs,
+                                max_completion_tokens: this.visionTokens,
+                                temperature: this.visionTemp,
+                                top_p: this.topP,
+                            })
+                            raw = r2.choices[0].message.content
+                        } catch {}
+                    }
+                }
+            }
+        }
+
+        // On format/400 error, try once more with the raw URL (no base64), some NVIDIA
+        // vision endpoints reject data URLs and need a direct link.
+        if (errType === 'format' && imageUrl) {
+            try {
+                const retryMsgs = [
+                    { role: 'system', content: s1msgs[0]?.content ?? '' },
+                    {
+                        role: 'user',
+                        content: [
+                            { type: 'image_url', image_url: { url: imageUrl } },
+                            { type: 'text', text: userText },
+                        ],
+                    },
+                ]
+                const r = await client.chat.completions.create({
+                    model,
+                    messages: retryMsgs,
+                    max_completion_tokens: this.visionTokens,
+                    temperature: this.visionTemp,
+                    top_p: this.topP,
+                })
+                raw = r.choices[0].message.content
+                errType = null
+            } catch (e) {
+                console.warn('[AI] Vision raw-URL retry also failed:', String(e).slice(0, 100))
+            }
+        }
+        return { raw, errType }
+    }
+
     async _callVision(prompt, imageUrl, isGif, systemPrompt, userId = null, allImages = null) {
         const vclient = this._visionClient ?? this._groq
-        if (!vclient) return null
+        if (!vclient && !(this.agentFallbacks?.vision?.length)) return null
         const gifNote = isGif
             ? "\n\nNote: This is an animated GIF. You can only see the first frame. Describe what you see clearly and precisely, vibe, subject, colours, action. Be honest that it's one frame if movement is implied."
             : ''
-        const visionSys =
-            'You are a precise image description assistant. Describe exactly what you see, subjects, actions, text, mood, colours, context. Be detailed and factual. No greetings, no fluff. Just the visual content.' +
-            gifNote
-        const imageCount = allImages?.length ?? 1
+        // "read this / ocr / transcribe" asks need verbatim text, not vibes — the
+        // describer prompt used to summarize screenshots instead of reading them.
+        const ocrIntent =
+            /(ocr|transcribe|transcript|extract (the )?text|what does (it|this|that|the image) say|can u( n)? read|\bread\b.*(this|that|it)|check this)/i.test(
+                prompt ?? '',
+            )
+        const visionSys = ocrIntent
+            ? 'You are an OCR engine. Transcribe ALL text visible in the image EXACTLY, character for character, preserving line breaks and layout. Numbers, names, symbols — copy them verbatim, never paraphrase or "fix" them. If part is illegible, mark it [illegible]. If there is genuinely no text, say NONE, then describe the image in one line.' +
+              gifNote
+            : 'You are a precise image description assistant. Describe exactly what you see, subjects, actions, text, mood, colours, context. Be detailed and factual. No greetings, no fluff. Just the visual content.' +
+              gifNote
+        const imageCount = Math.min(allImages?.length ?? 1, 3)
         const userText = (
             prompt?.trim() ||
             (imageCount > 1
@@ -140,13 +226,18 @@ export class VisionCore extends ResearchCore {
                   : 'Describe this image in detail.')
         ).slice(0, 2000)
 
-        // Download image to base64 so servers don't need to fetch Discord CDN URLs
+        // Download image to base64 so servers don't need to fetch Discord CDN URLs.
+        // Capped: providers reject oversized payloads (Groq: 20MB/request — base64
+        // inflates ~33%, so ~12MB raw is the safe ceiling), oversized falls back
+        // to URL form instead of failing the whole call.
+        const MAX_IMG_BYTES = 12 * 1024 * 1024
         let imageContent
         try {
             const imgRes = await fetch(imageUrl, { signal: AbortSignal.timeout(10_000) })
             if (!imgRes.ok) throw new Error(`HTTP ${imgRes.status}`)
             const contentType = imgRes.headers.get('content-type')?.split(';')[0]?.trim() ?? 'image/jpeg'
             const buffer = await imgRes.arrayBuffer()
+            if (buffer.byteLength > MAX_IMG_BYTES) throw new Error(`too large (${(buffer.byteLength / 1048576).toFixed(1)}MB)`)
             const base64 = Buffer.from(buffer).toString('base64')
             imageContent = { type: 'base64', media_type: contentType, data: base64 }
         } catch (e) {
@@ -161,11 +252,12 @@ export class VisionCore extends ResearchCore {
               }
             : { type: 'image_url', image_url: { url: imageUrl } }
 
-        // Build content array with all images if multiple were sent
+        // Build content array with all images if multiple were sent. Capped at 3:
+        // providers limit images per request (Groq: 3) and a 4th errors the call.
         const imageBlocks =
             allImages && allImages.length > 1
                 ? await Promise.all(
-                      allImages.slice(0, 4).map(async (img) => {
+                      allImages.slice(0, 3).map(async (img) => {
                           // Download each image to base64
                           try {
                               const imgRes = await fetch(img.url, { signal: AbortSignal.timeout(10_000) })
@@ -173,6 +265,7 @@ export class VisionCore extends ResearchCore {
                               const ct =
                                   imgRes.headers.get('content-type')?.split(';')[0]?.trim() ?? 'image/jpeg'
                               const buf = await imgRes.arrayBuffer()
+                              if (buf.byteLength > MAX_IMG_BYTES) throw new Error('too large')
                               const b64 = Buffer.from(buf).toString('base64')
                               return { type: 'image_url', image_url: { url: `data:${ct};base64,${b64}` } }
                           } catch {
@@ -200,67 +293,24 @@ export class VisionCore extends ResearchCore {
         ]
         let raw = null
         let errType = null
-        try {
-            const r = await vclient.chat.completions.create({
-                model: this.visionModel,
-                messages: s1msgs,
-                max_completion_tokens: this.visionTokens,
-                temperature: this.visionTemp,
-                top_p: this.topP,
-            })
-            raw = r.choices[0].message.content
-            this.keyFailures[this.currentKeyIdx] = 0
-        } catch (e) {
-            const err = String(e).toLowerCase()
-            if (err.includes('404') && (err.includes('retrieve media') || err.includes('failed to retrieve')))
-                errType = 'expired'
-            else if (err.includes('400') || err.includes('invalid image') || err.includes('invalid url'))
-                errType = 'format'
-            else if (this._isCapacityError(e) || this._isRequestError(e)) return null
-            else {
-                this.keyFailures[this.currentKeyIdx] = (this.keyFailures[this.currentKeyIdx] ?? 0) + 1
-                if (this._isKeyError(e)) {
-                    if (await this.rotateKey(err)) {
-                        try {
-                            const r2 = await vclient.chat.completions.create({
-                                model: this.visionModel,
-                                messages: s1msgs,
-                                max_completion_tokens: this.visionTokens,
-                                temperature: this.visionTemp,
-                                top_p: this.topP,
-                            })
-                            raw = r2.choices[0].message.content
-                        } catch {}
+        const primary = this._visionClient ?? this._groq
+        if (primary) ({ raw, errType } = await this._describeWith(primary, this.visionModel, s1msgs, userText, imageUrl, true))
+        // Hard failure (not expired/format, which are terminal answers) -> walk
+        // this agent's own fallback chain before giving up to text-only.
+        if (!raw && !errType) {
+            for (const fb of this.agentFallbacks?.vision ?? []) {
+                try {
+                    const client = this._fallbackClient(fb)
+                    if (!client) continue
+                    const att = await this._describeWith(client, fb.model, s1msgs, userText, imageUrl, false)
+                    if (att.raw || att.errType) {
+                        if (att.raw)
+                            console.log(`[AI] Vision fallback answered via ${fb.provider ?? fb.baseUrl} / ${fb.model}`)
+                        raw = att.raw
+                        errType = att.errType
+                        break
                     }
-                }
-            }
-        }
-
-        // On format/400 error, try once more with the raw URL (no base64), some NVIDIA
-        // vision endpoints reject data URLs and need a direct link.
-        if (errType === 'format' && imageUrl) {
-            try {
-                const retryMsgs = [
-                    { role: 'system', content: visionSys },
-                    {
-                        role: 'user',
-                        content: [
-                            { type: 'image_url', image_url: { url: imageUrl } },
-                            { type: 'text', text: userText },
-                        ],
-                    },
-                ]
-                const r = await vclient.chat.completions.create({
-                    model: this.visionModel,
-                    messages: retryMsgs,
-                    max_completion_tokens: this.visionTokens,
-                    temperature: this.visionTemp,
-                    top_p: this.topP,
-                })
-                raw = r.choices[0].message.content
-                errType = null
-            } catch (e) {
-                console.warn('[AI] Vision raw-URL retry also failed:', String(e).slice(0, 100))
+                } catch {}
             }
         }
 

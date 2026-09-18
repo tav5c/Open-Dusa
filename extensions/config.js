@@ -83,6 +83,65 @@ function resolveAgentProvider(providers, providerName, legacyUrl, legacyKeys) {
     return null
 }
 
+// Per-agent fallback chains: [{ provider?, model }]. A plain string means
+// "same provider as the agent". Each entry resolves to {provider, baseUrl,
+// keys, model}; unresolvable entries (unknown provider, blank model, keyless
+// pool) are skipped with a warning so one bad line can't break the chain.
+function parseFallbackString(t, ownResolved, providers) {
+    // "provider/model" pair when the head names a configured provider
+    // ("groq/compound"), otherwise the whole string is a model ID on the
+    // agent's own provider ("qwen/qwen3.8-max", "mistralai/...").
+    const slash = t.indexOf('/')
+    const head = slash > 0 ? t.slice(0, slash) : ''
+    if (head && providers.some((x) => x.name === head)) {
+        const p = providers.find((x) => x.name === head)
+        const model = t.slice(slash + 1).trim()
+        if (model && p.keys?.length) return { provider: p.name, baseUrl: p.baseUrl, keys: p.keys, model }
+        return null
+    }
+    if (!ownResolved?.baseUrl || !ownResolved?.keys?.length) return null
+    return { provider: null, baseUrl: ownResolved.baseUrl, keys: ownResolved.keys, model: t }
+}
+function resolveFallbacks(list, ownResolved, providers) {
+    const out = []
+    const push = (fb) => {
+        if (fb && !out.some((x) => x.model === fb.model && x.baseUrl === fb.baseUrl)) out.push(fb)
+    }
+    for (const entry of asArray(list)) {
+        if (typeof entry === 'string') {
+            // Comma-separated pairs allowed: "groq/compound, groq/compound-mini"
+            for (const part of entry.split(',')) {
+                const t = part.trim()
+                if (!t) continue
+                push(parseFallbackString(t, ownResolved, providers))
+            }
+        } else if (entry && typeof entry === 'object') {
+            const model = typeof entry.model === 'string' ? entry.model.trim() : ''
+            if (!model) continue
+            if (entry.provider) {
+                const p = providers.find((x) => x.name === entry.provider)
+                if (!p || !p.keys?.length) {
+                    console.warn(`[Config] fallback provider '${entry.provider}' not found or keyless, skipping`)
+                    continue
+                }
+                push({ provider: p.name, baseUrl: p.baseUrl, keys: p.keys, model })
+            } else if (ownResolved?.baseUrl && ownResolved?.keys?.length) {
+                push({ provider: null, baseUrl: ownResolved.baseUrl, keys: ownResolved.keys, model })
+            }
+        }
+    }
+    return out
+}
+// Collects both spellings: "fallback" (compact string, tried first) and
+// "fallbacks" (array of strings/objects).
+function fallbackRaw(agent) {
+    const out = []
+    if (typeof agent?.fallback === 'string') out.push(agent.fallback)
+    else out.push(...asArray(agent?.fallback))
+    out.push(...asArray(agent?.fallbacks))
+    return out
+}
+
 function normalizeGuilds(raw) {
     // Canonical: one map, { "<guildId>": { ai?: bool, isolatedMemory?: bool } }
     if (raw.guilds && typeof raw.guilds === 'object' && !Array.isArray(raw.guilds)) {
@@ -136,6 +195,7 @@ export function normalizeConfig(raw) {
     chat.resolved =
         resolveAgentProvider(providers, chat.provider, raw.llmBaseUrl ?? raw.llm_base_url, raw.llmKeys ?? raw.llm_keys) ??
         { baseUrl: primary.baseUrl, keys: primary.keys }
+    chat.fallbacks = resolveFallbacks(fallbackRaw(a.chat), chat.resolved, providers)
 
     const research = {
         provider: a.research?.provider,
@@ -145,6 +205,7 @@ export function normalizeConfig(raw) {
         maxTokens: a.research?.maxTokens ?? raw.searchTokens ?? 1500,
     }
     research.resolved = resolveAgentProvider(providers, research.provider, raw.research_base_url, raw.research_key)
+    research.fallbacks = resolveFallbacks(fallbackRaw(a.research), research.resolved, providers)
 
     const vision = {
         provider: a.vision?.provider,
@@ -154,6 +215,7 @@ export function normalizeConfig(raw) {
         maxTokens: a.vision?.maxTokens ?? raw.visionTokens ?? 512,
     }
     vision.resolved = resolveAgentProvider(providers, vision.provider)
+    vision.fallbacks = resolveFallbacks(fallbackRaw(a.vision), vision.resolved, providers)
 
     // The classifier rides the NIM provider by default when one is configured:
     // YES/NO routing is tiny but frequent, no reason to let it nibble the primary's
@@ -171,6 +233,7 @@ export function normalizeConfig(raw) {
         maxTokens: a.classifier?.maxTokens ?? 5,
     }
     classifier.resolved = clfResolved
+    classifier.fallbacks = resolveFallbacks(fallbackRaw(a.classifier), clfResolved, providers)
 
     const qa = a.quickAgent ?? raw.quickAgent ?? {}
     const quickAgent = {
@@ -180,6 +243,17 @@ export function normalizeConfig(raw) {
         maxTokens: qa.maxTokens ?? 1400,
         allowResearch: qa.allowResearch !== false,
         systemPrompt: asPrompt(qa.systemPrompt),
+        // No own provider: plain-string fallbacks are skipped, entries with an
+        // explicit provider still resolve.
+        fallbacks: resolveFallbacks(fallbackRaw(qa), null, providers),
+    }
+
+    // Legacy top-level fallbackModels: historically tried on the chat provider
+    // only. Merged into the chat chain (deduped) so there is exactly one
+    // fallback path instead of two. Entries use the same pair syntax.
+    for (const fb of resolveFallbacks(asArray(raw.fallbackModels ?? raw.fallback_models), chat.resolved, providers)) {
+        if (!chat.fallbacks.some((f) => f.model === fb.model && f.baseUrl === fb.baseUrl))
+            chat.fallbacks.push({ ...fb, provider: fb.provider ?? chat.provider ?? null })
     }
 
     const guilds = normalizeGuilds(raw)
@@ -208,6 +282,10 @@ export function normalizeConfig(raw) {
         siteUrl: raw.siteUrl ?? raw.site_url ?? '',
         streaming: raw.streaming === true,
         debug: raw.debug === true,
+        // Censor toggle: true disables every code-level NSFW/dangerous/hate refusal
+        // (routing + canned replies + slur guard) so the models judge content
+        // themselves. Defaults to false (safe).
+        nsfw: raw.nsfw === true,
         triggers: asArray(typeof raw.triggers === 'string' ? raw.triggers.split(',') : raw.triggers)
             .map((t) => String(t).trim().toLowerCase())
             .filter(Boolean),
@@ -309,6 +387,11 @@ export function loadConfig() {
         config.isolatedGuildIds = Object.keys(config.guilds).filter((id) => config.guilds[id].isolatedMemory)
     }
     if (Object.keys(runtime).length) console.log('[Config] Applied runtime.json overrides')
+    // Mirror the censor toggle for config-less modules (safety.js): true means
+    // the models judge content themselves. Requires a restart to take effect,
+    // like every other config value.
+    globalThis._medusaNsfw = config.nsfw === true
+    if (config.nsfw) console.log('[Config] Censor toggle ON (nsfw:true) — code-level refusals disabled')
     const keyCounts = config.providers.map((p) => `${p.name}: ${p.keys.length} key${p.keys.length === 1 ? '' : 's'}`).join(', ')
     console.log(`[Config] ${config.providers.length} provider(s) [${keyCounts}], ${config.guildIds.length} guild(s) in scope`)
     _cached = config
