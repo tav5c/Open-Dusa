@@ -187,16 +187,39 @@ export class ProviderCore {
     /**
      * Try each configured provider in priority order until one returns a non-null reply
      * or all of them are either circuit-open or exhausted. Capacity/503 errors don't count
-     * against a provider as long as its other keys still respond.
+     * against a provider as long as its other keys still respond. The requested model is
+     * honored verbatim, providers already configured for it go first so chat doesn't burn
+     * a doomed call (e.g. asking groq for xkiro's qwen model) on every single message.
      */
-    async _routedCall(messages, maxTokens, temp, topP) {
+    async _routedCall(messages, model, maxTokens, temp, topP) {
         if (!this._providers) this._initProviders()
         const now = Date.now()
-        for (const p of this._providers) {
+        // Stable sort: the agent's pinned provider first (it owns this model family —
+        // avoids a doomed cross-provider call when the slug is aggregator-specific,
+        // e.g. OpenRouter-style `:free` suffixes that 404 elsewhere), then exact
+        // model matches, otherwise priority order.
+        const preferredBase = this.llmBaseUrl
+        const ordered = [...this._providers].sort((a, b) => {
+            const pref = (b.baseUrl === preferredBase ? 1 : 0) - (a.baseUrl === preferredBase ? 1 : 0)
+            if (pref !== 0) return pref
+            return (b.model === model ? 1 : 0) - (a.model === model ? 1 : 0)
+        })
+        let attempts = 0
+        // First-miss forensics: "Routed via x in Ns (2 attempts)" never says what
+        // the first provider DID. Record it so "whats groq doing" has an answer.
+        let firstFailure = null
+        const noteFailure = (p, detail) => {
+            if (!firstFailure) firstFailure = `${p.name} (${detail})`
+        }
+        for (const p of ordered) {
             if (!p.client) continue
-            if (now < p.state.openUntil) continue // breaker open
+            if (now < p.state.openUntil) {
+                noteFailure(p, 'breaker open')
+                continue // breaker open
+            }
+            attempts++
             const payload = {
-                ...this._buildPayload(p.model ?? this.aiModel, messages, maxTokens, temp, topP, p.baseUrl),
+                ...this._buildPayload(model ?? p.model ?? this.aiModel, messages, maxTokens, temp, topP, p.baseUrl),
                 stream: false,
             }
             try {
@@ -204,14 +227,37 @@ export class ProviderCore {
                 const out = r.choices?.[0]?.message?.content
                 if (out) {
                     this._resetBreaker(p)
+                    // Slow-provider forensics: a "slow ass" complaint is otherwise
+                    // unprovable after the fact. Log whenever failover happened or
+                    // a single provider took a while — including WHAT missed first.
+                    const elapsed = Date.now() - now
+                    if (attempts > 1 || elapsed > 8000) {
+                        console.log(
+                            `[AI] Routed via '${p.name}' in ${(elapsed / 1000).toFixed(1)}s (${attempts} attempt${attempts === 1 ? '' : 's'}${firstFailure ? `, first miss: ${firstFailure}` : ''})`,
+                        )
+                    }
                     return out
                 }
+                noteFailure(p, 'empty response')
                 this._tripBreaker(p, 'empty response')
             } catch (e) {
+                noteFailure(p, `HTTP ${this._errorStatus(e) ?? '?'} ${String(e?.message ?? e).slice(0, 60)}`)
                 const err = String(e).toLowerCase()
                 if (this._config?.debug)
                     console.warn(`[AI] Provider '${p.name}' failed (${e?.status ?? 'no-status'}): ${err.slice(0, 120)}`)
                 if (this._isCapacityError(e) || this._isRequestError(e)) continue // changing keys cannot fix these
+                if (this._isBillingError(e)) {
+                    // Wallet-level block (pay-as-you-go balance, promo credit that
+                    // doesn't cover premium models): every key shares the wallet,
+                    // so rotating would burn the whole ring for nothing. Open the
+                    // breaker briefly, leave keys alone, say exactly what to do.
+                    p.state.openUntil = Date.now() + 5 * 60_000
+                    p.state.failures = 0
+                    console.warn(
+                        `[AI] Provider '${p.name}' billing-blocked (NOT key-specific — keys untouched): ${String(e?.message ?? e).slice(0, 160)} — deposit real balance or switch to a covered model.`,
+                    )
+                    continue
+                }
                 if (this._isKeyError(e)) {
                     // Burn through the whole key ring before giving up on this provider,
                     // each org has its own daily pool so the next key is a fresh wallet
@@ -227,6 +273,12 @@ export class ProviderCore {
                             const out2 = r2.choices?.[0]?.message?.content
                             if (out2) {
                                 this._resetBreaker(p)
+                                const elapsed2 = Date.now() - now
+                                if (elapsed2 > 8000) {
+                                    console.log(
+                                        `[AI] Routed via '${p.name}' after key burn in ${(elapsed2 / 1000).toFixed(1)}s (first miss: HTTP ${this._errorStatus(e) ?? '?'} ${String(e?.message ?? e).slice(0, 60)})`,
+                                    )
+                                }
                                 return out2
                             }
                             stopReason = 'empty response'
@@ -290,6 +342,14 @@ export class ProviderCore {
         if (this._rotatePromise) return this._rotatePromise
 
         this._rotatePromise = (async () => {
+            // Billing blocks are wallet-level: rotating keys can't help, and must
+            // not cool down healthy keys. Bail out and let the caller degrade.
+            if (this._isBillingError(errorMsg)) {
+                console.warn(
+                    `[AI] Billing-blocked, not rotating keys: ${String(errorMsg).slice(0, 160)}`,
+                )
+                return false
+            }
             const n = this.aiTokens.length
             if (!n) return false
             const old = this.currentKeyIdx
@@ -359,6 +419,20 @@ export class ProviderCore {
         }
     }
 
+    // Censor toggle: config.json "nsfw". True = the models judge content
+    // themselves; every code-level refusal below is bypassed. Defaults off.
+    _nsfwAllowed() {
+        return !!((this._config ?? this.config)?.nsfw) || globalThis._medusaNsfw === true
+    }
+    // Billing blocks (pay-as-you-go wallet, credits, deposits) are PROVIDER-level,
+    // never key-level: every key shares the same wallet, so rotating burns the
+    // whole ring for nothing. Matched before _isKeyError so these skip rotation.
+    _isBillingError(e) {
+        const s = String(e?.message ?? e).toLowerCase()
+        return /pay.as.you.go|deposited balance|promotional|bonus credit|insufficient.*(balance|credit|fund)|wallet|payment required|requires (more |real )?credits?|out of credits|billing/i.test(
+            s,
+        )
+    }
     _isRateError(e) {
         const s = String(e).toLowerCase()
         const status = this._errorStatus(e)
@@ -541,6 +615,15 @@ export class ProviderCore {
     }
 
     // Streams a completion into a live-editing message; falls back to non-streaming on error.
+    // Streaming previews must never flash internal syntax: strip complete command
+    // tags plus any trailing "<<" fragment the model may be mid-emit. A lone "<"
+    // can't parse as a tag, so it can wait for the next chunk.
+    _stripPartialTags(text) {
+        return String(text ?? '')
+            .replace(/<{2,3}\s*(?:RUN_CMD|ACTIONS_INTENDED)\s*:[\s\S]*?>{2,3}/g, '')
+            .replace(/<{2,3}\s*(?:RUN_CMD|ACTIONS_INTENDED)\s*:[^<>]*>?\s*$/g, '')
+            .replace(/<<[^<>]*$/g, '')
+    }
     async _streamChat(messages, model, maxTokens, temp, message) {
         if (!this._groq) return null
         const payload = { ...this._buildPayload(model, messages, maxTokens, temp), stream: true }
@@ -560,12 +643,12 @@ export class ProviderCore {
                 const now = Date.now()
                 if (placeholder && now - lastEdit >= EDIT_MS && full.length <= MAX_LEN) {
                     lastEdit = now
-                    placeholder.edit(full + ' ▌').catch(() => {})
+                    placeholder.edit(this._stripPartialTags(full) + ' ▌').catch(() => {})
                 }
                 if (full.length > MAX_LEN) break // let splitResponse + secureReply handle the rest
             }
             if (placeholder) {
-                const finalText = this.finalSecurityCheck(full.slice(0, 2000))
+                const finalText = this.finalSecurityCheck(this._stripPartialTags(full).slice(0, 2000))
                 if (finalText.trim()) placeholder.edit(finalText).catch(() => {})
                 else placeholder.delete().catch(() => {})
             }
@@ -577,31 +660,71 @@ export class ProviderCore {
         }
     }
 
-    async _groqCallWithFallbacks(messages, model, maxTokens = 2500, temp = this.temperature, topP) {
-        // Prefer the multi-provider router when configured. Falls back to
-        // single-provider with capacity-model fallbacks on total router miss.
+    // Ad-hoc client for a fallback entry (own provider + first key). Reuses the
+    // router provider's live client when the baseUrl matches, so breaker state
+    // and key rotation stay shared instead of split-brained.
+    _fallbackClient(entry) {
+        if (!entry?.baseUrl || !entry?.keys?.length) return null
+        const hit = (this._providers ?? []).find((p) => p.baseUrl === entry.baseUrl && p.client)
+        if (hit) return hit.client
+        this._fallbackClients ??= new Map()
+        const id = `${entry.baseUrl}|${entry.keys[0]}`
+        if (!this._fallbackClients.has(id)) {
+            try {
+                this._fallbackClients.set(
+                    id,
+                    new OpenAI({ apiKey: entry.keys[0], baseURL: entry.baseUrl, timeout: 12_000, maxRetries: 0 }),
+                )
+            } catch {
+                return null
+            }
+        }
+        return this._fallbackClients.get(id) ?? null
+    }
+
+    // One attempt at one fallback entry. Never throws, never rotates keys:
+    // failure just means "next entry". Breaker-open router providers are
+    // skipped fast without burning a call.
+    async _tryFallbackEntry(entry, messages, maxTokens, temp, topP) {
+        if (!entry?.baseUrl || !entry?.keys?.length || !entry?.model) return null
+        const routerP = (this._providers ?? []).find((p) => p.baseUrl === entry.baseUrl)
+        if (routerP && Date.now() < (routerP.state.openUntil ?? 0)) return null
+        const client = routerP?.client ?? this._fallbackClient(entry)
+        if (!client) return null
+        try {
+            const payload = this._buildPayload(entry.model, messages, maxTokens, temp, topP, entry.baseUrl)
+            const r = await client.chat.completions.create({ ...payload, stream: false })
+            const out = r.choices?.[0]?.message?.content
+            if (out) {
+                if (routerP) this._resetBreaker(routerP)
+                return out
+            }
+            return null
+        } catch (e) {
+            if (this._isBillingError(e) && routerP) {
+                routerP.state.openUntil = Date.now() + 5 * 60_000
+                routerP.state.failures = 0
+                console.warn(`[AI] Fallback provider '${routerP.name}' billing-blocked, skipping`)
+            }
+            return null
+        }
+    }
+
+    async _groqCallWithFallbacks(messages, model, maxTokens = 2500, temp = this.temperature, topP, agent = 'chat') {
+        // Prefer the multi-provider router when configured. On total miss, walk
+        // this agent's own fallback chain (config agents.*.fallbacks, plus legacy
+        // top-level fallbackModels merged into chat) — each entry carries its own
+        // provider, so dead providers/models are skipped, never retried, and a
+        // 404 on one entry doesn't stop the rest.
         if (this._providers?.length > 1) {
-            const routed = await this._routedCall(messages, maxTokens, temp, topP)
+            const routed = await this._routedCall(messages, model, maxTokens, temp, topP)
             if (routed) return routed
         }
         const result = await this._groqCall(messages, model, maxTokens, temp, topP)
         if (result && !result.capacityError) return result
-        for (const fb of this.capacityFallbacks) {
-            if (fb === model) continue
-            try {
-                const r = await this._groq.chat.completions.create({
-                    model: fb,
-                    messages,
-                    max_completion_tokens: maxTokens,
-                    temperature: temp,
-                    top_p: topP ?? 1,
-                })
-                return r.choices[0].message.content
-            } catch (e) {
-                // Capacity error -> try the next fallback model; any other error -> stop.
-                if (this._isCapacityError(String(e))) continue
-                break
-            }
+        for (const fb of this.agentFallbacks?.[agent] ?? []) {
+            const out = await this._tryFallbackEntry(fb, messages, maxTokens, temp, topP)
+            if (out) return out
         }
         return null
     }

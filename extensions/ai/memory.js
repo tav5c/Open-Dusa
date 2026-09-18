@@ -9,19 +9,26 @@ import { containsDisallowedHate } from './safety.js'
 
 const PERF = loadPerformance()
 
+// No-op handle: every consumer already tolerates it (checked via `db._stub`
+// or try/catch), so a dead engine means "no persistence", never a crash.
+const stubDb = () => ({
+    prepare: () => ({ run: () => {}, get: () => null, all: () => [] }),
+    exec: () => {},
+    pragma: () => {},
+    close: () => {},
+    _stub: true,
+})
+
 class DBPool {
     constructor() {
         this._pool = new Map()
     }
     get(path) {
-        if (!globalThis._sqlite3) {
-            return {
-                prepare: () => ({ run: () => {}, get: () => null, all: () => [] }),
-                exec: () => {},
-                pragma: () => {},
-                close: () => {},
-                _stub: true,
-            }
+        // No driver, or driver present but native bindings broken (see loadSqlite
+        // probe): hand back a no-op handle so callers keep working memory-less
+        // instead of throwing halfway through boot.
+        if (!globalThis._sqlite3 || globalThis._sqliteUsable === false) {
+            return stubDb()
         }
         if (!this._pool.has(path)) {
             mkdirSync(dirname(path) || '.', { recursive: true })
@@ -95,10 +102,28 @@ class AIMemoryManager {
             base = join('data/ai', folder)
         }
         this._guildId = guildId
-        mkdirSync(base, { recursive: true })
-        this.db = dbPool.get(join(base, 'memory.db'))
-        this._initSchema()
-        this._purgeUnsafeMemory()
+        try {
+            mkdirSync(base, { recursive: true })
+        } catch (e) {
+            console.warn(`[DB] Could not create ${base}, memory will not persist:`, e.message)
+        }
+        // Storage failure must never take down the AI: fall back to the no-op
+        // handle so she runs memory-less instead of registerAI throwing.
+        // Schema init is inside the same guard: a corrupt (but openable) DB must
+        // degrade identically, not crash the constructor halfway.
+        try {
+            this.db = dbPool.get(join(base, 'memory.db'))
+        } catch (e) {
+            console.warn('[DB] Memory database unavailable, running without persistence:', e.message)
+            this.db = stubDb()
+        }
+        try {
+            this._initSchema()
+            this._purgeUnsafeMemory()
+        } catch (e) {
+            console.warn('[DB] Memory schema init failed, running without persistence:', e.message)
+            this.db = stubDb()
+        }
         this._interestsThrottle = new Map()
         this._personalityThrottle = new Map()
         // Auto-vacuum: each DB compacts on its own schedule so no two files block each
@@ -525,6 +550,22 @@ class AIMemoryManager {
         this.db
             .prepare('INSERT OR REPLACE INTO user_aliases (user_id, alias, set_by_user_id) VALUES (?,?,?)')
             .run(userId, alias, setBy)
+    }
+
+    // Reverse lookup for agent name resolution ("tony" -> user_id). Exact match
+    // first, then lowercase — the write path already constrains aliases to
+    // lowercase alphanumerics, this just tolerates older rows.
+    getUserIdByAlias(alias) {
+        try {
+            const a = String(alias ?? '').trim()
+            if (!a) return null
+            const row =
+                this.db.prepare('SELECT user_id FROM user_aliases WHERE alias=?').get(a) ??
+                this.db.prepare('SELECT user_id FROM user_aliases WHERE alias=?').get(a.toLowerCase())
+            return row?.user_id ?? null
+        } catch {
+            return null
+        }
     }
 
     updateRelationship(userId, relatedId) {

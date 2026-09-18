@@ -30,7 +30,28 @@ export async function loadSqlite() {
     // Expose for modules that resolve the driver lazily via globalThis.
     globalThis._sqlite3 = { default: _Database }
     globalThis._openDb = openDb
+    // Probe ONCE whether the native bindings actually work. The JS wrapper can
+    // import fine while the .node binary was never built (Pterodactyl and similar
+    // hosts block install scripts by default) — every `new Database()` then throws.
+    // Marking it here lets every consumer degrade to no-persistence stubs instead
+    // of one failed open taking down the whole AI extension.
+    try {
+        const probe = new _Database(':memory:')
+        probe.close?.()
+        globalThis._sqliteUsable = true
+    } catch (e) {
+        globalThis._sqliteUsable = false
+        console.warn(
+            '[DB] SQLite native bindings missing (install scripts blocked?). Persistence DISABLED — the bot will run memory-less. ' +
+                'Fix: `npm install-scripts approve better-sqlite3 better-sqlite3-multiple-ciphers && npm rebuild better-sqlite3 better-sqlite3-multiple-ciphers`, then restart. ' +
+                `(${String(e.message).slice(0, 120)})`,
+        )
+    }
     return { Database: _Database, isCipher: _isCipher }
+}
+
+export function sqliteUsable() {
+    return globalThis._sqliteUsable !== false && !!_Database
 }
 
 export function encryptionEnabled() {
@@ -53,6 +74,10 @@ function _rmSidecars(path) {
 // PLAINTEXT database to encrypted on first run once a key is configured.
 export function openDb(path) {
     if (!_Database) throw new Error('[DB] loadSqlite() must be awaited before openDb()')
+    if (globalThis._sqliteUsable === false)
+        throw new Error(
+            '[DB] SQLite engine unavailable (native bindings missing). Approve install scripts and rebuild, or run without persistence.',
+        )
     const key = process.env.DB_ENCRYPTION_KEY || ''
 
     // No key, or a driver without cipher support -> plain open (backward compatible).

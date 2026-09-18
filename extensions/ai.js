@@ -22,6 +22,33 @@ import { logAction } from './moderation.js'
 
 export { _undiciAgent } from './ai/providers.js'
 
+// Shared recall formatting: prefix `recall` and `/recall` both use it. Returns
+// the reply text (auto-delete + privacy notes included where they apply).
+async function buildRecallText(ai, guild, authorId, isMod, query, { ephemeralHint = false } = {}) {
+    if (!query) return '❌ Give me a name to recall.'
+    if (!guild) return '❌ Server memory only works in a server.'
+    const id = await ai._resolveMemberId({ guild, reference: null }, query)
+    if (!id) return `❌ No member matching \`${String(query).slice(0, 60)}\` found.`
+    // Privacy: anyone may recall themselves; recalling others is mods (+owner).
+    if (String(authorId) !== String(id) && !isMod)
+        return '🔑 Recall of others is mods-only — but you can recall yourself.'
+    const mem = ai.getMem(guild)
+    const user = mem.getUser(id)
+    if (!user) return `💭 Nothing stored on <@${id}> yet — they haven't chatted with me.`
+    const ints = mem.getInterests(id, 5)
+    const pers = mem.getPersonality(id)
+    const summary = mem.getSummary(id)
+    const lines = [
+        `**Recall — ${user.display_name || user.username}** (<@${id}>)`,
+        `Conversations: \`${user.conversation_count ?? 0}\` • Last seen: \`${String(user.last_interaction ?? 'never').slice(0, 10)}\``,
+    ]
+    if (ints.length) lines.push(`Interests: ${ints.map((r) => `${r.topic}(${r.frequency})`).join(', ')}`)
+    if (pers?.traits) lines.push(`Vibe: ${pers.traits}`)
+    if (summary) lines.push(`Notes: ${String(summary).slice(0, 500)}`)
+    if (!ephemeralHint) lines.push('-# (auto-deletes in 60s)')
+    return lines.join('\n')
+}
+
 const PERF = loadPerformance()
 
 // Register function (called from index.js)
@@ -204,6 +231,37 @@ export async function registerAI(client, db, config) {
     }, 30 * 60_000).unref()
     // interaction listeners (AI-owned slash commands)
     client.on('interactionCreate', async (interaction) => {
+        // Modal submit for the confirm-reason button (customId mcfm-rsn:<cmd>:<target>).
+        // Refreshes the pending args and the confirm embed in place.
+        if (interaction.isModalSubmit?.() && interaction.customId?.startsWith('mcfm-rsn:')) {
+            try {
+                // NOTE: modal IDs are mcfm-rsn:<cmd>:<target> (tag is one segment),
+                // unlike button IDs mcfm:<yes|no|rsn>:<cmd>:<target>.
+                const [, cmd, ...tparts] = String(interaction.customId).split(':')
+                const target = tparts.join(':')
+                const key = `${interaction.user.id}:${cmd}:${target}`
+                const val = ai._pendingConfirms.get(key)
+                if (!val || Date.now() - val.ts > 30_000) {
+                    return interaction.reply({
+                        content: '⌛ Expired — ask again if you still want it.',
+                        flags: MessageFlags.Ephemeral,
+                    })
+                }
+                const reason = interaction.fields.getTextInputValue('reason')?.slice(0, 300) ?? ''
+                // Preserve a leading duration token for mute ("10m"), replace the rest.
+                const parts = (val.args ?? '').split(/\s+/).filter(Boolean)
+                const keepDur = cmd === 'mute' && parts[1] && /^\d/.test(parts[1]) ? ` ${parts[1]}` : ''
+                val.args = `${parts[0] ?? ''}${keepDur} ${reason}`.trim()
+                val.ts = Date.now()
+                await interaction.update({
+                    embeds: [ai.buildConfirmEmbed(cmd, target, reason, interaction.user.id)],
+                    components: [ai.buildConfirmRow(cmd, target)],
+                })
+            } catch (e) {
+                console.error('[AI] Confirm modal error:', e)
+            }
+            return
+        }
         if (!interaction.isChatInputCommand()) return
         const { commandName } = interaction
         const uid = interaction.user.id
@@ -541,6 +599,24 @@ export async function registerAI(client, db, config) {
             })
         }
 
+        // /recall — fully private memory lookup (ephemeral, only the invoker sees).
+        if (commandName === 'recall') {
+            if (!interaction.guild)
+                return interaction.reply({ content: 'Server only.', flags: MessageFlags.Ephemeral })
+            const isMod =
+                String(interaction.user.id) === String(OWNER_ID) ||
+                !!interaction.memberPermissions?.has(PermissionFlagsBits.ModerateMembers)
+            const text = await buildRecallText(
+                ai,
+                interaction.guild,
+                String(interaction.user.id),
+                isMod,
+                interaction.options.getString('target') ?? '',
+                { ephemeralHint: true },
+            )
+            return interaction.reply({ content: text || '…', flags: MessageFlags.Ephemeral })
+        }
+
 
         if (commandName === 'ai-pause') {
             const guild = interaction.guild
@@ -737,6 +813,19 @@ export async function registerAI(client, db, config) {
         }, 500)
         return msg.reply(`✅ Switched to **${newMode === 1 ? 'focused' : 'normal'} mode**`)
     })
+    // Memory lookup by name: what the server roster says + what she remembers.
+    // Results post visibly (and land in history), so "who is X / is X here" gets
+    // answered from data instead of guessed from vibes.
+    client.commands.set('recall', async (msg, args) => {
+        const isMod =
+            String(msg.author.id) === String(OWNER_ID) ||
+            !!msg.member?.permissions?.has(PermissionFlagsBits.ModerateMembers)
+        const text = await buildRecallText(ai, msg.guild, String(msg.author.id), isMod, args.join(' ').trim())
+        if (!text) return
+        const sent = await msg.reply(text)
+        // Privacy window: memory profiles shouldn't sit in chat forever.
+        setTimeout(() => sent?.delete?.().catch(() => {}), 60_000).unref()
+    })
 
     client.commands.set(
         'aihistory',
@@ -799,6 +888,13 @@ export async function registerAI(client, db, config) {
     )
 
     console.log('[AI] Manager initialized, listeners registered')
+    // Build fingerprint: proves which feature set is actually running on the
+    // host. Compare against the repo when behavior doesn't match the code.
+    console.log(
+        `[AI] Confirm UI: ${typeof ai._watchConfirmUI === 'function' ? 'buttons+modal' : 'MISSING'}, ` +
+            `selects: ${typeof ai._answerConfirm === 'function' ? 'on' : 'off'}, ` +
+            `second-thoughts: ${typeof ai._secondThought === 'function' ? 'on' : 'off'}`,
+    )
     return ai
 }
 
@@ -822,6 +918,13 @@ export function buildAISlashCommands() {
                     .setName('mode')
                     .setDescription('focused or normal')
                     .addChoices({ name: 'focused', value: 'focused' }, { name: 'normal', value: 'normal' }),
+            ),
+        new SlashCommandBuilder()
+            .setName('recall')
+            .setDescription('Look up what Medusa remembers about a member (only you see this)')
+            .setContexts(0)
+            .addStringOption((o) =>
+                o.setName('target').setDescription('Name, @mention, or user ID').setRequired(true),
             ),
         new SlashCommandBuilder()
             .setName('ai-pause')
