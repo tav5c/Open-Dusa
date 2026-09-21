@@ -279,6 +279,7 @@ export function normalizeConfig(raw) {
             tavilyKey: raw.search?.tavilyKey ?? raw.tavily_key ?? '',
         },
         giphyKey: raw.giphyKey ?? raw.giphy_api_key ?? '',
+        klipyKey: raw.klipyKey ?? raw.klipy_key ?? '',
         siteUrl: raw.siteUrl ?? raw.site_url ?? '',
         streaming: raw.streaming === true,
         debug: raw.debug === true,

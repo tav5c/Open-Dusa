@@ -15,7 +15,14 @@ import { LRUCache } from 'lru-cache'
 import { join } from 'path'
 import { performance } from 'perf_hooks'
 import { loadPerformance } from '../performance.js'
-import { CAPABILITIES_NOTE, DESTRUCTIVE_CMDS, NEVER_RESEARCH_PREFIXES, NO_SEARCH_SIGNALS, SEARCH_EMOJIS, makeIdSet } from './constants.js'
+import {
+    CAPABILITIES_NOTE,
+    DESTRUCTIVE_CMDS,
+    NEVER_RESEARCH_PREFIXES,
+    NO_SEARCH_SIGNALS,
+    SEARCH_EMOJIS,
+    makeIdSet,
+} from './constants.js'
 import { AIMemoryManager, GhostUsers } from './memory.js'
 import { MOD_CMDS, CMD_PERMS } from './agent-commands.js'
 import { OutputCore } from './output.js'
@@ -26,10 +33,7 @@ const PERF = loadPerformance()
 // Destructive verbs whose RUN_CMD tags must never stream raw to the channel.
 // Built from the shared DESTRUCTIVE_CMDS set (+warn, whose instant embed would
 // also leak) so the streaming gate can never drift from the confirm flow.
-export const MAY_EMIT_CMD_RE = new RegExp(
-    `\\b(?:${[...DESTRUCTIVE_CMDS, 'warn'].join('|')})\\b`,
-    'i',
-)
+export const MAY_EMIT_CMD_RE = new RegExp(`\\b(?:${[...DESTRUCTIVE_CMDS, 'warn'].join('|')})\\b`, 'i')
 
 export class AIChatManager extends OutputCore {
     constructor(client, db, config) {
@@ -259,12 +263,18 @@ export class AIChatManager extends OutputCore {
         )
             return '[CURRENT VIBE] soft mode: warm and real, comfort first, drop the roasts and the slang pile-on, short and genuine.'
         if (
-            /(\broast me\b|\bhype me\b|\blets go\b|\bsheeesh\b|\bpog\b|\bfire\b|\bslay\b|\bperiodt\b|\bno cap\b)/.test(t) ||
+            /(\broast me\b|\bhype me\b|\blets go\b|\bsheeesh\b|\bpog\b|\bfire\b|\bslay\b|\bperiodt\b|\bno cap\b)/.test(
+                t,
+            ) ||
             /[A-Z]{6,}/.test(text) ||
             text.includes('!!!')
         )
             return '[CURRENT VIBE] hyped gremlin mode: match their energy, tease playfully, roast the SITUATION never the person, caps sparingly for punch.'
-        if (/(\blol\b|\blmao\b|\bbruh\b|\bdead\b|💀|\bbffr\b|\bunhinged\b|\bchaotic\b|\bmeme\b|\bfunny\b|\bjoke\b)/.test(t))
+        if (
+            /(\blol\b|\blmao\b|\bbruh\b|\bdead\b|💀|\bbffr\b|\bunhinged\b|\bchaotic\b|\bmeme\b|\bfunny\b|\bjoke\b)/.test(
+                t,
+            )
+        )
             return '[CURRENT VIBE] gremlin mode: sharp, witty, a little unhinged, tease but never punch down, punchy with some meat — never a bare one-liner on a real question.'
         if (
             /(\bplease\b|help (me |with )?(with |to )?(fix|understand|write|make|do|choose|find|learn)|how (do|can|to)|\berror\b|\bexplain\b|\btutorial\b|\bguide\b|\bwhat does\b|\bwhy does\b)/.test(
@@ -285,7 +295,11 @@ export class AIChatManager extends OutputCore {
         const recent = buf.filter((e) => now - e.ts < 5 * 60_000)
         if (recent.length < 3) return ''
         const aboutMe = recent.filter((e) => /\bmedusa\b|\bmeddy\b|\bmed\b/i.test(e.content ?? '')).length
-        const tease = recent.filter((e) => /(\blol\b|\blmao\b|💀|\broast\b|\bclown\b|\bmid\b|\bratio\b|\bbozo\b|\bdumb\b|\bstupid\b|\bcringe\b)/i.test(e.content ?? '')).length
+        const tease = recent.filter((e) =>
+            /(\blol\b|\blmao\b|💀|\broast\b|\bclown\b|\bmid\b|\bratio\b|\bbozo\b|\bdumb\b|\bstupid\b|\bcringe\b)/i.test(
+                e.content ?? '',
+            ),
+        ).length
         if (recent.length >= 8 || tease >= 4)
             return '[ROOM CLIMATE] the room is feral rn — match the chaos, loud and notorious, but stay sharp.'
         if (aboutMe >= 2)
@@ -299,9 +313,7 @@ export class AIChatManager extends OutputCore {
         // Identity facts (creator, links) survive every persona swap, personas change her
         // tune, not who she is. The safety policy rides along everywhere and stays
         // non-overridable. Persona precedence: user custom > server persona > default.
-        const identity = this.identity
-            ? `\n\n[IDENTITY, always true, in any persona] ${this.identity}`
-            : ''
+        const identity = this.identity ? `\n\n[IDENTITY, always true, in any persona] ${this.identity}` : ''
         const base = `${this.instructions}${identity}\n\n${SAFETY_POLICY}`
         if (!userId) return base
         if (this.userModes[userId] === 1)
@@ -347,7 +359,13 @@ export class AIChatManager extends OutputCore {
                             'You compress chat logs into dense long-term memory notes. Output only the notes, no preamble.',
                     })
                     if (!summary || summary.length < 20) continue
-                    if (mem.saveSummaryAndPrune(user_id, summary, rows.map((r) => r.id)))
+                    if (
+                        mem.saveSummaryAndPrune(
+                            user_id,
+                            summary,
+                            rows.map((r) => r.id),
+                        )
+                    )
                         console.log(`[AI] Memory: condensed ${rows.length} rows into notes for ${user_id}`)
                 }
             }
@@ -553,7 +571,8 @@ TIME: ${new Date().toISOString().slice(0, 16)} UTC`
         const _provider = this._detectProvider(this.aiModel)?.id ?? 'unknown'
         const _cfg = this._config ?? this.config
         const _realKey = (k) => !!k && !/YOUR_|_HERE|PLACEHOLDER/i.test(k)
-        const _canResearch = !!this._researchClient && (_realKey(_cfg.search?.tavilyKey) || _realKey(_cfg.search?.serperKey))
+        const _canResearch =
+            !!this._researchClient && (_realKey(_cfg.search?.tavilyKey) || _realKey(_cfg.search?.serperKey))
         parts.push(
             `YOUR MODEL/RUNTIME (plumbing, never your identity): your engine is "${this.aiModel}" via ${_provider} (vision: "${this.visionModel}", research: "${this.researchModel}"). ` +
                 `Capabilities: image vision, long-term memory${_canResearch ? ', live web research' : ''}. ` +
@@ -588,7 +607,9 @@ TIME: ${new Date().toISOString().slice(0, 16)} UTC`
                 })
                 .trim()
             if (!refText && ref.embeds?.length) {
-                const e = ref.embeds.find((x) => x.data?.type !== 'image' && x.data?.type !== 'gifv') ?? ref.embeds[0]
+                const e =
+                    ref.embeds.find((x) => x.data?.type !== 'image' && x.data?.type !== 'gifv') ??
+                    ref.embeds[0]
                 const eb = [
                     e?.author?.name,
                     e?.title,
@@ -647,7 +668,14 @@ TIME: ${new Date().toISOString().slice(0, 16)} UTC`
             // topP is threaded as a call-scoped argument, no shared this.topP mutation, so
             // concurrent stateless calls can't race on each other's sampling settings.
             // agent='quickAgent' so its own fallback chain applies, not chat's.
-            return await this._groqCallWithFallbacks(messages, model, maxTokens, temperature, topP, 'quickAgent')
+            return await this._groqCallWithFallbacks(
+                messages,
+                model,
+                maxTokens,
+                temperature,
+                topP,
+                'quickAgent',
+            )
         }
 
         if (routing === 'research') {
@@ -852,7 +880,16 @@ Answer concisely using the research.`
     }
 
     // Research response
-    async ResearchResponse({ prompt, history, userId, username, displayName, message, systemPrompt, extraSys = null }) {
+    async ResearchResponse({
+        prompt,
+        history,
+        userId,
+        username,
+        displayName,
+        message,
+        systemPrompt,
+        extraSys = null,
+    }) {
         // Profile visual fast-path, bypass LLM, guarantee command execution ────
         const visualCmd = this._matchProfileVisual(prompt, userId, message)
         if (visualCmd) return { response: visualCmd, researched: false }
@@ -875,7 +912,7 @@ Answer concisely using the research.`
         if (routing === 'dangerous')
             return {
                 response:
-                    "hard pass on that one 🚫 not something i do. you good? lmk what else is on your mind",
+                    'hard pass on that one 🚫 not something i do. you good? lmk what else is on your mind',
                 researched: false,
             }
 
@@ -923,9 +960,7 @@ Answer concisely using the research.`
             return {
                 response,
                 streamed:
-                    this._config?.streaming === true &&
-                    !!message?.channel &&
-                    !MAY_EMIT_CMD_RE.test(prompt),
+                    this._config?.streaming === true && !!message?.channel && !MAY_EMIT_CMD_RE.test(prompt),
                 researched: false,
             }
         }
@@ -1024,7 +1059,15 @@ Answer concisely using the research.`
     // hedged knowledge answers), then speaks ONLY on a correction or a genuinely
     // useful addendum: "actually …" / "oh also …", capped short so chat never gets
     // walled. Confirmed answers stay silent — the check is logged, not messaged.
-    async _secondThought({ message, bareQuestion, response, researched, hadSources, verifyCtx, confirmPending = false }) {
+    async _secondThought({
+        message,
+        bareQuestion,
+        response,
+        researched,
+        hadSources,
+        verifyCtx,
+        confirmPending = false,
+    }) {
         if (confirmPending) return
         if (!response || response.length < 15 || response.startsWith('⏳')) return
         if (/^nah i'm not going hunting|^hard pass on that one/.test(response)) return
@@ -1102,8 +1145,7 @@ Answer concisely using the research.`
         // primary signal, raw-content match is the fallback.
         const botId = this.client.user.id
         const mentionedAnywhere =
-            message.mentions?.users?.has(botId) === true ||
-            new RegExp(`<@!?${botId}>`).test(content)
+            message.mentions?.users?.has(botId) === true || new RegExp(`<@!?${botId}>`).test(content)
         // Mid-sentence mentions count as a summon in always-active channels/DMs.
         const mentioned = startsWithExplicitPing
 
@@ -1250,7 +1292,7 @@ Answer concisely using the research.`
             const key = `${userId}-${message.channel.id}`
             if (!this.messageHistory.has(key)) this.messageHistory.set(key, [])
 
-            let { url: imageUrl, isGif, label: imgLabel } = this._getImageFromMessage(message)
+            let { url: imageUrl, isGif, label: imgLabel, spoilerSkipped } = this._getImageFromMessage(message)
             if (!imageUrl && message.reference?.messageId) {
                 const rr = await this._resolveReplyContext(message)
                 if (rr?.hasImage) ({ url: imageUrl, isGif, label: imgLabel } = rr.imgData)
@@ -1263,8 +1305,7 @@ Answer concisely using the research.`
                     mem.addConversation(userId, message.channel.id, content, vRes)
                     const hist = this.messageHistory.get(key)
                     hist.push({ role: 'user', content }, { role: 'assistant', content: vRes })
-                    for (const chunk of this.splitResponse(vRes))
-                        await this.secureReply(message, chunk)
+                    for (const chunk of this.splitResponse(vRes)) await this.secureReply(message, chunk)
                 }
                 return
             }
@@ -1274,6 +1315,8 @@ Answer concisely using the research.`
             let finalContent = content
             const textFiles = await this._processTextAttachments(message)
             if (textFiles) finalContent += textFiles
+            if (!imageUrl && spoilerSkipped)
+                finalContent += `\n\n[${spoilerSkipped} spoiler-tagged image(s) attached but left unopened — ask me to look and I will.]`
 
             let { response, streamed, researched, hadSources, verifyCtx } = await this.ResearchResponse({
                 prompt: finalContent,
@@ -1326,8 +1369,7 @@ Answer concisely using the research.`
                 try {
                     const recent = await message.channel.messages.fetch({ limit: 5 })
                     const ours = recent.find(
-                        (m) =>
-                            m.author.id === this.client.user.id && m.reference?.messageId === message.id,
+                        (m) => m.author.id === this.client.user.id && m.reference?.messageId === message.id,
                     )
                     if (ours && (finalText !== response || ui)) {
                         const editPayload = ui
@@ -1406,6 +1448,18 @@ Answer concisely using the research.`
                 hist.push({ role: 'assistant', content: response || '*(silently executed system tool)*' })
             }
             const media = await this._pickExpressiveMedia(response, message)
+            if (media?.explicit) {
+                // A real GIF is attached below: drop the model's no-generation
+                // refusal instead of shipping "I can't" next to a GIF.
+                const cleaned = String(response ?? '')
+                    .replace(
+                        /[^.!?\n]*\bI\s+(?:don't|do not|can['’]t|cannot)\s+(?:have|got)\b[^.!?\n]*?\b(?:image|gif)\b[^.!?\n]*?\bgeneration\b[^.!?\n]*[.!?]*/gi,
+                        '',
+                    )
+                    .replace(/\n{3,}/g, '\n\n')
+                    .trim()
+                response = cleaned || 'here you go 💜'
+            }
             const chunks = this.splitResponse(response || '')
             const sentMsgs = []
             // Confirm UI rides on the SAME send as the note text: both land
@@ -1440,7 +1494,9 @@ Answer concisely using the research.`
                     if (entry) entry.uiMsg = uiSent
                     console.log(`[AI] Confirm UI attached for '${ui.key.split(':')[1]}'`)
                 } else {
-                    console.error(`[AI] Confirm UI has nowhere to attach (send failed, see secureReply log above)`)
+                    console.error(
+                        `[AI] Confirm UI has nowhere to attach (send failed, see secureReply log above)`,
+                    )
                 }
             }
             if (execResult.sensitive && sentMsgs.length) {
@@ -1522,7 +1578,10 @@ Answer concisely using the research.`
                 const botOk = !need || message.guild?.members.me?.permissions?.has(need)
                 if (!stillOk || !botOk) {
                     await message.react('❌').catch(() => {})
-                    await this.secureReply(message, `🔑 Can't run \`${cmdName}\` anymore — permissions changed since you asked.`)
+                    await this.secureReply(
+                        message,
+                        `🔑 Can't run \`${cmdName}\` anymore — permissions changed since you asked.`,
+                    )
                     return
                 }
             }
@@ -1578,6 +1637,7 @@ Answer concisely using the research.`
                     this._pendingConfirms.delete(hit.key)
                     if (lower === 'no') {
                         await message.react('❌').catch(() => {})
+                        this._recordConfirmOutcome(hit.key, message, 'cancelled')
                         return
                     }
                     await this._runConfirmedCommand(hit.key, hit.val, message)
@@ -1633,13 +1693,20 @@ Answer concisely using the research.`
                             col.stop()
                             if (!selVal || Date.now() - selVal.ts > 30_000) {
                                 await i
-                                    .update({ content: '⌛ Expired — ask again if you still want it.', components: [] })
+                                    .update({
+                                        content: '⌛ Expired — ask again if you still want it.',
+                                        components: [],
+                                    })
                                     .catch(() => {})
+                                this._recordConfirmOutcome(selKey, message, 'expired')
                                 return
                             }
                             this._pendingConfirms.delete(selKey)
                             await i
-                                .update({ content: `✅ Confirmed \`${selKey.split(':')[1]}\` — running it now.`, components: [] })
+                                .update({
+                                    content: `✅ Confirmed \`${selKey.split(':')[1]}\` — running it now.`,
+                                    components: [],
+                                })
                                 .catch(() => {})
                             await this._runConfirmedCommand(selKey, selVal, message)
                         } catch (e) {
@@ -1670,6 +1737,7 @@ Answer concisely using the research.`
             this._pendingConfirms.delete(key)
             if (lower === 'no') {
                 await message.react('❌').catch(() => {})
+                this._recordConfirmOutcome(key, message, 'cancelled')
                 return
             }
             await this._runConfirmedCommand(key, val, message)
@@ -1868,7 +1936,8 @@ ${cleaned}`
             if (content) {
                 const out = this.finalSecurityCheck(content)
                 const payload = { content: out, allowedMentions: { parse: [] } }
-                if (/<@!?\d+>|<@&\d+>|@everyone|@here/.test(out)) payload.flags = MessageFlags.SuppressNotifications
+                if (/<@!?\d+>|<@&\d+>|@everyone|@here/.test(out))
+                    payload.flags = MessageFlags.SuppressNotifications
                 await ch.send(payload)
             }
         } catch (e) {

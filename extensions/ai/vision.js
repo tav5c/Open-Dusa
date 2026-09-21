@@ -46,12 +46,19 @@ export class VisionCore extends ResearchCore {
             '.ex',
             '.exs',
         ])
-        const textAtts = [...message.attachments.values()].filter((att) => {
+        const allText = [...message.attachments.values()].filter((att) => {
             const ct = (att.contentType ?? '').toLowerCase()
             const ext = att.name?.split('.').pop()?.toLowerCase()
             return ct.includes('text/') || TEXT_EXTS.has('.' + ext)
         })
-        if (!textAtts.length) return ''
+        // Spoiler-tagged files stay unopened unless explicitly asked for —
+        // the tag means "hide by default", describing them would defeat it.
+        const spoilerFiles = allText.filter((att) => att.spoiler)
+        const textAtts = allText.filter((att) => !att.spoiler)
+        const spoilerNote = spoilerFiles.length
+            ? `\n\n[${spoilerFiles.length} spoiler-tagged file(s) left unopened — ask me to read them and I will.]`
+            : ''
+        if (!textAtts.length) return spoilerNote
         const totalSize = textAtts.reduce((sum, att) => sum + att.size, 0)
         if (totalSize > 150_000)
             return `\n\n[${textAtts.length} file(s) skipped, combined size ${(totalSize / 1024).toFixed(0)}KB exceeds limit]`
@@ -61,7 +68,7 @@ export class VisionCore extends ResearchCore {
                 if (att.size > 80_000)
                     return `\n\n[File: \`${att.name}\`, too large to read (${(att.size / 1024).toFixed(0)}KB)]`
                 try {
-                    const res = await fetch(att.url)
+                    const res = await fetch(att.url, { signal: AbortSignal.timeout(10_000) })
                     const text = await res.text()
                     return `\n\n[Attached File: ${att.name}]\n\`\`\`\n${text.slice(0, 10000)}\n\`\`\``
                 } catch (e) {
@@ -70,7 +77,7 @@ export class VisionCore extends ResearchCore {
                 }
             }),
         )
-        return results.join('')
+        return results.join('') + spoilerNote
     }
     _getImageFromMessage(message) {
         const IMAGE_TYPES = new Set(['image/png', 'image/jpeg', 'image/jpg', 'image/webp', 'image/gif'])
@@ -80,9 +87,15 @@ export class VisionCore extends ResearchCore {
             if (IMAGE_TYPES.has(ct)) return true
             return /\.(png|jpe?g|webp|gif)$/i.test(att.name ?? '')
         }
-        // Collect ALL images, not just the first
+        // Collect ALL images, not just the first. Spoiler-tagged attachments
+        // are counted but never fetched (see _processTextAttachments).
         const images = []
+        let spoilerSkipped = 0
         for (const att of message.attachments.values()) {
+            if (att.spoiler) {
+                spoilerSkipped++
+                continue
+            }
             const ct = (att.contentType ?? '').split(';')[0].trim().toLowerCase()
             if (!isImageAtt(att)) continue
             const isGif = ct === 'image/gif' || att.name?.toLowerCase().endsWith('.gif')
@@ -90,7 +103,7 @@ export class VisionCore extends ResearchCore {
             if (isGif && url) url += (url.includes('?') ? '&' : '?') + 'format=webp&width=960'
             images.push({ url, isGif, label: `image ${images.length + 1}` })
         }
-        if (images.length > 0) return { ...images[0], allImages: images }
+        if (images.length > 0) return { ...images[0], allImages: images, spoilerSkipped }
 
         for (const embed of message.embeds) {
             if (embed.data.type === 'gifv') {
@@ -109,12 +122,16 @@ export class VisionCore extends ResearchCore {
         const ref = message.reference?.resolved
         if (ref) {
             for (const att of ref.attachments.values()) {
+                if (att.spoiler) {
+                    spoilerSkipped++
+                    continue
+                }
                 const ct = (att.contentType ?? '').split(';')[0].trim().toLowerCase()
                 if (!isImageAtt(att)) continue
                 const isGif = ct === 'image/gif' || att.name?.toLowerCase().endsWith('.gif')
                 let url = att.proxyURL ?? att.url
                 if (isGif && url) url += (url.includes('?') ? '&' : '?') + 'format=webp&width=960'
-                return { url, isGif, label: 'replied image' }
+                return { url, isGif, label: 'replied image', spoilerSkipped }
             }
             for (const embed of ref.embeds) {
                 if (embed.data.type === 'gifv') {
@@ -124,7 +141,7 @@ export class VisionCore extends ResearchCore {
                 if (embed.image?.url) return { url: embed.image.url, isGif: false, label: 'replied image' }
             }
         }
-        return { url: null, isGif: false, label: null }
+        return { url: null, isGif: false, label: null, spoilerSkipped }
     }
 
     // Stage-1 describe against one specific client+model. Returns {raw, errType};
@@ -201,7 +218,7 @@ export class VisionCore extends ResearchCore {
 
     async _callVision(prompt, imageUrl, isGif, systemPrompt, userId = null, allImages = null) {
         const vclient = this._visionClient ?? this._groq
-        if (!vclient && !(this.agentFallbacks?.vision?.length)) return null
+        if (!vclient && !this.agentFallbacks?.vision?.length) return null
         const gifNote = isGif
             ? "\n\nNote: This is an animated GIF. You can only see the first frame. Describe what you see clearly and precisely, vibe, subject, colours, action. Be honest that it's one frame if movement is implied."
             : ''
@@ -237,7 +254,8 @@ export class VisionCore extends ResearchCore {
             if (!imgRes.ok) throw new Error(`HTTP ${imgRes.status}`)
             const contentType = imgRes.headers.get('content-type')?.split(';')[0]?.trim() ?? 'image/jpeg'
             const buffer = await imgRes.arrayBuffer()
-            if (buffer.byteLength > MAX_IMG_BYTES) throw new Error(`too large (${(buffer.byteLength / 1048576).toFixed(1)}MB)`)
+            if (buffer.byteLength > MAX_IMG_BYTES)
+                throw new Error(`too large (${(buffer.byteLength / 1048576).toFixed(1)}MB)`)
             const base64 = Buffer.from(buffer).toString('base64')
             imageContent = { type: 'base64', media_type: contentType, data: base64 }
         } catch (e) {
@@ -293,8 +311,23 @@ export class VisionCore extends ResearchCore {
         ]
         let raw = null
         let errType = null
+        // GIFs must be requested as a static frame everywhere, including the
+        // raw-URL retry inside _describeWith: some vision endpoints 400 on
+        // animated GIF URLs ("animated GIFs are not supported").
+        const staticUrl =
+            isGif && imageUrl && !/[?&]format=webp/.test(imageUrl)
+                ? imageUrl + (imageUrl.includes('?') ? '&' : '?') + 'format=webp&width=960'
+                : imageUrl
         const primary = this._visionClient ?? this._groq
-        if (primary) ({ raw, errType } = await this._describeWith(primary, this.visionModel, s1msgs, userText, imageUrl, true))
+        if (primary)
+            ({ raw, errType } = await this._describeWith(
+                primary,
+                this.visionModel,
+                s1msgs,
+                userText,
+                staticUrl,
+                true,
+            ))
         // Hard failure (not expired/format, which are terminal answers) -> walk
         // this agent's own fallback chain before giving up to text-only.
         if (!raw && !errType) {
@@ -302,10 +335,12 @@ export class VisionCore extends ResearchCore {
                 try {
                     const client = this._fallbackClient(fb)
                     if (!client) continue
-                    const att = await this._describeWith(client, fb.model, s1msgs, userText, imageUrl, false)
+                    const att = await this._describeWith(client, fb.model, s1msgs, userText, staticUrl, false)
                     if (att.raw || att.errType) {
                         if (att.raw)
-                            console.log(`[AI] Vision fallback answered via ${fb.provider ?? fb.baseUrl} / ${fb.model}`)
+                            console.log(
+                                `[AI] Vision fallback answered via ${fb.provider ?? fb.baseUrl} / ${fb.model}`,
+                            )
                         raw = att.raw
                         errType = att.errType
                         break

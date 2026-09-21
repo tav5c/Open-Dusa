@@ -227,14 +227,14 @@ npm run dev      # development (auto-restart on file changes)
         "serperKey": "", // serper.dev - free tier: 2500 searches/month
         "tavilyKey": "" // tavily.com - fallback search provider
     },
-    "giphyKey": "", // Giphy API key for GIF reactions (blank = free fallback)
+    "giphyKey": "", // Giphy API key for GIF reactions (fallback if Klipy fails)
+    "klipyKey": "", // Klipy API key — primary GIF provider (blank = skip to Giphy, then free fallback)
 
     // ─── Behavior ────────────────────────────────────────────────────────────
     "triggers": "meddy,medusa,med", // Words that wake her up (comma-separated)
     "allowDMs": false, // Whether she responds to DMs
     "streaming": false, // Live-edit replies token-by-token as they generate
     "nsfw": false, // Censor toggle: true disables ALL code-level NSFW/dangerous/hate refusals (routing + canned replies + slur guard) so the models judge content themselves. Defaults to false (safe)
-    "memoryDepth": 25, // Conversation turns included in history
     "funMsgInterval": 5400, // Seconds between unprompted messages (0 to disable)
     "stopSequences": [], // Extra stop sequences passed to the LLM
     "ignoreUsers": [], // User IDs the AI never responds to (edit here, config.json is the only source)
@@ -267,7 +267,7 @@ npm run dev      # development (auto-restart on file changes)
 
 ## Performance Tuning
 
-Open-Dusa ships with safe defaults suitable for cheap shared hosts (256 MB RAM, shared CPU). If you're running on a VPS with more headroom, edit `configs/performance.json` to override any of these knobs.
+Open-Dusa ships with safe defaults suitable for cheap shared hosts (256 MB RAM, shared CPU). If you're running on a VPS with more headroom, edit `configs/performance.json` to override any of these knobs. One exception: `memoryDepth` set in `config.json` wins over the perf file — delete it there to single-source history depth from `performance.json`.
 
 On first startup, if `configs/performance.json` doesn't exist, the bot auto-creates it with defaults. Edit and restart to apply.
 
@@ -309,14 +309,14 @@ On first startup, if `configs/performance.json` doesn't exist, the bot auto-crea
 }
 
 {
-  "sqlite":      { "cacheSizeKB": 100000, "mmapSizeBytes": 536870912 },
-  "discord":     { "messageCache": 500, "memberCacheMax": 2000, "userCache": 5000, "messageSweepLifetime": 1800 },
-  "ai":          { "responseCacheMax": 4096, "responseCacheTTLSec": 600, "responseCacheMaxMB": 100,
-                   "userCacheMax": 5000, "userCacheTTLSec": 300,
+  "sqlite":      { "cacheSizeKB": 25000, "mmapSizeBytes": 134217728 },
+  "discord":     { "messageCache": 250, "memberCacheMax": 1000, "userCache": 2500, "messageSweepInterval": 250, "messageSweepLifetime": 1500 },
+  "ai":          { "responseCacheMax": 8192, "responseCacheTTLSec": 1800, "responseCacheMaxMB": 100,
+                   "userCacheMax": 5000, "userCacheTTLSec": 600,
                    "messageHistoryMax": 1000, "messageHistoryTTLMin": 120,
                    "repliedMsgCacheMax": 2000, "repliedMsgCacheTTLMin": 30,
-                   "memoryDepth": 50, "passiveBufferMax": 50, "passiveBufferChannelsMax": 1500 },
-  "maintenance": { "cleanupIntervalMin": 30, "retentionDays": 180, "loopLagWarnMs": 200 }
+                   "memoryDepth": 20, "passiveBufferMax": 50, "passiveBufferChannelsMax": 1500 },
+  "maintenance": { "cleanupIntervalMin": 45, "retentionDays": 180, "vacuumEveryDays": 7, "loopLagWarnMs": 200 }
 }
 
 npm run start:beefy    # 3 GB heap, 16 UV threads - good for 2-4 GB VPS
@@ -506,7 +506,9 @@ Servers with `"isolatedMemory": true` in the `guilds` map (or isolated live with
 **Expressive Media**
 
 - Tone-matched sticker and GIF reactions (40% chance when triggered)
-- Falls back to free anime GIF API (nekos.best) if no Giphy key
+- Klipy first, then Giphy if a key is set, then free anime GIF API (nekos.best)
+- Explicit "send a gif of X" asks fetch by subject, no dice roll
+- Spoiler-tagged attachments are never opened unless explicitly asked
 - Hard-blocked on moderation and NSFW responses
 
 **System**

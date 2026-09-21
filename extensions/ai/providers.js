@@ -429,6 +429,17 @@ export class ProviderCore {
     // whole ring for nothing. Matched before _isKeyError so these skip rotation.
     _isBillingError(e) {
         const s = String(e?.message ?? e).toLowerCase()
+        // Rate limits are NEVER billing, no matter what else the body says.
+        // Groq TPM bodies keep going past the 160 chars we log ("...Limit N,
+        // Used M... upgrade your plan... billing options") and that tail can
+        // trip the wallet patterns below — so rate language wins outright.
+        if (
+            this._errorStatus(e) === 429 ||
+            /(^|\D)(429|rate limit|too large|tokens per (minute|hour|day)|requests per|try again in|\btpm\b|\brpm\b|\brpd\b|service tier|rate-limits?)\b/.test(
+                s,
+            )
+        )
+            return false
         return /pay.as.you.go|deposited balance|promotional|bonus credit|insufficient.*(balance|credit|fund)|wallet|payment required|requires (more |real )?credits?|out of credits|billing/i.test(
             s,
         )

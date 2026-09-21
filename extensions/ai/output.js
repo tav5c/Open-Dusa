@@ -67,7 +67,14 @@ export class OutputCore extends AgentCommandCore {
                 const now = Date.now()
                 if (now - (this._safetyAuditAt.get(key) ?? 0) > 60_000) {
                     this._safetyAuditAt.set(key, now)
-                    logAction(this.db, guild.id, user.id, this.client.user.id, 'AI safety block', 'Unsafe generated output')
+                    logAction(
+                        this.db,
+                        guild.id,
+                        user.id,
+                        this.client.user.id,
+                        'AI safety block',
+                        'Unsafe generated output',
+                    )
                 }
             }
             text = safetyRefusal(text)
@@ -79,7 +86,10 @@ export class OutputCore extends AgentCommandCore {
         let out = text2.replace(/@(?:[\u200B\u200C\u200D\uFEFF]*)?(everyone|here)/gi, '🪼')
         // Strip leaked internal-context markers: tolerate a missing ']' and an echoed "**Name**:" preface, and bound to the first blank line so a top-of-reply echo can't wipe the real message
         out = out
-            .replace(/^[\s>"'`]*(?:\*\*[^\n*]+\*\*\s*:?\s*["']?)?\s*\[INTERNAL\b[\s\S]*?(?:\]\s*["']?|\n\s*\n|$)/i, '')
+            .replace(
+                /^[\s>"'`]*(?:\*\*[^\n*]+\*\*\s*:?\s*["']?)?\s*\[INTERNAL\b[\s\S]*?(?:\]\s*["']?|\n\s*\n|$)/i,
+                '',
+            )
             .replace(/\[INTERNAL\b[^\]]*\]/gi, '')
             .trim()
         out = out.replace(/<\/?reply_context[^>]*>/g, '')
@@ -225,6 +235,65 @@ export class OutputCore extends AgentCommandCore {
     }
 
     // Expressive media, stickers, server emojis, GIFs
+    // Explicit GIF ask in the USER text ("send a gif of yoshimitsu").
+    // Returns a subject string or null. Conservative on purpose: pattern 3
+    // (bare "<subject> gif") requires a real subject, not stopwords.
+    _extractGifSubject(userText) {
+        const s = String(userText ?? '')
+            .trim()
+            .toLowerCase()
+            .replace(/[<@#!&>]/g, '')
+            .slice(0, 200)
+        const m1 = s.match(
+            /(?:send|post|drop|show|give|find|need|want)(?: me| us)? (?:a |an |the )?gifs?(?: of| about| featuring| with)? (.+?)(?:\s+(?:pls|please))?[?!.,]*$/,
+        )
+        if (m1?.[1]?.trim()) return m1[1].trim().slice(0, 60)
+        const m2 = s.match(/(?:a |an |the )?gifs? of (.+?)(?:\s+(?:pls|please))?[?!.,]*$/)
+        if (m2?.[1]?.trim()) return m2[1].trim().slice(0, 60)
+        const m3 = s.match(/^(.+?) gifs?(?:\s+(?:pls|please))?[?!.,]*$/)
+        const subj = m3?.[1]?.trim() ?? ''
+        if (subj.length >= 3 && !/^(this|that|a|the|your|my|some|any|more|another)$/.test(subj))
+            return subj.slice(0, 60)
+        return null
+    }
+
+    // Klipy -> Giphy chain for an arbitrary subject query. No dice roll,
+    // no tone pool. Returns a GIF URL or null. (nekos.best excluded: its
+    // fixed anime categories can't serve arbitrary subjects.)
+    async _fetchGifFromProviders(q) {
+        const klipyKey = this._config?.klipyKey
+        if (q && klipyKey) {
+            try {
+                const res = await fetch(
+                    `https://api.klipy.com/api/v1/${klipyKey}/gifs/search?q=${encodeURIComponent(q)}&per_page=10`,
+                    { signal: AbortSignal.timeout(3000) },
+                )
+                const data = await res.json()
+                const items = data?.data?.data ?? []
+                if (items.length) {
+                    const pick = items[Math.floor(Math.random() * items.length)]?.file ?? {}
+                    const md = pick.md ?? pick.sm ?? pick.hd ?? {}
+                    const url = md.gif?.url || md.webp?.url || null
+                    if (url) return url
+                }
+            } catch {}
+        }
+        const giphyKey = this._config?.giphyKey
+        if (q && giphyKey) {
+            try {
+                const res = await fetch(
+                    `https://api.giphy.com/v1/gifs/search?api_key=${giphyKey}&q=${encodeURIComponent(q)}&limit=10&rating=pg-13&lang=en`,
+                    { signal: AbortSignal.timeout(3000) },
+                )
+                const data = await res.json()
+                const results = data?.data ?? []
+                if (results.length)
+                    return results[Math.floor(Math.random() * results.length)]?.images?.original?.url ?? null
+            } catch {}
+        }
+        return null
+    }
+
     // Called after response is finalized. Returns { sticker, gif } or null.
     // Never fires on serious/mod/research-heavy responses.
     async _pickExpressiveMedia(response, message) {
@@ -234,6 +303,14 @@ export class OutputCore extends AgentCommandCore {
         const SERIOUS = /\b(ban|mute|warn|kick|purge|moderat|you are (now|hereby)|action has been|case #)\b/i
         const NSFW_BLOCK = /\b(nsfw|porn|nude|sex|hentai|lewd|explicit)\b/i
         if (SERIOUS.test(response) || NSFW_BLOCK.test(response)) return null
+        // Explicit GIF asks bypass everything below (tone gate, dice roll):
+        // the user asked, the subject IS the query.
+        const gifSubject = this._extractGifSubject(message?.content)
+        if (gifSubject) {
+            const direct = await this._fetchGifFromProviders(gifSubject)
+            if (direct) return { gif: direct, explicit: true }
+            // No result anywhere: fall through, the model's prose handles it.
+        }
         // Skip if response is just a command execution (no real text)
         if (response.trim().startsWith('⚙️') || response.length < 20) return null
         // Tone detection
@@ -289,36 +366,53 @@ export class OutputCore extends AgentCommandCore {
             }
         }
 
-        // GIF fetch logic (Giphy + Free Fallback)
+        // GIF fetch logic (Klipy -> Giphy -> Free Fallback)
         if (!result.sticker && Math.random() > 0.6) {
-            const giphyKey = this._config?.giphyKey
+            const queries = [
+                ...(isFunny ? ['anime crying laughing', 'bruh moment', 'anime skull'] : []),
+                ...(isHype ? ['anime hype', 'lets go anime', 'anime slay'] : []),
+                ...(isConfused ? ['anime confused', 'anime wait what', 'anime thinking'] : []),
+                ...(isChaos ? ['anime unhinged', 'anime chaos', 'anime stare'] : []),
+            ]
+            const q = queries.length ? queries[Math.floor(Math.random() * queries.length)] : null
             let fetchedGif = null
 
-            // 1. Try Giphy if API key exists
-            if (giphyKey) {
-                const queries = [
-                    ...(isFunny ? ['anime crying laughing', 'bruh moment', 'anime skull'] : []),
-                    ...(isHype ? ['anime hype', 'lets go anime', 'anime slay'] : []),
-                    ...(isConfused ? ['anime confused', 'anime wait what', 'anime thinking'] : []),
-                    ...(isChaos ? ['anime unhinged', 'anime chaos', 'anime stare'] : []),
-                ]
-                if (queries.length) {
-                    const q = queries[Math.floor(Math.random() * queries.length)]
-                    try {
-                        const res = await fetch(
-                            `https://api.giphy.com/v1/gifs/search?api_key=${giphyKey}&q=${encodeURIComponent(q)}&limit=10&rating=pg-13&lang=en`,
-                            { signal: AbortSignal.timeout(3000) },
-                        )
-                        const data = await res.json()
-                        const results = data?.data ?? []
-                        if (results.length)
-                            fetchedGif =
-                                results[Math.floor(Math.random() * results.length)]?.images?.original?.url
-                    } catch {}
-                }
+            // 0. Try Klipy first when a key is configured (primary GIF provider).
+            // GET api.klipy.com/api/v1/{key}/gifs/search?q=&per_page= -> data.data[].file.md.gif.url
+            const klipyKey = this._config?.klipyKey
+            if (q && klipyKey) {
+                try {
+                    const res = await fetch(
+                        `https://api.klipy.com/api/v1/${klipyKey}/gifs/search?q=${encodeURIComponent(q)}&per_page=10`,
+                        { signal: AbortSignal.timeout(3000) },
+                    )
+                    const data = await res.json()
+                    const items = data?.data?.data ?? []
+                    if (items.length) {
+                        const pick = items[Math.floor(Math.random() * items.length)]?.file ?? {}
+                        const md = pick.md ?? pick.sm ?? pick.hd ?? {}
+                        fetchedGif = md.gif?.url || md.webp?.url || null
+                    }
+                } catch {}
             }
 
-            // 2. Fallback to free SFW anime API (nekos.best) if Giphy isn't set or failed
+            // 1. Giphy fallback if Klipy is unset or failed
+            const giphyKey = this._config?.giphyKey
+            if (q && !fetchedGif && giphyKey) {
+                try {
+                    const res = await fetch(
+                        `https://api.giphy.com/v1/gifs/search?api_key=${giphyKey}&q=${encodeURIComponent(q)}&limit=10&rating=pg-13&lang=en`,
+                        { signal: AbortSignal.timeout(3000) },
+                    )
+                    const data = await res.json()
+                    const results = data?.data ?? []
+                    if (results.length)
+                        fetchedGif =
+                            results[Math.floor(Math.random() * results.length)]?.images?.original?.url
+                } catch {}
+            }
+
+            // 2. Free SFW anime API (nekos.best) if both are unset or failed
             if (!fetchedGif) {
                 const categories = [
                     ...(isFunny ? ['laugh', 'smile', 'smug'] : []),

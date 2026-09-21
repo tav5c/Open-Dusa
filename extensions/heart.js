@@ -1,6 +1,7 @@
 import { LRUCache } from 'lru-cache'
+import { statfsSync } from 'fs'
+import { cpus, loadavg } from 'os'
 import { monitorEventLoopDelay } from 'perf_hooks'
-import si from 'systeminformation'
 import { loadPerformance } from './performance.js'
 
 const PERF = loadPerformance()
@@ -207,25 +208,30 @@ export class MedusaHeart {
                 )
             }
 
-            // Disk check (critical for Pterodactyl/ephemeral hosts)
+            // Disk check (critical for Pterodactyl/ephemeral hosts). Native
+            // statfs: no subprocess, no dependency. '/' is the container rootfs.
             try {
-                const fsData = await si.fsSize()
-                const main = fsData?.find((f) => f.fs === '/' || f.mount === '/') || fsData?.[0]
-                if (main) {
-                    this.monitor.diskUsed = main.used / 1024 / 1024 / 1024
-                    this.monitor.diskTotal = main.size / 1024 / 1024 / 1024
-                    if (main.use > 90) console.warn(`[Heart] DISK ALMOST FULL: ${main.use.toFixed(0)}%`)
+                const st = statfsSync('/')
+                const size = st.blocks * st.bsize
+                const used = (st.blocks - st.bfree) * st.bsize
+                if (size > 0) {
+                    this.monitor.diskUsed = used / 1024 / 1024 / 1024
+                    this.monitor.diskTotal = size / 1024 / 1024 / 1024
+                    const pct = (used / size) * 100
+                    if (pct > 90) console.warn(`[Heart] DISK ALMOST FULL: ${pct.toFixed(0)}%`)
                 }
             } catch {
-                /* fsSize fails in some containers, ignore */
+                /* statfs fails in some containers, ignore */
             }
 
-            // CPU: prefer systeminformation, fallback to last-known (non-blocking)
+            // CPU: 1-min load average as % of capacity. Not identical to a
+            // point-in-time reading, but close enough for a warning threshold —
+            // and it's a syscall, not a subprocess spawn.
             try {
-                const load = await si.currentLoad()
-                this.monitor.cpu = load.currentLoad ?? 0
+                const cores = cpus()?.length || 1
+                this.monitor.cpu = (loadavg()[0] / cores) * 100
             } catch {
-                // Container/restricted env: keep last known, don't block 100ms
+                // Restricted env: keep last known, don't block
                 this.monitor.cpu = this.monitor.cpu || 0
             }
 
@@ -289,9 +295,14 @@ export class MedusaHeart {
             // Most are non-fatal (token expired, DM blocked, unknown message), log and continue.
             // Only bail on genuine runtime crashes.
             const code = e?.code
-            const isDiscordSoft = code === 10008 || code === 10062 || code === 40060 ||
-                                  code === 50001 || code === 50013 || code === 50035 ||
-                                  code === 50007
+            const isDiscordSoft =
+                code === 10008 ||
+                code === 10062 ||
+                code === 40060 ||
+                code === 50001 ||
+                code === 50013 ||
+                code === 50035 ||
+                code === 50007
             if (isDiscordSoft) {
                 console.warn(`[Heart] Soft Discord error (${code}), continuing`)
                 this._stats.errors++

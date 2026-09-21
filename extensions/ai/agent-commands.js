@@ -15,12 +15,7 @@ import {
     TextInputStyle,
 } from 'discord.js'
 import { VisionCore } from './vision.js'
-import {
-    DESTRUCTIVE_CMDS,
-    INT_COUNT_CMDS,
-    SENSITIVE_CMDS,
-    USER_TARGET_CMDS,
-} from './constants.js'
+import { DESTRUCTIVE_CMDS, INT_COUNT_CMDS, SENSITIVE_CMDS, USER_TARGET_CMDS } from './constants.js'
 import { parseWhen } from '../reminders.js'
 
 // Module-scope command metadata: shared by _executeParsedCommands (gates +
@@ -148,7 +143,9 @@ export class AgentCommandCore extends VisionCore {
     // then a live API search for big rosters whose offline members aren't cached).
     // Ambiguous or missing matches return null so the caller asks for a mention.
     async _resolveMemberId(message, raw) {
-        const clean = String(raw ?? '').replace(/[<@!>]/g, '').trim()
+        const clean = String(raw ?? '')
+            .replace(/[<@!>]/g, '')
+            .trim()
         if (/^\d{15,20}$/.test(clean)) return clean
         const guild = message?.guild
         if (!guild) return null
@@ -196,7 +193,10 @@ export class AgentCommandCore extends VisionCore {
         // match: without that, "kick rick" resolves to a "prick" who merely shares
         // letters — the one wrong-direction case that can harm a real user.
         if (lower.length >= 4) {
-            const norm = (s) => String(s ?? '').toLowerCase().replace(/[^a-z0-9]/g, '')
+            const norm = (s) =>
+                String(s ?? '')
+                    .toLowerCase()
+                    .replace(/[^a-z0-9]/g, '')
             const q = qn || norm(lower)
             const levCap = (x, y, cap) => {
                 if (Math.abs(x.length - y.length) > cap) return cap + 1
@@ -237,7 +237,11 @@ export class AgentCommandCore extends VisionCore {
             const list = [...found.values()].filter((m) =>
                 [m.user?.username, m.user?.globalName, m.displayName, m.nickname]
                     .filter(Boolean)
-                    .map((n) => String(n).toLowerCase().replace(/[^a-z0-9]/g, ''))
+                    .map((n) =>
+                        String(n)
+                            .toLowerCase()
+                            .replace(/[^a-z0-9]/g, ''),
+                    )
                     .some((nn) => nn && qn && nn[0] === qn[0]),
             )
             const exactApi = list.filter((m) =>
@@ -299,6 +303,24 @@ export class AgentCommandCore extends VisionCore {
             .setColor(0xef9f27)
             .setFooter({ text: 'Expires in 30s' })
     }
+    // Cancel/expiry paper trail: a declined or expired confirm must leave an
+    // explicit "nothing was executed" record in short-term history. Without
+    // it the model later reconstructs ask → "on it" → user satisfaction as
+    // a completed action ("I already muted Adi" after a cancel).
+    _recordConfirmOutcome(key, message, outcome) {
+        try {
+            const [, cmdName, target] = String(key).split(':')
+            const who = /^\d{15,20}$/.test(target ?? '') ? `<@${target}>` : target || 'that action'
+            const hk = `${message.author.id}-${message.channel.id}`
+            this.messageHistory ??= new Map()
+            const hist = this.messageHistory.get(hk) ?? []
+            hist.push({
+                role: 'assistant',
+                content: `(${cmdName} ${who} was ${outcome} — nothing was executed.)`,
+            })
+            this.messageHistory.set(hk, hist)
+        } catch {}
+    }
     // Collector wiring for an already-posted confirm UI message. Called by
     // chat.js right after the UI send succeeds, so buttons never exist
     // untracked. Single message carries text note + embed + row: it lands
@@ -344,18 +366,28 @@ export class AgentCommandCore extends VisionCore {
                     col.stop()
                     if (!val || Date.now() - val.ts > 30_000) {
                         await i
-                            .update({ content: '⌛ Expired — ask again if you still want it.', embeds: [], components: [] })
+                            .update({
+                                content: '⌛ Expired — ask again if you still want it.',
+                                embeds: [],
+                                components: [],
+                            })
                             .catch(() => {})
+                        this._recordConfirmOutcome(key, message, 'expired')
                         return
                     }
                     this._pendingConfirms.delete(key)
                     if (decision === 'no') {
                         await i.update({ content: 'Cancelled.', embeds: [], components: [] }).catch(() => {})
                         await message.react('❌').catch(() => {})
+                        this._recordConfirmOutcome(key, message, 'cancelled')
                         return
                     }
                     await i
-                        .update({ content: `✅ Confirmed \`${parts[2]}\` — running it now.`, embeds: [], components: [] })
+                        .update({
+                            content: `✅ Confirmed \`${parts[2]}\` — running it now.`,
+                            embeds: [],
+                            components: [],
+                        })
                         .catch(() => {})
                     await this._runConfirmedCommand(key, val, message)
                 } catch (e) {
@@ -553,7 +585,9 @@ export class AgentCommandCore extends VisionCore {
                         const k = (m[1] ?? m[3]).toLowerCase()
                         if (!(k in kv)) kv[k] = m[2] ?? m[4]
                     }
-                    const target = Object.keys(kv).find((k) => /^(user_?id|user|target|recipient|to|id)$/i.test(k))
+                    const target = Object.keys(kv).find((k) =>
+                        /^(user_?id|user|target|recipient|to|id)$/i.test(k),
+                    )
                     const body = Object.keys(kv).find((k) => /^(content|message|msg|text|body)$/i.test(k))
                     if (target && body) argsStr = `${kv[target]} ${kv[body]}`
                 }
@@ -644,9 +678,12 @@ export class AgentCommandCore extends VisionCore {
                     const existing = this._pendingConfirms.get(confirmKey)
                     const now = Date.now()
                     // Confirm-note text, shared by the fresh and refreshed paths below.
-                    const target = cmdName === 'announce'
-                        ? (args[0] ?? '').replace(/^<#(\d{15,20})>$/, '<#$1>')
-                        : args[0] && /^\d{15,20}$/.test(args[0]) ? `<@${args[0]}>` : (args[0] ?? '')
+                    const target =
+                        cmdName === 'announce'
+                            ? (args[0] ?? '').replace(/^<#(\d{15,20})>$/, '<#$1>')
+                            : args[0] && /^\d{15,20}$/.test(args[0])
+                              ? `<@${args[0]}>`
+                              : (args[0] ?? '')
                     const reason = args.slice(1).join(' ')
                     // In-character confirm: the model's own prose stays untouched,
                     // this rides after it (tags stripped below) instead of replacing
@@ -654,8 +691,8 @@ export class AgentCommandCore extends VisionCore {
                     // SAME send as this note (see confirmUI below), so tap-✅ is
                     // always safe to promise: both land together or fail loudly.
                     const closers = [
-                        'say **yes** (or tap ✅) within 30s and it\'s done.',
-                        'yes or no — or tap ✅ / ❌. you\'ve got 30s before i lose interest.',
+                        "say **yes** (or tap ✅) within 30s and it's done.",
+                        "yes or no — or tap ✅ / ❌. you've got 30s before i lose interest.",
                         '**yes** (or ✅) in the next 30s, or it never happened.',
                     ]
                     const noteBase = `you want me to \`${cmdName}\`${target ? ` on ${target}` : ''}${reason ? ` — "${reason}"` : ''}?`
@@ -671,59 +708,72 @@ export class AgentCommandCore extends VisionCore {
                     if (approved) {
                         this._pendingConfirms.delete(confirmKey)
                     } else {
-                    if (existing && now - existing.ts <= 30_000) {
-                        // Same ask while one pends: refresh the stored args (the user
-                        // may have corrected the reason). Update the tracked UI
-                        // message in place when there is one; re-note (with fresh
-                        // buttons only if none were ever posted) at most every 5s
-                        // so rapid repeats don't spam the channel.
-                        existing.args = argsStr
-                        existing.ts = now
-                        if (existing.uiMsg) {
-                            try {
-                                await existing.uiMsg.edit({
-                                    embeds: [this.buildConfirmEmbed(cmdName, targetArg, reason, message.author.id)],
-                                    components: [this.buildConfirmRow(cmdName, targetArg)],
-                                }).catch(() => {})
-                            } catch {}
-                        }
-                        if (!existing.noteTs || now - existing.noteTs > 5000) {
-                            existing.noteTs = now
-                            if (!existing.uiMsg) confirmUI = uiParts()
-                            confirmNote = `🔄 updated — ${noteBase} ${closer}`
-                            console.log(`[AI] Confirmation refreshed for '${cmdName}' by ${message.author.id}`)
-                        }
-                        continue
-                    }
-                    if (!existing || now - existing.ts > 30_000) {
-                        for (const [k] of this._pendingConfirms) {
-                            if (
-                                k.startsWith(`${message.author.id}:${cmdName}:`) &&
-                                now - this._pendingConfirms.get(k).ts > 30_000
-                            ) {
-                                this._pendingConfirms.delete(k)
+                        if (existing && now - existing.ts <= 30_000) {
+                            // Same ask while one pends: refresh the stored args (the user
+                            // may have corrected the reason). Update the tracked UI
+                            // message in place when there is one; re-note (with fresh
+                            // buttons only if none were ever posted) at most every 5s
+                            // so rapid repeats don't spam the channel.
+                            existing.args = argsStr
+                            existing.ts = now
+                            if (existing.uiMsg) {
+                                try {
+                                    await existing.uiMsg
+                                        .edit({
+                                            embeds: [
+                                                this.buildConfirmEmbed(
+                                                    cmdName,
+                                                    targetArg,
+                                                    reason,
+                                                    message.author.id,
+                                                ),
+                                            ],
+                                            components: [this.buildConfirmRow(cmdName, targetArg)],
+                                        })
+                                        .catch(() => {})
+                                } catch {}
                             }
-                        }
-                        // Pre-check: can the bot actually moderate this target?
-                        if (cmdName === 'mute') {
-                            const rawId = args[0]?.replace(/[<@!>]/g, '')
-                            const targetMember = rawId ? message.guild?.members.cache.get(rawId) : null
-                            if (targetMember && !targetMember.moderatable) {
-                                finalResponse = `❌ I can't mute <@${rawId}>, they're above me in the hierarchy.`
-                                continue
+                            if (!existing.noteTs || now - existing.noteTs > 5000) {
+                                existing.noteTs = now
+                                if (!existing.uiMsg) confirmUI = uiParts()
+                                confirmNote = `🔄 updated — ${noteBase} ${closer}`
+                                console.log(
+                                    `[AI] Confirmation refreshed for '${cmdName}' by ${message.author.id}`,
+                                )
                             }
+                            continue
                         }
-                        this._pendingConfirms.set(confirmKey, { ts: now, args: argsStr, noteTs: now })
-                        // Hard expiry respects refreshes via _sweepConfirm (re-arms
-                        // while fresh so abandoned refreshes still GC).
-                        this._sweepConfirm(confirmKey)
-                        confirmNote = `⏳ ${noteBase} ${closer}`
-                        confirmUI = uiParts()
-                        console.log(`[AI] Confirmation requested for '${cmdName}' by ${message.author.id}`)
-                        continue
-                    }
-                    // Has confirmed within 30s, clear and proceed
-                    this._pendingConfirms.delete(confirmKey)
+                        if (!existing || now - existing.ts > 30_000) {
+                            for (const [k] of this._pendingConfirms) {
+                                if (
+                                    k.startsWith(`${message.author.id}:${cmdName}:`) &&
+                                    now - this._pendingConfirms.get(k).ts > 30_000
+                                ) {
+                                    this._pendingConfirms.delete(k)
+                                }
+                            }
+                            // Pre-check: can the bot actually moderate this target?
+                            if (cmdName === 'mute') {
+                                const rawId = args[0]?.replace(/[<@!>]/g, '')
+                                const targetMember = rawId ? message.guild?.members.cache.get(rawId) : null
+                                if (targetMember && !targetMember.moderatable) {
+                                    finalResponse = `❌ I can't mute <@${rawId}>, they're above me in the hierarchy.`
+                                    continue
+                                }
+                            }
+                            this._pendingConfirms.set(confirmKey, { ts: now, args: argsStr, noteTs: now })
+                            // Hard expiry respects refreshes via _sweepConfirm (re-arms
+                            // while fresh so abandoned refreshes still GC).
+                            this._sweepConfirm(confirmKey)
+                            confirmNote = `⏳ ${noteBase} ${closer}`
+                            confirmUI = uiParts()
+                            console.log(
+                                `[AI] Confirmation requested for '${cmdName}' by ${message.author.id}`,
+                            )
+                            continue
+                        }
+                        // Has confirmed within 30s, clear and proceed
+                        this._pendingConfirms.delete(confirmKey)
                     }
                 }
 
@@ -825,14 +875,18 @@ export class AgentCommandCore extends VisionCore {
                                 : message.guild?.channels.cache.find((c) => c.name?.toLowerCase() === name)
                             const body = args.slice(1).join(' ')
                             if (!message.member?.permissions?.has(PermissionFlagsBits.ManageMessages))
-                                finalResponse = "🔑 You need Manage Messages to announce."
+                                finalResponse = '🔑 You need Manage Messages to announce.'
                             else if (!body) finalResponse = '❌ Give me a channel and announcement text.'
-                            else if (!chan) finalResponse = `❌ I couldn't find channel ${rawTarget || '(missing)'}.`
+                            else if (!chan)
+                                finalResponse = `❌ I couldn't find channel ${rawTarget || '(missing)'}.`
                             else if (!chan.isTextBased() || !chan.isSendable())
                                 finalResponse = `❌ #${chan.name} can't accept messages.`
                             else {
                                 const userIds = [...body.matchAll(/<@!?(\d{15,20})>/g)].map((m) => m[1])
-                                await chan.send({ content: body, allowedMentions: { users: [...new Set(userIds)], parse: [] } })
+                                await chan.send({
+                                    content: body,
+                                    allowedMentions: { users: [...new Set(userIds)], parse: [] },
+                                })
                                 executionLogs.push(`📢 Announced to #${chan.name}`)
                             }
                         } else if (cmdName === 'mail') {
@@ -909,6 +963,19 @@ export class AgentCommandCore extends VisionCore {
                     /[^.!?\n]*\b(?:is|are|'re)\b[^.!?\n]*\b(?:muted|banned|kicked|warned|silenced|gagged)\b(?=[^.!?\n]*(?:[.!]|$))[^.!?\n]*/gi,
                     '',
                 )
+                // First-person past-tense claims ("I already muted Adi", "I've
+                // banned tony") with plain names: no mention, no has-been, so
+                // every pattern above misses them. Fiction when !modExecuted.
+                // Colloquial "I warned you"-style prose can catch here too;
+                // the footer below marks it as unverified rather than certain.
+                .replace(
+                    /[^.!?\n]*\bI(?:'ve| have)?\s+already\s+(?:warned|muted|banned|kicked|gagged|silenced|booted)\b[^.!?\n]*[.!?]*/gi,
+                    '',
+                )
+                .replace(
+                    /[^.!?\n]*\bI(?:'ve| have)?\s+(?:warned|muted|banned|kicked|gagged|silenced|booted)\b\s+(?:<@!?\d+>|[A-Z][\w.]{2,}|you|him|her|them)\b[^.!?\n]*[.!?]*/gi,
+                    '',
+                )
                 .replace(/\n{3,}/g, '\n\n')
                 .trim()
             // No footer on the confirm-setup path: the ⏳ note already signals
@@ -929,7 +996,9 @@ export class AgentCommandCore extends VisionCore {
             this._blockedStreaks ??= new Map()
             const prev = this._blockedStreaks.get(message.author.id)
             const count =
-                prev && Date.now() - prev.at < 300_000 ? prev.count + blockedNotes.length : blockedNotes.length
+                prev && Date.now() - prev.at < 300_000
+                    ? prev.count + blockedNotes.length
+                    : blockedNotes.length
             this._blockedStreaks.set(message.author.id, { count, at: Date.now() })
             const list = `\`${[...new Set(blockedNotes)].join('`, `')}\``
             finalResponse +=
