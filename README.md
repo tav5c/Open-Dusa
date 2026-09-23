@@ -356,6 +356,7 @@ Every command below also works with any alias you add to `prefixAliases` in `con
 
 ```
 
+```
 med,p <prompt> - Set a custom AI persona just for you
 med,pr - Reset to default persona
 med,serverp <prompt> - Set a server-wide persona (needs Manage Server)
@@ -375,7 +376,7 @@ med,remind #channel <when> <text> - Fire it in another channel instead
 med,remind every <1d|friday 17:00> <text> - Repeating schedule (weekly UTC, min every 5m, 10 max)
 med,reminders - Embed list with tap-to-cancel buttons | med,delreminder <id> - Cancel one
 
-`````
+```
 
 > [!NOTE]
 > The prefix `remind` command only accepts a duration or ISO datetime as its first token - it doesn't parse natural language. Mention Medusa instead (`@Medusa remind me to... in 20m`) to set one conversationally; she extracts the timing herself and confirms with a real timestamped reminder line, not just a reply.
@@ -564,7 +565,7 @@ Config is file-based (`config.json`) but the bot token can also be passed as an 
 
 ```bash
 TOKEN=your_token_here npm start
-`````
+````
 
 The health server port can be overridden:
 
@@ -681,4 +682,4 @@ This policy may be updated over time; material changes will be reflected in this
 > [!NOTE]
 > MIT - fork it, modify it, ship it. A credit back would be appreciated but isn't required.
 
-Built by [Tav](https://tav5c.github.io/) · Open-sourced as Open-Dusa
+Built by [Tav](https://tav5c.pages.dev/) · Open-sourced as Open-Dusa
