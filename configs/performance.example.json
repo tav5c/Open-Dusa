@@ -36,7 +36,9 @@
     "repliedMsgCacheTTLMin": 10,
     "memoryDepth": 25,
     "passiveBufferMax": 25,
-    "passiveBufferChannelsMax": 500
+    "passiveBufferChannelsMax": 500,
+    "billingStats": false,
+    "fairShare": true
   },
 
   "maintenance": {
