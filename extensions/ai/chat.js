@@ -897,6 +897,8 @@ TIME: ${new Date().toISOString().slice(0, 16)} UTC${personaOwned ? '' : '\nVOICE
         skipResearch = false,
         systemExtra = '',
         userCtx = '',
+        guildId = null,
+        isOwner = false,
     }) {
         if (!this._groq) return null
 
@@ -939,9 +941,14 @@ TIME: ${new Date().toISOString().slice(0, 16)} UTC${personaOwned ? '' : '\nVOICE
 
         if (routing === 'research') {
             const t0 = Date.now()
+            // Stateless calls carry no discord.js message: fair-share gets an
+            // explicit guild (DM/group commands have none) instead of reading
+            // a `message` variable that doesn't exist in this scope
+            // (ReferenceError -> "Failed to generate response" on every
+            // research-flavored /medusa ask, while plain "hi" worked).
             const raw = await this._callResearch(prompt, {
-                guildId: message?.guild?.id,
-                priority: String(message?.author?.id) === String(this.ownerId) || !message?.guild,
+                guildId: guildId ?? 'dm',
+                priority: isOwner || !guildId,
             })
             if (raw) {
                 const { text, sources } = this._parseSources(raw)

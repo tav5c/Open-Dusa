@@ -309,6 +309,8 @@ export async function registerAI(client, db, config) {
                     prompt,
                     forceSearch,
                     skipResearch: skipSearch,
+                    guildId: interaction.guild?.id ?? null,
+                    isOwner,
                 })
                 if (!response)
                     return interaction.editReply({ content: '✗ All providers failed. Try again shortly.' })
@@ -379,6 +381,8 @@ export async function registerAI(client, db, config) {
                         return ''
                     })()}QUICKIE: one fast, precise, well-formatted answer. Lead with the answer, minimal throat-clearing, markdown only where it helps.`,
                     userCtx,
+                    guildId: interaction.guild?.id ?? null,
+                    isOwner,
                 })
                 if (!response)
                     return interaction.editReply({ content: '✗ All providers failed. Try again shortly.' })
