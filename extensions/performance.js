@@ -45,6 +45,8 @@ const DEFAULTS = {
         memoryDepth: 25,
         passiveBufferMax: 25,
         passiveBufferChannelsMax: 500,
+        billingStats: false,
+        fairShare: true,
     },
     maintenance: {
         cleanupIntervalMin: 10,
@@ -89,12 +91,16 @@ export function loadPerformance() {
         // Advise on Node flag mismatches (can't change them at runtime)
         const n = _cached.node ?? {}
         if (n.uvThreadpoolSize && process.env.UV_THREADPOOL_SIZE !== String(n.uvThreadpoolSize)) {
-            console.warn(`[Perf] performance.json wants UV_THREADPOOL_SIZE=${n.uvThreadpoolSize} but process has ${process.env.UV_THREADPOOL_SIZE || 'default(4)'}, set via npm script or env`)
+            console.warn(
+                `[Perf] performance.json wants UV_THREADPOOL_SIZE=${n.uvThreadpoolSize} but process has ${process.env.UV_THREADPOOL_SIZE || 'default(4)'}, set via npm script or env`,
+            )
         }
         if (n.maxOldSpaceSizeMB) {
             const cur = process.execArgv.join(' ') + ' ' + (process.env.NODE_OPTIONS || '')
             if (!cur.includes('--max-old-space-size')) {
-                console.warn(`[Perf] performance.json wants --max-old-space-size=${n.maxOldSpaceSizeMB}MB but it's not set, start with NODE_OPTIONS or npm script`)
+                console.warn(
+                    `[Perf] performance.json wants --max-old-space-size=${n.maxOldSpaceSizeMB}MB but it's not set, start with NODE_OPTIONS or npm script`,
+                )
             }
         }
         console.log('[Perf] Loaded performance.json')
@@ -106,4 +112,6 @@ export function loadPerformance() {
     }
 }
 
-export function getPerf() { return _cached ?? loadPerformance() }
+export function getPerf() {
+    return _cached ?? loadPerformance()
+}

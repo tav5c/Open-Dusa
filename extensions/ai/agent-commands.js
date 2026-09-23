@@ -41,6 +41,7 @@ export const MOD_CMDS = new Set([
     'setnickname',
     'addrole',
     'removerole',
+    'createrole',
 ])
 const VIRTUAL_CMDS = new Set([
     'poll',
@@ -77,6 +78,7 @@ export const CMD_PERMS = {
     setnickname: PermissionFlagsBits.ManageNicknames,
     addrole: PermissionFlagsBits.ManageRoles,
     removerole: PermissionFlagsBits.ManageRoles,
+    createrole: PermissionFlagsBits.ManageRoles,
 }
 // One-line consequence blurbs for confirm embeds: what does what, for what.
 const CONFIRM_CONSEQUENCE = {
@@ -92,6 +94,7 @@ const CONFIRM_CONSEQUENCE = {
     mpurge: "That user's recent messages will be wiped.",
     delchan: 'The channel will be permanently deleted.',
     announce: 'A message will post publicly in that channel.',
+    createrole: 'A new role will be created on this server.',
     mail: 'A private note goes to the bot owner.',
     dm: 'A DM will be sent as the bot.',
 }
@@ -157,14 +160,23 @@ export class AgentCommandCore extends VisionCore {
         }
         if (clean.length < 2) return null
         const lower = clean.toLowerCase()
-        const qn = lower.replace(/[^a-z0-9]/g, '')
+        // Unicode fold: stylized display names ("𝓐𝓭𝓲", "ａｄｉ", "ⒶⒹⒾ")
+        // NFKD-decompose to ASCII so every stage below compares folded forms.
+        // Plain ASCII folds to itself — zero behavior change for normal names.
+        const fold = (s) =>
+            String(s ?? '')
+                .normalize('NFKD')
+                .replace(/[\u0300-\u036f\ufe00-\ufe0f]/g, '')
+                .toLowerCase()
+                .replace(/[^a-z0-9]/g, '')
+        const qn = fold(clean)
         const names = (m) =>
             [m.user?.username, m.user?.globalName, m.displayName, m.nickname]
                 .filter(Boolean)
                 .map((n) => String(n).toLowerCase())
         const cacheMembers = [...(guild.members.cache?.values() ?? [])]
         const exact = cacheMembers.filter((m) =>
-            names(m).some((n) => n === lower || n.replace(/^@/, '') === lower),
+            names(m).some((n) => n === lower || n.replace(/^@/, '') === lower || (qn && fold(n) === qn)),
         )
         if (exact.length === 1) return exact[0].id
         if (exact.length > 1) return null
@@ -177,6 +189,16 @@ export class AgentCommandCore extends VisionCore {
                 while (i !== -1) {
                     if (i === 0 || !/[a-z0-9]/.test(s[i - 1])) return true
                     i = s.indexOf(lower, i + 1)
+                }
+                // Folded retry: stylized names ("𝓐𝓭𝓲") never contain the raw
+                // query, but their ASCII fold does. Same word-start guard.
+                if (qn) {
+                    const f = fold(n)
+                    let j = f.indexOf(qn)
+                    while (j !== -1) {
+                        if (j === 0 || !/[a-z0-9]/.test(f[j - 1])) return true
+                        j = f.indexOf(qn, j + 1)
+                    }
                 }
                 return false
             }),
@@ -193,10 +215,7 @@ export class AgentCommandCore extends VisionCore {
         // match: without that, "kick rick" resolves to a "prick" who merely shares
         // letters — the one wrong-direction case that can harm a real user.
         if (lower.length >= 4) {
-            const norm = (s) =>
-                String(s ?? '')
-                    .toLowerCase()
-                    .replace(/[^a-z0-9]/g, '')
+            const norm = (s) => fold(s ?? '')
             const q = qn || norm(lower)
             const levCap = (x, y, cap) => {
                 if (Math.abs(x.length - y.length) > cap) return cap + 1
@@ -237,11 +256,7 @@ export class AgentCommandCore extends VisionCore {
             const list = [...found.values()].filter((m) =>
                 [m.user?.username, m.user?.globalName, m.displayName, m.nickname]
                     .filter(Boolean)
-                    .map((n) =>
-                        String(n)
-                            .toLowerCase()
-                            .replace(/[^a-z0-9]/g, ''),
-                    )
+                    .map((n) => fold(n))
                     .some((nn) => nn && qn && nn[0] === qn[0]),
             )
             const exactApi = list.filter((m) =>

@@ -69,18 +69,24 @@ function getTs() {
 const origLog = console.log,
     origError = console.error,
     origWarn = console.warn
-console.log = (...a) => origLog(`${clr.cyan}${getTs()}${clr.reset}`, ...a)
-console.warn = (...a) => origWarn(`${clr.light_yellow}${getTs()} [WARN]${clr.reset}`, ...a)
+// Production log level: LOG_LEVEL=error|warn|info|debug (default info).
+// Errors always surface; warn/info gate by level; console.debug is added
+// for noisy diagnostics. Zero per-call cost beyond a map lookup.
+const LOG_LEVEL = (process.env.LOG_LEVEL ?? 'info').toLowerCase()
+const _LVL = { error: 0, warn: 1, info: 2, debug: 3 }
+const _showLvl = (l) => globalThis._medusaDebug === true || (_LVL[l] ?? 2) <= (_LVL[LOG_LEVEL] ?? 2)
+console.log = (...a) => {
+    if (_showLvl('info')) origLog(`${clr.cyan}${getTs()}${clr.reset}`, ...a)
+}
+console.warn = (...a) => {
+    if (_showLvl('warn')) origWarn(`${clr.light_yellow}${getTs()} [WARN]${clr.reset}`, ...a)
+}
+console.debug = (...a) => {
+    if (_showLvl('debug')) origLog(`${clr.cyan}${getTs()} [DEBUG]${clr.reset}`, ...a)
+}
 console.error = (...a) => {
     const m = typeof a[0] === 'string' ? a[0] : a[0]?.message || a[0]?.code || String(a[0])
-    if (
-        m &&
-        (m.includes('No libpcap provider') ||
-            m.includes('UND_ERR_HEADERS_TIMEOUT') ||
-            m.includes('Headers Timeout'))
-    )
-        return
-    if (a[1]?.code === 'UND_ERR_HEADERS_TIMEOUT') return
+    if (m && m.includes('No libpcap provider')) return
     const allArgs = a.map((x) => (typeof x === 'string' ? x : x?.message || x?.code || String(x))).join(' ')
     if (allArgs.includes('521') || allArgs.includes('Unexpected server response')) return
     origError(`${clr.light_red}${getTs()} [ERROR]${clr.reset}`, ...a)
@@ -117,54 +123,55 @@ try {
     console.error('[Boot] data/ migration failed:', e.message)
 }
 while (true) {
-try {
-    await loadSqlite()
-    mkdirSync('data/logs', { recursive: true })
-    db = openDb('data/logs/medusa.db')
-    // Wait up to 10s on locks BEFORE any lock-taking pragma, so an overlapping
-    // restart blocks briefly instead of failing with "database is locked".
-    db.pragma('busy_timeout = 10000')
-    db.pragma('locking_mode = EXCLUSIVE')
     try {
-        db.pragma('journal_mode = WAL')
-    } catch (e) {
-        console.warn(`[DB] WAL mode fallback: ${e.message}`)
-    }
-    db.pragma('synchronous = NORMAL')
-    db.pragma('temp_store = MEMORY')
-    db.pragma(`journal_size_limit = ${PERF.sqlite.journalSizeLimit}`)
-    try {
-        db.pragma(`mmap_size = ${PERF.sqlite.mmapSizeBytes}`)
-    } catch (e) {}
-    db.pragma(`cache_size = -${PERF.sqlite.cacheSizeKB}`)
-    db.pragma(`wal_autocheckpoint = ${PERF.sqlite.walAutocheckpoint}`)
-
-
-    let _vacuumEligible = false
-    setInterval(() => {
+        await loadSqlite()
+        mkdirSync('data/logs', { recursive: true })
+        db = openDb('data/logs/medusa.db')
+        // Wait up to 10s on locks BEFORE any lock-taking pragma, so an overlapping
+        // restart blocks briefly instead of failing with "database is locked".
+        db.pragma('busy_timeout = 10000')
+        db.pragma('locking_mode = EXCLUSIVE')
         try {
-            if (!db.open) return
-            db.pragma('wal_checkpoint(TRUNCATE)')
-            // Prune old mod logs and resolved warnings monthly
-            const cutoff = new Date(Date.now() - 180 * 86400000).toISOString().slice(0, 10)
-            const r1 = db.prepare('DELETE FROM mod_logs WHERE timestamp < ?').run(cutoff)
-            const r2 = db.prepare('DELETE FROM warnings WHERE active = FALSE AND timestamp < ?').run(cutoff)
-            const r3 = db
-                .prepare(
-                    'DELETE FROM server_data WHERE guild_id NOT IN (SELECT DISTINCT guild_id FROM mod_logs UNION SELECT DISTINCT guild_id FROM warnings)',
-                )
-                .run()
-            const deleted = (r1.changes ?? 0) + (r2.changes ?? 0) + (r3.changes ?? 0)
-            if (deleted > 100) _vacuumEligible = true
-            // Only pay the VACUUM cost when a real amount of data was actually removed
-            if (_vacuumEligible) {
-                db.prepare('VACUUM').run()
-                _vacuumEligible = false
-            }
-        } catch {}
-    }, 300_000).unref()
+            db.pragma('journal_mode = WAL')
+        } catch (e) {
+            console.warn(`[DB] WAL mode fallback: ${e.message}`)
+        }
+        db.pragma('synchronous = NORMAL')
+        db.pragma('temp_store = MEMORY')
+        db.pragma(`journal_size_limit = ${PERF.sqlite.journalSizeLimit}`)
+        try {
+            db.pragma(`mmap_size = ${PERF.sqlite.mmapSizeBytes}`)
+        } catch (e) {}
+        db.pragma(`cache_size = -${PERF.sqlite.cacheSizeKB}`)
+        db.pragma(`wal_autocheckpoint = ${PERF.sqlite.walAutocheckpoint}`)
 
-    db.exec(`
+        let _vacuumEligible = false
+        setInterval(() => {
+            try {
+                if (!db.open) return
+                db.pragma('wal_checkpoint(TRUNCATE)')
+                // Prune old mod logs and resolved warnings monthly
+                const cutoff = new Date(Date.now() - 180 * 86400000).toISOString().slice(0, 10)
+                const r1 = db.prepare('DELETE FROM mod_logs WHERE timestamp < ?').run(cutoff)
+                const r2 = db
+                    .prepare('DELETE FROM warnings WHERE active = FALSE AND timestamp < ?')
+                    .run(cutoff)
+                const r3 = db
+                    .prepare(
+                        'DELETE FROM server_data WHERE guild_id NOT IN (SELECT DISTINCT guild_id FROM mod_logs UNION SELECT DISTINCT guild_id FROM warnings)',
+                    )
+                    .run()
+                const deleted = (r1.changes ?? 0) + (r2.changes ?? 0) + (r3.changes ?? 0)
+                if (deleted > 100) _vacuumEligible = true
+                // Only pay the VACUUM cost when a real amount of data was actually removed
+                if (_vacuumEligible) {
+                    db.prepare('VACUUM').run()
+                    _vacuumEligible = false
+                }
+            } catch {}
+        }, 300_000).unref()
+
+        db.exec(`
         CREATE TABLE IF NOT EXISTS mod_logs (
             id INTEGER PRIMARY KEY AUTOINCREMENT,
             guild_id INTEGER, user_id INTEGER, moderator_id INTEGER,
@@ -187,24 +194,24 @@ try {
         CREATE INDEX IF NOT EXISTS idx_mod_logs_g  ON mod_logs(guild_id);
         CREATE INDEX IF NOT EXISTS idx_mod_logs_gu ON mod_logs(guild_id, user_id);
     `)
-    console.log('[DB] SQLite WAL initialized')
-    break
-} catch (e) {
-    if (/locked/i.test(e.message) && _dbAttempt < 3) {
-        _dbAttempt++
-        console.warn(
-            `[DB] Database locked (previous instance still shutting down?), retry ${_dbAttempt}/3 in 3s`,
-        )
-        try {
-            db?.close?.()
-        } catch {}
-        await new Promise((resolve) => setTimeout(resolve, 3000))
-        continue
+        console.log('[DB] SQLite WAL initialized')
+        break
+    } catch (e) {
+        if (/locked/i.test(e.message) && _dbAttempt < 3) {
+            _dbAttempt++
+            console.warn(
+                `[DB] Database locked (previous instance still shutting down?), retry ${_dbAttempt}/3 in 3s`,
+            )
+            try {
+                db?.close?.()
+            } catch {}
+            await new Promise((resolve) => setTimeout(resolve, 3000))
+            continue
+        }
+        console.error('[DB] better-sqlite3 unavailable:', e.message)
+        db = { prepare: () => ({ run: () => {}, get: () => null, all: () => [] }), exec: () => {} }
+        break
     }
-    console.error('[DB] better-sqlite3 unavailable:', e.message)
-    db = { prepare: () => ({ run: () => {}, get: () => null, all: () => [] }), exec: () => {} }
-    break
-}
 }
 
 // Client
@@ -566,16 +573,10 @@ async function cmdMenu(ctx) {
 // Slash command definitions
 const SLASH_CMDS = [
     // Server-only utility commands, the profile pair below covers DMs
+    new SlashCommandBuilder().setName('ping').setDescription('Check latency').setContexts(0),
+    new SlashCommandBuilder().setName('stats').setDescription('Live performance stats').setContexts(0),
     new SlashCommandBuilder()
-        .setName('ping')
-        .setDescription('Check latency')
-        .setContexts(0),
-    new SlashCommandBuilder()
-        .setName('stats')
-        .setDescription('Live performance stats')
-        .setContexts(0),
-    new SlashCommandBuilder()
-        .setName('av')
+        .setName('avatar')
         .setDescription("User's server avatar")
         .setContexts(0)
         .addUserOption((o) => o.setName('member').setDescription('Target user')),
@@ -587,12 +588,12 @@ const SLASH_CMDS = [
         .setContexts(0, 1, 2)
         .addUserOption((o) => o.setName('member').setDescription('Target user')),
     new SlashCommandBuilder()
-        .setName('bn')
+        .setName('banner')
         .setDescription("User's server banner")
         .setContexts(0)
         .addUserOption((o) => o.setName('member').setDescription('Target user')),
     new SlashCommandBuilder()
-        .setName('mbn')
+        .setName('mbanner')
         .setDescription("User's main profile banner")
         .setIntegrationTypes(0, 1)
         .setContexts(0, 1, 2)
@@ -672,7 +673,9 @@ const SLASH_CMDS = [
             o.setName('user').setDescription('The member whose messages get wiped').setRequired(true),
         )
         .addBooleanOption((o) =>
-            o.setName('everywhere').setDescription('Go through every channel in the server, not just this one'),
+            o
+                .setName('everywhere')
+                .setDescription('Go through every channel in the server, not just this one'),
         )
         .addStringOption((o) =>
             o.setName('start-from').setDescription('Message ID or link to start wiping from'),
@@ -683,11 +686,11 @@ const SLASH_CMDS = [
         .setDescription('Hunt down and delete recent messages that contain a word or phrase')
         .setContexts(0)
         .addStringOption((o) =>
-            o.setName('text').setDescription('The word or phrase to look for (optional if you set other filters)'),
+            o
+                .setName('text')
+                .setDescription('The word or phrase to look for (optional if you set other filters)'),
         )
-        .addUserOption((o) =>
-            o.setName('user').setDescription('Only delete messages sent by this member'),
-        )
+        .addUserOption((o) => o.setName('user').setDescription('Only delete messages sent by this member'))
         .addIntegerOption((o) =>
             o
                 .setName('scan')
@@ -696,7 +699,9 @@ const SLASH_CMDS = [
                 .setMaxValue(500),
         )
         .addBooleanOption((o) =>
-            o.setName('exact').setDescription('Only delete perfect matches, not anything that contains the text'),
+            o
+                .setName('exact')
+                .setDescription('Only delete perfect matches, not anything that contains the text'),
         )
         .addStringOption((o) =>
             o.setName('start-from').setDescription('Message ID or link where the sweep starts (newest end)'),
@@ -736,8 +741,11 @@ for (const [name, ext] of client.extensions) {
 }
 
 addCmd('av', (msg, args) => cmdAv(msg, args))
+addCmd('avatar', (msg, args) => cmdAv(msg, args))
 addCmd('bn', (msg, args) => cmdBn(msg, args))
+addCmd('banner', (msg, args) => cmdBn(msg, args))
 addCmd('mbn', (msg, args) => cmdMbn(msg, args))
+addCmd('mbanner', (msg, args) => cmdMbn(msg, args))
 addCmd('mav', (msg, args) => cmdMav(msg, args))
 addCmd('ping', (msg) => cmdPing(msg))
 addCmd('stats', (msg) => cmdStats(msg))
@@ -920,6 +928,28 @@ addCmd('listroles', async (msg) => {
         .slice(0, 30)
     await msg.reply(`🎭 **Server Roles:**\n${roles.join(', ')}`)
 })
+addCmd('createrole', async (msg, args) => {
+    if (!msg.member.permissions.has(PermissionFlagsBits.ManageRoles)) return
+    // Split a trailing hex color off the name when present.
+    let roleName = args.join(' ').trim()
+    let color = null
+    const colorMatch = roleName.match(/^(.*?)\s+#?([0-9a-f]{6})$/i)
+    if (colorMatch) {
+        roleName = colorMatch[1].trim()
+        color = `#${colorMatch[2]}`
+    }
+    if (!roleName) return msg.reply('❌ Give the role a name: `createrole <name> [#hexcolor]`.')
+    try {
+        const role = await msg.guild.roles.create({
+            name: roleName.slice(0, 100),
+            ...(color ? { color } : {}),
+            reason: `Created by ${msg.author.tag} via Medusa`,
+        })
+        await msg.reply(`✅ Created role ${role} (${role.name}).`)
+    } catch (e) {
+        await msg.reply(`❌ Failed: ${e.message}`)
+    }
+})
 
 client.once('clientReady', async () => {
     try {
@@ -928,7 +958,9 @@ client.once('clientReady', async () => {
         const owner = client.application.owner.owner
             ? client.application.owner.owner.user
             : client.application.owner
-        console.log(`[System] Medusa is live. Owner: ${owner.tag || owner.username}`)
+        console.log(
+            `[System] Medusa is live. Owner: ${config.ownerName || owner.tag || owner.username} (app by ${owner.tag || owner.username})`,
+        )
     } catch (e) {
         console.error('[System] Failed to fetch application info:', e)
     }
@@ -1001,7 +1033,7 @@ client.once('clientReady', async () => {
     } catch {}
 
     console.log(
-        `\n  ⛧ MEDUSA ⛧\n  Logged as: ${client.user.tag}\n  Prefix: ${PREFIX}\n  Servers: ${client.guilds.cache.size}\n`,
+        `\n  ⛧ MEDUSA ⛧\n  Logged as: ${client.user.tag}\n  Prefix: ${PREFIX}\n  Servers: ${client.guilds.cache.size} (${config.guildIds.length} in scope)\n`,
     )
 })
 
@@ -1030,7 +1062,7 @@ client.on('interactionCreate', async (interaction) => {
     if (commandName === 'ping') return cmdPing(interaction)
     if (commandName === 'stats') return cmdStats(interaction)
     if (commandName === 'menu') return cmdMenu(interaction)
-    if (commandName === 'av')
+    if (commandName === 'avatar' || commandName === 'av')
         return cmdAv(
             interaction,
             interaction.options.getMember('member') ??
@@ -1046,7 +1078,7 @@ client.on('interactionCreate', async (interaction) => {
                 interaction.member ??
                 interaction.user,
         )
-    if (commandName === 'bn')
+    if (commandName === 'banner' || commandName === 'bn')
         return cmdBn(
             interaction,
             interaction.options.getMember('member') ??
@@ -1054,7 +1086,7 @@ client.on('interactionCreate', async (interaction) => {
                 interaction.member ??
                 interaction.user,
         )
-    if (commandName === 'mbn')
+    if (commandName === 'mbanner' || commandName === 'mbn')
         return cmdMbn(
             interaction,
             interaction.options.getMember('member') ??

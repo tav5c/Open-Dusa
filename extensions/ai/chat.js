@@ -9,8 +9,16 @@ import {
     StringSelectMenuBuilder,
     StringSelectMenuOptionBuilder,
 } from 'discord.js'
-import { existsSync, readFileSync, readdirSync, renameSync } from 'fs'
-import { mkdir, writeFile } from 'fs/promises'
+import {
+    existsSync,
+    mkdirSync,
+    readFileSync,
+    readdirSync,
+    renameSync,
+    rmSync,
+    unlinkSync,
+    writeFileSync,
+} from 'fs'
 import { LRUCache } from 'lru-cache'
 import { join } from 'path'
 import { performance } from 'perf_hooks'
@@ -24,11 +32,71 @@ import {
     makeIdSet,
 } from './constants.js'
 import { AIMemoryManager, GhostUsers } from './memory.js'
+import { FairQueue, estTokens } from './fairqueue.js'
+import { getLocalTimeLine, getSavedTimezone, lookupLocation, saveUserTimezone } from '../timezones.js'
 import { MOD_CMDS, CMD_PERMS } from './agent-commands.js'
 import { OutputCore } from './output.js'
 import { SAFETY_POLICY, claimsWrongIdentity, containsDisallowedHate, safetyRefusal } from './safety.js'
 
 const PERF = loadPerformance()
+
+// Pure migration: legacy split user files -> merged {users, servers} shape.
+// loadFn(path, fallback) abstracts disk for tests. Ghost scopes "gid:uid"
+// fold into users[uid].ghost[gid].
+export function migrateLegacyUsers(loadFn) {
+    const out = { users: {}, servers: {} }
+    const modes = loadFn('data/ai/user_modes.json', {})
+    const prompts = loadFn('data/ai/custom_prompts.json', {})
+    const servers = loadFn('data/ai/server_prompts.json', {})
+    const ghosts = loadFn('data/ai/ghost_users.json', {})
+    for (const [uid, v] of Object.entries(modes ?? {})) (out.users[uid] ??= {}).mode = v
+    for (const [uid, v] of Object.entries(prompts ?? {})) (out.users[uid] ??= {}).prompt = v
+    for (const [scope, tids] of Object.entries(ghosts ?? {})) {
+        const i = String(scope).lastIndexOf(':')
+        if (i < 0 || !Array.isArray(tids)) continue
+        const gid = scope.slice(0, i)
+        const uid = scope.slice(i + 1)
+        ;((out.users[uid] ??= {}).ghost ??= {})[gid] = tids
+    }
+    for (const [gid, p] of Object.entries(servers ?? {})) (out.servers[gid] ??= {}).persona = p
+    return out
+}
+
+// Pure merge for the users file: live maps win per-key, but entries that
+// only exist in the previous file content survive (migration boots,
+// mid-hydration saves). Returns { users, servers }.
+export function mergeUsersData(prevU, prevS, maps, pruneAbsent = false) {
+    const users = {}
+    const ids = new Set([
+        ...Object.keys(prevU ?? {}),
+        ...Object.keys(maps.userModes ?? {}),
+        ...Object.keys(maps.customPrompts ?? {}),
+        ...Object.keys(maps.userStreams ?? {}),
+        ...Object.keys(maps.userMemory ?? {}),
+    ])
+    for (const uid of ids) {
+        const entry = { ...(prevU?.[uid] ?? {}) }
+        if (maps.userModes?.[uid] !== undefined) entry.mode = maps.userModes[uid]
+        else if (pruneAbsent) delete entry.mode
+        if (typeof maps.customPrompts?.[uid] === 'string') entry.prompt = maps.customPrompts[uid]
+        else if (pruneAbsent) delete entry.prompt
+        if (maps.userStreams?.[uid] !== undefined) entry.stream = maps.userStreams[uid]
+        else if (pruneAbsent) delete entry.stream
+        if (maps.userMemory?.[uid] !== undefined) entry.memory = maps.userMemory[uid]
+        else if (pruneAbsent) delete entry.memory
+        const g = entry.ghost
+        if (!g || !Object.keys(g).length) delete entry.ghost
+        if (Object.keys(entry).length) users[uid] = entry
+    }
+    const servers = {}
+    const gids = new Set([...Object.keys(prevS ?? {}), ...Object.keys(maps.serverPrompts ?? {})])
+    for (const gid of gids) {
+        const p = maps.serverPrompts?.[gid]
+        const persona = typeof p === 'string' && p ? p : prevS?.[gid]?.persona
+        if (typeof persona === 'string' && persona) servers[gid] = { persona }
+    }
+    return { users, servers }
+}
 
 // Destructive verbs whose RUN_CMD tags must never stream raw to the channel.
 // Built from the shared DESTRUCTIVE_CMDS set (+warn, whose instant embed would
@@ -51,6 +119,7 @@ export class AIChatManager extends OutputCore {
         this.researchModel = agents.research.model
         this.visionModel = agents.vision.model
         this.classifierModel = agents.classifier.model
+        this.classifierTokens = agents.classifier.maxTokens ?? 64
         // Per-agent fallback chains (config agents.*.fallbacks, plus legacy
         // top-level fallbackModels merged into chat). Each entry carries its own
         // provider, so a dead provider/model is walked past, never retried.
@@ -98,6 +167,18 @@ export class AIChatManager extends OutputCore {
         this.llmBaseUrl = agents.chat.resolved.baseUrl
         this.ownerId = config.ownerId
         this.ownerName = config.ownerName
+        // Debug mode: owner-only replies, no passive buffering, prod DBs
+        // untouched (ephemeral scratch DB, wiped below + on enable), verbose
+        // logging via globalThis._medusaDebug. Hot-toggleable at runtime with
+        // no reboot — every gate below reads live state.
+        this.debugMode = config.debug === true
+        globalThis._medusaDebug = this.debugMode
+        if (this.debugMode) {
+            try {
+                rmSync('data/ai/debug - debug', { recursive: true, force: true })
+            } catch {}
+            console.warn('[AI] DEBUG MODE is ON at boot — owner-only, scratch DB, no passive buffering')
+        }
         this.currentKeyIdx = 0
         this.deadKeys = new Set()
         this.keyFailures = {}
@@ -116,8 +197,12 @@ export class AIChatManager extends OutputCore {
         this.responseCache = new LRUCache({
             max: P.responseCacheMax,
             ttl: P.responseCacheTTLSec * 1000,
-            updateAgeOnGet: true,
-            allowStale: true,
+            // updateAgeOnGet:false + allowStale:false — TTL means TTL. The old
+            // true/true combo is documented by lru-cache as "causing it to not
+            // expire", pinning stale (even pre-persona-swap) replies forever on
+            // repeated prompts.
+            updateAgeOnGet: false,
+            allowStale: false,
             maxSize: P.responseCacheMaxMB * 1024 * 1024,
             sizeCalculation: (value) => (typeof value === 'string' ? value.length : 1024),
         })
@@ -147,13 +232,76 @@ export class AIChatManager extends OutputCore {
         this.globalMem = new AIMemoryManager()
         this.isolatedMems = new Map()
 
-        // Custom prompts / modes
-        this.customPrompts = this._loadJSON('data/ai/custom_prompts.json', {})
-        this.serverPrompts = this._loadJSON('data/ai/server_prompts.json', {})
-        this.userModes = this._loadJSON('data/ai/user_modes.json', {})
+        // Single user-data file: per-user mode/prompt/stream/ghost prefs plus
+        // per-server personas. Migrates the legacy split files once (modes,
+        // custom prompts, server prompts, ghost list), then never touches
+        // them again. Sparse: absent keys simply mean defaults.
+        this.userData = null
+        const loaded = this._loadUsersFile()
+        if (loaded.status === 'ok') {
+            this.userData = loaded.data
+        } else {
+            if (loaded.status === 'corrupt') {
+                // Preserve the evidence and, critically, do NOT treat this as
+                // a first boot: legacy files (if any survive) are still a
+                // better source than an empty object.
+                const bak = `data/ai/medusa-users.json.corrupt.${Date.now()}`
+                try {
+                    renameSync('data/ai/medusa-users.json', bak)
+                    console.warn(
+                        `[AI] medusa-users.json unreadable, preserved as ${bak} — attempting legacy recovery`,
+                    )
+                } catch {}
+            }
+            this.userData = migrateLegacyUsers((p, fb) => this._loadJSON(p, fb))
+            // Gate legacy deletion on a verified write: if persisting fails
+            // (ENOSPC, read-only mount), the legacy files are the only copy
+            // left and must survive for the next boot to retry.
+            if (this._saveUsersNow()) {
+                for (const f of [
+                    'data/ai/user_modes.json',
+                    'data/ai/custom_prompts.json',
+                    'data/ai/server_prompts.json',
+                    'data/ai/ghost_users.json',
+                ])
+                    try {
+                        unlinkSync(f)
+                    } catch {}
+            } else {
+                console.warn('[AI] Migration save failed — legacy files kept, will retry next boot')
+            }
+        }
+        this.userData.users ??= {}
+        this.userData.servers ??= {}
+        console.log(
+            `[AI] User prefs loaded: ${Object.keys(this.userData.users).length} user(s), ${Object.keys(this.userData.servers).length} server(s)`,
+        )
+        // Working maps hydrated from the file (kept as the live structures;
+        // _saveUsersNow serializes everything back on change).
+        this.customPrompts = {}
+        this.serverPrompts = {}
+        this.userModes = {}
+        this.userStreams = {}
+        this.userMemory = {}
+        for (const [uid, u] of Object.entries(this.userData.users)) {
+            if (u?.mode !== undefined) this.userModes[uid] = u.mode
+            if (typeof u?.prompt === 'string') this.customPrompts[uid] = u.prompt
+            if (u?.stream !== undefined) this.userStreams[uid] = u.stream
+            if (u?.memory !== undefined) this.userMemory[uid] = u.memory
+        }
+        for (const [gid, s] of Object.entries(this.userData.servers)) {
+            if (typeof s?.persona === 'string') this.serverPrompts[gid] = s.persona
+        }
+        // From here on the working maps mirror the file, so saves may prune
+        // keys deleted from the maps (prompt wipes, stream resets). Before
+        // this flag, saves preserve everything (migration boots).
+        this._usersHydrated = true
 
         // Ghost users
-        this.ghost = new GhostUsers()
+        this.ghost = new GhostUsers(
+            () => (this.userData.users ??= {}),
+            () => this._scheduleUsersSave(),
+        )
 
         // Stats
         this.totalRequests = 0
@@ -192,17 +340,88 @@ export class AIChatManager extends OutputCore {
         try {
             if (!existsSync(path)) return fallback
             const raw = readFileSync(path, 'utf8')
-            return JSON.parse(raw.replace(/\b(\d{15,})\b/g, '"$1"'))
+            // Lookarounds: only quote bare digit runs, never ones already
+            // inside strings (legacy files may hold unquoted snowflakes).
+            return JSON.parse(raw.replace(/(?<!")\b(\d{15,})\b(?!")/g, '"$1"'))
         } catch {}
         return fallback
     }
-    async _saveJSON(path, data) {
+    // Single-file persist for all user/server prefs (modes, prompts, streams,
+    // ghosts, server personas). Debounced: coalesces rapid bursts.
+    _scheduleUsersSave() {
+        if (this._usersSaveTimer) clearTimeout(this._usersSaveTimer)
+        this._usersSaveTimer = setTimeout(() => {
+            this._usersSaveTimer = null
+            this._saveUsersNow()
+        }, 500)
+    }
+    _saveUsersNow() {
+        // Merge, never blind-overwrite: live maps win per-key, but entries
+        // that only exist in the previous file content (e.g. just migrated
+        // modes/prompts/personas before the working maps hydrated) survive.
+        // The old map-only version wiped the file to {"users":{}} on
+        // migration boots when the maps weren't hydrated yet.
+        // Returns success so callers (migration) can gate destructive steps.
+        // Atomic via tmp+rename: a kill mid-write can never leave a truncated
+        // 34-byte file behind for the next boot to "migrate" from.
         try {
-            await mkdir(path.split('/').slice(0, -1).join('/'), { recursive: true })
-            await writeFile(path, JSON.stringify(data, null, 2))
-        } catch {}
+            const merged = mergeUsersData(
+                this.userData?.users,
+                this.userData?.servers,
+                this,
+                this._usersHydrated === true,
+            )
+            // Clobber guard: never replace a non-empty file with an empty one.
+            // Whatever emptied the maps, a 34-byte write over real prefs is
+            // unrecoverable (legacy files are gone post-migration). Log loud,
+            // keep the old file.
+            const prevCount =
+                Object.keys(this.userData?.users ?? {}).length +
+                Object.keys(this.userData?.servers ?? {}).length
+            const nextCount = Object.keys(merged.users).length + Object.keys(merged.servers).length
+            if (prevCount > 0 && nextCount === 0) {
+                console.warn('[AI] Refusing to overwrite medusa-users.json with empty content (prefs kept)')
+                return false
+            }
+            this.userData = merged
+            mkdirSync('data/ai', { recursive: true })
+            const tmp = `data/ai/medusa-users.json.tmp.${process.pid}`
+            writeFileSync(tmp, JSON.stringify(this.userData, null, 2))
+            renameSync(tmp, 'data/ai/medusa-users.json')
+            return true
+        } catch (e) {
+            console.warn('[AI] Failed to persist medusa-users.json:', String(e?.message ?? e).slice(0, 120))
+            return false
+        }
+    }
+    // Load the prefs file distinguishing MISSING (first boot / fresh) from
+    // CORRUPT (truncated write, bad byte). The generic _loadJSON collapses
+    // both to `fallback`, which made every corrupt read look like a first
+    // boot and re-ran migration over deleted legacy files -> empty forever.
+    _loadUsersFile() {
+        const p = 'data/ai/medusa-users.json'
+        try {
+            if (!existsSync(p)) return { status: 'missing', data: null }
+            const raw = readFileSync(p, 'utf8')
+            // Plain parse, NO digit-quoting regex: this file is app-authored
+            // (JSON.stringify output), so snowflake keys are already quoted.
+            // The old regex wrapped them in a second pair of quotes, making
+            // every boot after the first real pref misdiagnose a valid file
+            // as corrupt and "recover" to empty.
+            const data = JSON.parse(raw)
+            if (!data || typeof data !== 'object') return { status: 'corrupt', data: null }
+            return { status: 'ok', data }
+        } catch {
+            return { status: existsSync(p) ? 'corrupt' : 'missing', data: null }
+        }
     }
     getMem(guild) {
+        // Debug mode: everything routes to an ephemeral scratch DB (wiped on
+        // boot, wiped on enable) so no prod memory is read or written.
+        if (this.debugMode) {
+            this._debugMem ??= new AIMemoryManager('debug', 'debug')
+            return this._debugMem
+        }
         if (!guild || !this.isolatedServers.has(guild.id)) return this.globalMem
         if (!this.isolatedMems.has(guild.id)) {
             this._resolveAndSync(guild)
@@ -313,20 +532,29 @@ export class AIChatManager extends OutputCore {
         // Identity facts (creator, links) survive every persona swap, personas change her
         // tune, not who she is. The safety policy rides along everywhere and stays
         // non-overridable. Persona precedence: user custom > server persona > default.
+        // Modes layer ON TOP of whichever persona won (they tune delivery, and since
+        // this change they carry the character instead of replacing it).
         const identity = this.identity ? `\n\n[IDENTITY, always true, in any persona] ${this.identity}` : ''
         const base = `${this.instructions}${identity}\n\n${SAFETY_POLICY}`
-        if (!userId) return base
-        if (this.userModes[userId] === 1)
-            return `${base}\n\n[USER STYLE] Focused mode: highly analytical, concise, direct, task-oriented, professional but personable, and minimal emoji.`
-        // Custom personas REPLACE the default tune instead of trailing it as a style note -
-        // the huge base persona swallows short prompts like "tsundere" whole.
-        const custom = this.customPrompts[userId]
-        if (custom && !containsDisallowedHate(custom, { persona: true }))
-            return `You are Medusa. This user gave you a custom persona, adopt it fully when talking to them:\n\n[USER PERSONA] ${custom}${identity}\n\n${SAFETY_POLICY}`
-        const server = guildId ? this.serverPrompts[guildId] : null
-        if (server && !containsDisallowedHate(server, { persona: true }))
-            return `You are Medusa. This server runs its own persona, adopt it fully here:\n\n[SERVER PERSONA] ${server}${identity}\n\n${SAFETY_POLICY}`
-        return base
+        let out = base
+        if (userId) {
+            // Custom personas REPLACE the default tune instead of trailing it as a style note -
+            // the huge base persona swallows short prompts like "tsundere" whole.
+            const custom = this.customPrompts[userId]
+            if (custom && !containsDisallowedHate(custom, { persona: true }))
+                out = `You are Medusa. This user gave you a custom persona, adopt it fully when talking to them:\n\n[USER PERSONA] ${custom}${identity}\n\n${SAFETY_POLICY}`
+            else {
+                const server = guildId ? this.serverPrompts[guildId] : null
+                if (server && !containsDisallowedHate(server, { persona: true }))
+                    out = `You are Medusa. This server runs its own persona, adopt it fully here:\n\n[SERVER PERSONA] ${server}${identity}\n\n${SAFETY_POLICY}`
+            }
+            const mode = this.userModes[userId] ?? 0
+            if (mode === 1)
+                out += `\n\n[USER STYLE] Focused mode: highly analytical, concise, direct, task-oriented, professional but personable, and minimal emoji — in this character's voice, not instead of it.`
+            else if (mode === 2)
+                out += `\n\n[USER STYLE] Fast mode: ultrashort replies, answer in as few words as possible while staying in character. No preamble, no follow-ups, minimal emoji.`
+        }
+        return out
     }
 
     // Memory summarization: fold each user's oldest conversations into one compact note,
@@ -477,6 +705,11 @@ export class AIChatManager extends OutputCore {
         // relationships, passive buffer, emoji list) is wasted prefill on "hi" / "ty".
         // Extended to short casual openers (<=6 words starting with a known social
         // prefix): same prefill savings on "good morning everyone", "i miss you guys", etc.
+        // Fast mode (2) always takes the mini path: the mode's whole point is
+        // minimum TTFT, and memory/room context is the most expensive prefill.
+        // Memory-off users take it too: no DB reads, no writes, no trace.
+        const fastMode = this.userModes?.[userId] === 2
+        const memOff = this.userMemory?.[userId] === false
         const msgText = (message?.content ?? '').trim()
         const msgLower = msgText.toLowerCase()
         const msgWords = msgText ? msgText.split(/\s+/).length : 0
@@ -486,18 +719,34 @@ export class AIChatManager extends OutputCore {
             /^(hi|hey|hello|yo|sup|ty|thanks|bye|cya|gn|gm|ok|lol|lmao|💜|💚|·)\b/i.test(msgText)
         const isCasualOpener =
             msgText && msgWords <= 6 && NEVER_RESEARCH_PREFIXES.some((p) => msgLower.startsWith(p))
-        if (isTinyGreeting || isCasualOpener) {
+        if (isTinyGreeting || isCasualOpener || fastMode || memOff) {
             const name = message.member?.displayName ?? message.author?.username ?? 'user'
+            // Voice anchor lives here (not just the system prompt) because this
+            // is the exact path where "hey baby" drift was observed: short
+            // replies run on minimal context with less to anchor them. Skipped
+            // when a custom/server persona owns the voice — hardcoded lines
+            // must never overrule an explicit user choice.
+            const gid = message?.guild?.id
+            const personaOwned =
+                typeof this.customPrompts?.[userId] === 'string' ||
+                (gid && typeof this.serverPrompts?.[gid] === 'string')
             const mini = `ACTIVE USER: ${name} (<@${message.author.id}>)
-TIME: ${new Date().toISOString().slice(0, 16)} UTC`
-            this.userCache.set(cacheKey, mini)
+TIME: ${new Date().toISOString().slice(0, 16)} UTC${personaOwned ? '' : '\nVOICE: mythic, dry, cool — warmth on your terms, never fawning'}`
+            if (!fastMode && !memOff) this.userCache.set(cacheKey, mini)
             return mini
         }
 
         const mem = this.getMem(message?.guild)
-        // Load ghost list for this user in this guild so buildContext can filter channel context
+        // Load ghost list for this user in this guild so buildContext can filter channel context.
+        // Memory-off users are excluded the same way (ghost-mode by default):
+        // never anybody's room context, never random callbacks, no DB reads.
         const ghostScope = message?.guild ? `${message.guild.id}:${userId}` : null
-        const ghostedIds = ghostScope ? this.ghost.list(ghostScope) : []
+        const ghostedIds = [...(ghostScope ? this.ghost.list(ghostScope) : [])]
+        try {
+            for (const [oid, o] of Object.entries(this.userData?.users ?? {})) {
+                if (oid !== userId && o?.memory === false && !ghostedIds.includes(oid)) ghostedIds.push(oid)
+            }
+        } catch {}
         const ctx = mem.buildContext(userId, message?.channel?.id, ghostedIds)
         const guild = message?.guild
         const parts = []
@@ -642,19 +891,29 @@ TIME: ${new Date().toISOString().slice(0, 16)} UTC`
     }
     // Stateless one-shot for /medusa (Quick Agent). No memory, no RUN_CMD, no user-context, no cache.
     // Research fallback runs when forceSearch=true or the prompt obviously needs live data.
-    async generateStatelessResponse({ prompt, forceSearch = false }) {
+    async generateStatelessResponse({
+        prompt,
+        forceSearch = false,
+        skipResearch = false,
+        systemExtra = '',
+        userCtx = '',
+    }) {
         if (!this._groq) return null
 
         // Quick Agent settings are normalized (prompt arrays pre-joined) by config.js
         const { model, temperature, topP, maxTokens, allowResearch } = this._config.agents.quickAgent
-        const systemPrompt = this._config.agents.quickAgent.systemPrompt || this._defaultQuickAgentPrompt()
+        let systemPrompt = this._config.agents.quickAgent.systemPrompt || this._defaultQuickAgentPrompt()
+        if (userCtx) systemPrompt += `\n\n[WHO YOU'RE TALKING TO]\n${userCtx}`
+        if (systemExtra) systemPrompt += `\n\n${systemExtra}`
 
         const routing =
-            allowResearch && forceSearch
-                ? 'research'
-                : allowResearch
-                  ? await this.needsResearch(prompt)
-                  : 'direct'
+            skipResearch || !allowResearch
+                ? 'direct'
+                : allowResearch && forceSearch
+                  ? 'research'
+                  : allowResearch
+                    ? await this.needsResearch(prompt)
+                    : 'direct'
         // Only 'dangerous' (illegal) hard-refuses. 'nsfw'-labelled prompts fall through to
         // the model, which answers non-explicitly per its prompt, the old flat refusal
         // fired on merely edgy questions and read as closed-minded.
@@ -680,11 +939,14 @@ TIME: ${new Date().toISOString().slice(0, 16)} UTC`
 
         if (routing === 'research') {
             const t0 = Date.now()
-            const raw = await this._callResearch(prompt)
+            const raw = await this._callResearch(prompt, {
+                guildId: message?.guild?.id,
+                priority: String(message?.author?.id) === String(this.ownerId) || !message?.guild,
+            })
             if (raw) {
                 const { text, sources } = this._parseSources(raw)
                 const researchPrompt =
-                    `Research data for the question below. Treat it as ground truth.
+                    `Research data for the question below. Today is ${new Date().toISOString().slice(0, 10)} — weigh the newest sources heaviest; if sources conflict or look stale, say so and give as-of dates instead of picking one silently.
 ` +
                     `${'-'.repeat(32)}
 ${text.slice(0, 3500)}
@@ -765,6 +1027,7 @@ Answer concisely using the research.`
         message = null,
         systemPrompt = null,
         extraSys = null,
+        guildId = null,
     }) {
         if (!this._groq) return null
         this.totalRequests++
@@ -801,8 +1064,17 @@ Answer concisely using the research.`
             // topic", "react with …") so casual uses ("good topic", "nice react")
             // don't pay the prefill cost.
             const ACTION_RE =
-                /\b(ban|kick|mute|unmute|warn|clearwarns|purge|clear|mpurge|fpurge|delete|remove|lock|unlock|role|nickname|rename|announce|poll|thread|pin|unpin|slowmode|remind|reminders|delreminder|mail|movevc|whois|timeout|time out|auditlogs|createchan|delchan|addemoji|listroles|set the topic|set topic|change the topic|update topic|react with|react to)\b/i
-            const needsCaps = ACTION_RE.test(prompt) || ACTION_RE.test(message?.content ?? '')
+                /\b(ban|kick|mute|unmute|warn|clearwarns|purge|clear|mpurge|fpurge|delete|remove|lock|unlock|role|createrole|nickname|rename|announce|poll|thread|pin|unpin|slowmode|remind|reminders|delreminder|mail|movevc|whois|timeout|time out|auditlogs|createchan|delchan|addemoji|listroles|set the topic|set topic|change the topic|update topic|react with|react to)\b/i
+            // PEOPLE questions ("whos adi", "who is tony", "tell me about X")
+            // need the whois/recall rules just as much, but contain no action
+            // verb — "whos" never matches ACTION_RE, so the model answered from
+            // memory alone and missed a real member. Separate gate, same note.
+            const PEOPLE_RE = /\bwhoi?s\b|\bwho'?s\b|\bwho\s+(is|are)\b|\btell me about\b/i
+            const needsCaps =
+                ACTION_RE.test(prompt) ||
+                ACTION_RE.test(message?.content ?? '') ||
+                PEOPLE_RE.test(prompt) ||
+                PEOPLE_RE.test(message?.content ?? '')
 
             const messages = []
             if (systemPrompt) {
@@ -855,13 +1127,90 @@ Answer concisely using the research.`
             // NIM's KV cache allocation respects max_completion_tokens on many deployments,
             // so a lower value = faster first token and lower queue pressure under load.
             const wordCount = (prompt || '').split(/\s+/).length
-            const adaptiveMax = wordCount < 8 ? 500 : wordCount < 30 ? 800 : this.chatTokens
-            const streamingOn = this._config?.streaming === true && !!message?.channel && !mayEmitCmd
-            const response = streamingOn
-                ? await this._streamChat(messages, this.aiModel, adaptiveMax, this.temperature, message)
-                : await this._groqCallWithFallbacks(messages, this.aiModel, adaptiveMax, this.temperature)
+            const adaptiveMax =
+                this.userModes?.[userId] === 2
+                    ? 350 // fast mode: ultrashort by construction, not just by style
+                    : wordCount < 8
+                      ? 500
+                      : wordCount < 30
+                        ? 800
+                        : this.chatTokens
+            const streamingOn = this._didStream(message, userId, prompt)
+            // Pondering stub adapts to expected effort: long prompts and big
+            // token budgets narrate the wait, quick asks stay minimal.
+            const stubHint =
+                prompt.length > 2000 || adaptiveMax > 800
+                    ? 'give me a sec…'
+                    : prompt.length > 500 || adaptiveMax > 500
+                      ? 'one sec…'
+                      : '…'
+            // Fair-share gate: per-guild budget + global in-flight cap.
+            // Priority (owner/DM/mod-action) skips the queue but still counts
+            // usage. Shed returns a throttled breather, not silence.
+            this._fair ??= new FairQueue()
+            const fairOn = PERF.ai.fairShare !== false
+            // Background callers (persona pass, verdict, summaries) pass no
+            // message: guildId pins them to the right guild budget instead of
+            // the DM pool, and keeps them sheddable instead of invisible.
+            const fairGid = message?.guild?.id ?? guildId ?? 'dm'
+            const fairPriority =
+                String(userId ?? '') === String(this.ownerId ?? '') ||
+                (!message?.guild && !guildId) ||
+                mayEmitCmd
+            const fairTokens = estTokens(
+                messages.reduce((a, m) => a + String(m.content ?? '').length, 0),
+                adaptiveMax,
+                0,
+            )
+            const fair = fairOn
+                ? await this._fair.acquire({
+                      guildId: fairGid,
+                      tokens: fairTokens,
+                      priority: fairPriority,
+                  })
+                : null
+            if (fair && !fair.ok) {
+                // Background calls (no message) shed silently: returning the
+                // breather string here would post it as a "correction".
+                if (message && this._fair.shedNoticeOk(fairGid))
+                    return 'whoa, breather — this server is running me hot, give it a few seconds and try again 💜'
+                return null
+            }
+            let response
+            try {
+                response = streamingOn
+                    ? await this._streamChat(
+                          messages,
+                          this.aiModel,
+                          adaptiveMax,
+                          this.temperature,
+                          message,
+                          stubHint,
+                      )
+                    : await this._groqCallWithFallbacks(messages, this.aiModel, adaptiveMax, this.temperature)
+            } finally {
+                fair?.release?.()
+            }
 
             if (!response) return null
+            // Usage receipt for the billing footer (handleAIResponse reads and
+            // clears it). Keyed by message id (not the object — no strong refs
+            // pinning discord.js Messages) and only recorded when the footer
+            // is actually on; otherwise this Map would anchor 500 Messages
+            // nobody reads.
+            if (message && PERF.ai.billingStats === true) {
+                this._usageByMsg ??= new Map()
+                if (this._usageByMsg.size > 500) {
+                    const firstKey = this._usageByMsg.keys().next().value
+                    this._usageByMsg.delete(firstKey)
+                }
+                const inChars = messages.reduce((a, m) => a + String(m.content ?? '').length, 0)
+                this._usageByMsg.set(message.id, {
+                    inTok: Math.ceil(inChars / 4),
+                    outTok: Math.ceil(response.length / 4),
+                    secs: (performance.now() - t0) / 1000,
+                })
+            }
             if (this._isDegenerate(response)) {
                 this.errorCount++
                 console.log(`[AI] Degenerate response suppressed (user=${userId})`)
@@ -877,6 +1226,23 @@ Answer concisely using the research.`
             console.error('[AI] generateResponse error:', e)
             return null
         }
+    }
+
+    // Single source of truth for "did generateResponse stream this turn".
+    // NOTE: this helper answers the DECISION (should we attempt streaming?).
+    // The REPORTED streamed flags below must NOT use it — they read the
+    // artifact instead (message._medusaStreamMsg, set only when a stub was
+    // actually posted and still alive). Recomputing intent instead of reading
+    // outcome caused silent drops: cache hits, shed breathers, stream-open
+    // failures and mid-stream fallbacks all return real text with no stub,
+    // and a recomputed `true` made the caller skip posting it.
+    _didStream(message, userId, prompt) {
+        return (
+            this._config?.streaming === true &&
+            !!message?.channel &&
+            !MAY_EMIT_CMD_RE.test(prompt || '') &&
+            this.userStreams?.[userId] !== false
+        )
     }
 
     // Research response
@@ -934,10 +1300,7 @@ Answer concisely using the research.`
                     systemPrompt,
                     extraSys,
                 }),
-                streamed:
-                    this._config?.streaming === true &&
-                    !!message?.channel &&
-                    !MAY_EMIT_CMD_RE.test(nosearchPrompt),
+                streamed: !!message?._medusaStreamMsg,
                 researched: false,
             }
         }
@@ -959,8 +1322,7 @@ Answer concisely using the research.`
             // would make the caller skip posting -> silent drop.
             return {
                 response,
-                streamed:
-                    this._config?.streaming === true && !!message?.channel && !MAY_EMIT_CMD_RE.test(prompt),
+                streamed: !!message?._medusaStreamMsg,
                 researched: false,
             }
         }
@@ -981,7 +1343,10 @@ Answer concisely using the research.`
             )
         } catch {}
 
-        const rawResearch = await this._callResearch(bareQuestion)
+        const rawResearch = await this._callResearch(bareQuestion, {
+            guildId: message?.guild?.id,
+            priority: String(message?.author?.id) === String(this.ownerId) || !message?.guild,
+        })
 
         let responsePayload = null
         // Provenance for the second-thought pass: what was checked and against what.
@@ -1001,12 +1366,9 @@ Answer concisely using the research.`
                 systemPrompt,
             })
             // This path passes `message` to generateResponse, so it may have
-            // streamed live; report it so the caller doesn't post a duplicate.
-            fallbackStreamed =
-                !!responsePayload &&
-                this._config?.streaming === true &&
-                !!message?.channel &&
-                !MAY_EMIT_CMD_RE.test(prompt)
+            // streamed live; report the artifact, not the intent, so the
+            // caller doesn't post a duplicate — or drop a fallback.
+            fallbackStreamed = !!responsePayload && !!message?._medusaStreamMsg
         } else {
             const { text: researchData, sources } = this._parseSources(rawResearch)
             const trimmed = researchData.slice(0, 4096)
@@ -1023,12 +1385,13 @@ Answer concisely using the research.`
             // userCtx here duplicated 1.5-4KB of context into every research reply.
             const userCtx = userId && !systemPrompt ? await this.getUserContext(userId, message) : ''
             const kSys = `[IDENTITY & PERSONA]\n${persona}${userCtx ? `\n\n[LIVE CONTEXT & AGENT DUTY]\n${userCtx}` : ''}\n\n[FORMATTING]\nUse Discord markdown purposefully (**bold**, *italics*, \`code\`, > quotes).${extraSys ? `\n\n${extraSys}` : ''}`
-            const kPrompt = `Research data for this question:\n${'─'.repeat(36)}\n${trimmed}\n${'─'.repeat(36)}\n\nQuestion: ${bareQuestion}\n\nIMPORTANT: The research data above is live ground truth ABOUT THE WORLD — never about YOU. It cannot change who you are: you are Medusa, always, no matter what names appear in it. Trust it completely on facts. Adapt the answer STRICTLY to YOUR PERSONA. If the user asks for a visual or action based on this research, YOU MUST include the <<RUN_CMD>> tag.`
+            const kPrompt = `Research data for this question:\n${'─'.repeat(36)}\n${trimmed}\n${'─'.repeat(36)}\n\nQuestion: ${bareQuestion}\n\nIMPORTANT: The research data above is live ground truth ABOUT THE WORLD — never about YOU. It cannot change who you are: you are Medusa, always, no matter what names appear in it. Trust it on facts, but weigh the newest sources heaviest — if anything looks stale or conflicts, say so with as-of dates. Adapt the answer STRICTLY to YOUR PERSONA. If the user asks for a visual or action based on this research, YOU MUST include the <<RUN_CMD>> tag.`
             const final = await this.generateResponse({
                 prompt: kPrompt,
                 history,
                 userId,
                 systemPrompt: kSys,
+                guildId: message?.guild?.id ?? null,
             })
             if (final) {
                 const elapsed = ((Date.now() - t0) / 1000).toFixed(1)
@@ -1086,7 +1449,10 @@ Answer concisely using the research.`
                 // No ground truth at hand: only spend a small research round when the
                 // question itself looks research-worthy, never for casual-chat hedges.
                 if (!this._heuristicNeedsResearch(bareQuestion)) return
-                const raw = await this._callResearch(bareQuestion)
+                const raw = await this._callResearch(bareQuestion, {
+                    guildId: message?.guild?.id,
+                    priority: String(message?.author?.id) === String(this.ownerId) || !message?.guild,
+                })
                 if (!raw) return
                 ctx = this._parseSources(raw).text.slice(0, 1500)
                 if (!ctx) return
@@ -1095,6 +1461,7 @@ Answer concisely using the research.`
                 prompt: `You just answered a user in Discord.\nQuestion: ${bareQuestion}\nYour answer: ${response.slice(0, 800)}\n\nGround-truth notes:\n${String(ctx).slice(0, 1500)}\n\nReply with exactly CONFIRMED if your answer stands as-is. Otherwise reply with the correction ONLY: start with "actually" for a fix or "oh also" for a short addendum, max 40 words, plain Discord text, no preamble.`,
                 systemPrompt:
                     'You are a terse fact-checker. Output CONFIRMED or a sub-40-word correction. Nothing else.',
+                guildId: message?.guild?.id ?? null,
             })
             if (!verdict) return
             const v = verdict.trim()
@@ -1133,11 +1500,16 @@ Answer concisely using the research.`
             return { kind: 'ignore', reason: 'prefix_cmd' }
 
         const lower = content.toLowerCase()
-        const botMentionRx = new RegExp(`^<@!?${this.client.user.id}>\\s+`)
+        // Mention-only messages ("@Medusa" + image, no text): the trailing
+        // \s+ used to miss a bare mention at end-of-string, so image-only
+        // summons never triggered in regular channels. (?:\s|$) fixes it.
+        const botMentionRx = new RegExp(`^<@!?${this.client.user.id}>(?:\\s|$)`)
         // True = user typed @Medusa as the first token of the message, intentionally summoning her.
         // This holds even when the message is ALSO a reply: Discord does NOT inject the reply
         // auto-ping into message.content, so a typed @ping at the start is always a real summon
         // (a bare reply with no typed mention won't match and stays silent in non-active channels).
+        // Empty text is fine: attachments (images/files) are the content —
+        // vision/text-ingest paths default their prompts when words are absent.
         const startsWithExplicitPing = botMentionRx.test(content)
         // A typed @Medusa ANYWHERE in the message is an intentional summon (Discord
         // only puts it in content/mentions when the user actually picked her — a
@@ -1200,19 +1572,290 @@ Answer concisely using the research.`
     isTrigger(message) {
         return this.decideTrigger(message).kind === 'trigger'
     }
+    // Billing footer: "-# 2.4k/46 · 2.5k T · 6.7s · 364 t/s" (in/out,
+    // total, wall time, throughput). Estimates (chars/4), read from the
+    // usage receipt generateResponse left on this message. Off unless
+    // PERF.ai.billingStats is true. Appended to the sent chunk/edit only —
+    // stored history and memory never see it.
+    _billingFooter(message) {
+        if (PERF.ai.billingStats !== true || !message) return ''
+        const u = this._usageByMsg?.get(message.id)
+        this._usageByMsg?.delete(message.id)
+        if (!u) return ''
+        const fmt = (n) => (n >= 1000 ? `${(n / 1000).toFixed(1)}k` : `${Math.max(1, Math.round(n))}`)
+        const total = u.inTok + u.outTok
+        const secs = Math.max(0.1, u.secs)
+        const dur =
+            secs < 60
+                ? `${secs.toFixed(1)}s`
+                : `${Math.floor(secs / 60)}m${String(Math.floor(secs % 60)).padStart(2, '0')}s`
+        const rate = `${Math.round(total / secs)} t/s`
+        return `\n\n-# ${fmt(u.inTok)}/${fmt(u.outTok)} · ${fmt(total)} T · ${dur} · ${rate}`
+    }
+    // File return: the user explicitly asked for a file ("send it as a file",
+    // "save as foo.py") and the reply holds a fenced code block. Returns
+    // {fname, text} or null. Pure so it stays harness-testable.
+    _extractFileBlock(response, userContent) {
+        if (
+            !/\b(as an? )?files?\b|\bsend (it|this|that) as\b|\battach( it| this| that)?\b|\bsave (it|this|that) as\b/i.test(
+                userContent ?? '',
+            )
+        )
+            return null
+        const m = /```(\w*)\n([\s\S]{20,200000}?)\n?```/.exec(response ?? '')
+        if (!m) return null
+        const lang = (m[1] || 'txt').toLowerCase().slice(0, 10)
+        const extMap = {
+            js: 'js',
+            javascript: 'js',
+            ts: 'ts',
+            py: 'py',
+            python: 'py',
+            json: 'json',
+            html: 'html',
+            css: 'css',
+            md: 'md',
+            sh: 'sh',
+            sql: 'sql',
+            yaml: 'yaml',
+            yml: 'yml',
+            txt: 'txt',
+        }
+        const ext = extMap[lang] ?? 'txt'
+        const nameAsk = /\b(?:save as|call it|name it|filename)\s+([A-Za-z0-9_][\w.-]{0,60}\.\w{1,8})/i.exec(
+            userContent ?? '',
+        )
+        return { fname: nameAsk?.[1] ?? `code.${ext}`, text: m[2] }
+    }
     async handleAIResponse(message, customPrompt = null, systemOverride = null) {
         let typingInterval
+        // Ghost typing is the #1 sync complaint: Discord's indicator lives
+        // ~10s past the last sendTyping, and there is no stop-typing API, so
+        // the only control is WHEN the last tick fires. Stop it the moment
+        // visible output is done — before embed flushes, media sends, and the
+        // fire-and-forget second thought — instead of in finally. The finally
+        // below stays as a backstop for early returns.
+        const stopTyping = () => {
+            if (typingInterval) {
+                clearInterval(typingInterval)
+                typingInterval = null
+            }
+        }
         try {
-            message.channel.sendTyping().catch(() => {})
-            typingInterval = setInterval(() => message.channel.sendTyping().catch(() => {}), 9000)
+            // Typing TTL is ~10s and Discord clears it client-side the moment
+            // we send our own message (the stream stub). 5s keeps the worst
+            // gap small so typing visibly overlaps streaming instead of
+            // stopping dead when the placeholder lands.
+            // Per-user streaming pref (med,stream / /streaming): off means
+            // instant reply with no streaming AND no typing indicator.
+            const userNoStream = this.userStreams?.[message.author.id] === false
+            const keepTyping = () => {
+                if (userNoStream) return
+                message.channel.sendTyping().catch((e) => {
+                    if (this._config?.debug)
+                        console.warn('[AI] sendTyping failed:', String(e?.message ?? e).slice(0, 80))
+                })
+            }
+            keepTyping()
+            typingInterval = userNoStream ? null : setInterval(keepTyping, 5000)
 
             const mem = this.getMem(message.guild)
             const userId = message.author.id
+            // Memory-off: no DB reads (mini context) and no DB writes anywhere
+            // below. Ghost-mode by default: also excluded from others' context.
+            const memOff = this.userMemory?.[userId] === false
             const username = message.author.username
             const displayName = message.member?.displayName ?? username
-            const content = customPrompt || message.content
+            let content = customPrompt || message.content
+            // NOTE (reassigned below): time fast-paths may append resolved
+            // [TIME DATA] for the model to voice when token-saver is off.
             const bareQ =
                 content.replace(new RegExp(`^<@!?${this.client.user.id}>\\s*`), '').trim() || content
+            // Token-saver: trivial intents get fixed replies with zero LLM
+            // calls (config tokenSaver, default off = full generative).
+            // Greetings roll 25% to full generation anyway so she doesn't go
+            // robotic. Hate-gated: abuse never earns a cute fixed reply.
+            if (this._config?.tokenSaver === true && !containsDisallowedHate(content)) {
+                const bq = bareQ.toLowerCase()
+                const bqWords = bq ? bq.split(/\s+/).length : 0
+                let fixed = null
+                if (
+                    bq &&
+                    bqWords <= 3 &&
+                    /^(hi|hey|hello|yo|sup|ty|thanks|bye|cya|gn|gm|ok|lol|lmao|💜|💚|·)\b/i.test(bq) &&
+                    Math.random() >= 0.25
+                ) {
+                    const GREET = ['hey 💜', 'heyyy', 'hi hi 💜', 'hey hey', 'yo 💜']
+                    fixed = GREET[Math.floor(Math.random() * GREET.length)]
+                } else if (
+                    /^(your|ur|medusa'?s?|bot'?s?|her)\s+(ram|memory|cpu|uptime|ping|latency|status|vitals|lag|health)\b/i.test(
+                        bareQ.trim(),
+                    ) ||
+                    /^(ram|memory|cpu|uptime|ping|vitals)\b[^a-z]*\??$/i.test(bareQ.trim()) ||
+                    /^(ram|memory|cpu)\s+(usage|use|load|status|state|level)\b/i.test(bareQ.trim())
+                ) {
+                    const upMs = Date.now() - (this.client.heart?.startTime || Date.now())
+                    const upStr = `${Math.floor(upMs / 3600000)}h ${Math.floor((upMs % 3600000) / 60000)}m`
+                    const memMB = (process.memoryUsage().rss / 1024 / 1024).toFixed(1)
+                    const ping = this.client.ws?.ping ?? -1
+                    fixed = `⚡ running smooth — ${memMB}MB, up ${upStr}${ping >= 0 ? `, ${ping}ms ping` : ''} 💜`
+                }
+                if (fixed) {
+                    const hk = `${userId}-${message.channel.id}`
+                    this._histPush(
+                        hk,
+                        memOff,
+                        { role: 'user', content },
+                        { role: 'assistant', content: fixed },
+                    )
+                    if (!memOff) mem.addConversation(userId, message.channel.id, content, fixed)
+                    await this.secureReply(message, fixed)
+                    return
+                }
+            }
+            // Time fast-path: "what time is it" asked at her with nothing else
+            // attached resolves straight from data — zero hallucinated times.
+            // Token-saver ON: fixed template reply, zero LLM calls. OFF: the
+            // resolved facts ride along for her to voice with persona.
+            if (
+                /^(what'?s (the )?time|what time is it|current time|time check|what time|time pls|time please|time now)[?!.\s]*$/i.test(
+                    bareQ.trim(),
+                ) &&
+                !containsDisallowedHate(content)
+            ) {
+                const line = getLocalTimeLine(getSavedTimezone(userId))
+                if (line) {
+                    if (this._config?.tokenSaver === true) {
+                        // Fixed templates, deliberately un-personalized: the time
+                        // string must survive byte-exact, and persona flavor here
+                        // risks corrupting it. Two rotations so repeats don't echo.
+                        const timed =
+                            Math.random() < 0.5 ? `It's ${line} for you 💜` : `${line} — right now 💜`
+                        const hk = `${userId}-${message.channel.id}`
+                        this._histPush(
+                            hk,
+                            memOff,
+                            { role: 'user', content },
+                            { role: 'assistant', content: timed },
+                        )
+                        if (!memOff) mem.addConversation(userId, message.channel.id, content, timed)
+                        await this.secureReply(message, timed)
+                        return
+                    }
+                    content += `\n\n[TIME DATA, state as fact: it is ${line} for the asker.]`
+                }
+            }
+            // Mention-qualified time ask: "what time is it for @A @B" — resolve
+            // each mentioned member's saved zone (zero LLM). Anyone without
+            // one gets an honest line instead of a guess. Plain names (not
+            // mentions) fall through to the model.
+            {
+                const others = [...(message.mentions?.users?.keys?.() ?? [])].filter(
+                    (id) => id !== this.client.user.id && id !== userId,
+                )
+                const looksTimey =
+                    /^(what'?s (the )?time|what time is it|current time|time check|what time|time pls|time please|time now)\b/i.test(
+                        bareQ.trim(),
+                    ) && !containsDisallowedHate(content)
+                if (others.length && looksTimey) {
+                    const lines = others.slice(0, 5).map((id) => {
+                        const entry = getSavedTimezone(id)
+                        const line = entry ? getLocalTimeLine(entry) : null
+                        const who =
+                            message.mentions.users.get(id)?.displayName ??
+                            message.mentions.users.get(id)?.username ??
+                            'them'
+                        return line
+                            ? `**${who}**: ${line}`
+                            : `**${who}**: no timezone on file — tell me where they are and I'll do the math`
+                    })
+                    if (this._config?.tokenSaver === true) {
+                        const timed = lines.join('\n')
+                        const hk = `${userId}-${message.channel.id}`
+                        this._histPush(
+                            hk,
+                            memOff,
+                            { role: 'user', content },
+                            { role: 'assistant', content: timed },
+                        )
+                        if (!memOff) mem.addConversation(userId, message.channel.id, content, timed)
+                        await this.secureReply(message, timed)
+                        return
+                    }
+                    content += `\n\n[TIME DATA, state each as fact:\n${lines.map((l) => `- ${l.replace(/\*\*/g, '')}`).join('\n')}]`
+                }
+            }
+            // Place-qualified time ask: "what time is it in india" — resolve
+            // the place deterministically instead of letting the model guess
+            // (fixed-offset math breaks on DST zones; invented times are worse).
+            {
+                const placeM = bareQ
+                    .trim()
+                    .match(
+                        /^(?:what'?s (?:the )?time|what time is it|current time|time)\s+(?:in|for|at)\s+(.+?)[?!.\s]*$/,
+                    )
+                if (placeM && !containsDisallowedHate(content)) {
+                    const found = lookupLocation(placeM[1])
+                    if (found && found.zones.length === 1) {
+                        const line = getLocalTimeLine({ alias: found.display, timezone: found.zones[0] })
+                        if (line) {
+                            if (this._config?.tokenSaver === true) {
+                                const timed =
+                                    Math.random() < 0.5 ? `It's ${line} 💜` : `${line} — right now 💜`
+                                const hk = `${userId}-${message.channel.id}`
+                                this._histPush(
+                                    hk,
+                                    memOff,
+                                    { role: 'user', content },
+                                    { role: 'assistant', content: timed },
+                                )
+                                if (!memOff) mem.addConversation(userId, message.channel.id, content, timed)
+                                await this.secureReply(message, timed)
+                                return
+                            }
+                            content += `\n\n[TIME DATA, state as fact: it is ${line}.]`
+                        }
+                    }
+                    // Ambiguous (multi-zone) or unknown: fall through so she can
+                    // ask which one instead of guessing.
+                }
+            }
+            // Residence auto-learn: "i live in berlin" saves the zone natively
+            // (single-zone matches only — ambiguous places get a question, not
+            // a guess). Mirrors the existing alias-learn pattern below. Never
+            // in debug mode (prod data stays untouched).
+            {
+                const liveM =
+                    !this.debugMode &&
+                    bareQ
+                        .trim()
+                        .match(/^(?:i live in|i'm from|im from|i live at|moved to|based in)\s+(.+?)[.!]*$/i)
+                if (liveM && !containsDisallowedHate(content)) {
+                    const found = lookupLocation(liveM[1])
+                    if (found && found.zones.length === 1) {
+                        const tz = found.zones[0]
+                        const uname = message.member?.displayName ?? message.author?.username ?? 'you'
+                        saveUserTimezone(userId, {
+                            alias: found.display,
+                            timezone: tz,
+                            setBy: userId,
+                            setAt: new Date().toISOString(),
+                        })
+                        const line = getLocalTimeLine({ alias: found.display, timezone: tz })
+                        const ack = `got it — set your zone to ${found.display} (${line}) 💜 change it anytime with /tzset`
+                        const hk = `${userId}-${message.channel.id}`
+                        this._histPush(
+                            hk,
+                            memOff,
+                            { role: 'user', content },
+                            { role: 'assistant', content: ack },
+                        )
+                        if (!memOff) mem.addConversation(userId, message.channel.id, content, ack)
+                        await this.secureReply(message, ack)
+                        return
+                    }
+                }
+            }
             // Scan-before-talk: refresh the invoker and any mentioned users so display
             // names, permissions, and lookups see the live roster, not a stale cache.
             // Single fetches hit cache first, so this is ~free when warm. Best-effort.
@@ -1260,12 +1903,17 @@ Answer concisely using the research.`
                 }
             }
 
-            mem.updateUser(userId, username, displayName)
-            mem.analyzePersonality(userId, content)
-            mem.updateInterests(userId, content)
-            if (message.mentions?.users?.size) {
-                for (const [mentionedId] of message.mentions.users) {
-                    if (mentionedId !== this.client.user.id) mem.updateRelationship(userId, mentionedId)
+            // Memory-off users: no profiling writes at all (no user row touch,
+            // interests, personality, relationships, aliases). Reads already
+            // mini-pathed.
+            if (!memOff) {
+                mem.updateUser(userId, username, displayName)
+                mem.analyzePersonality(userId, content)
+                mem.updateInterests(userId, content)
+                if (message.mentions?.users?.size) {
+                    for (const [mentionedId] of message.mentions.users) {
+                        if (mentionedId !== this.client.user.id) mem.updateRelationship(userId, mentionedId)
+                    }
                 }
             }
 
@@ -1287,10 +1935,11 @@ Answer concisely using the research.`
                 'basically',
                 'probably',
             ])
-            if (aliasMatch && !ALIAS_BLACKLIST.has(aliasMatch[1])) mem.setAlias(userId, aliasMatch[1], userId)
+            if (aliasMatch && !ALIAS_BLACKLIST.has(aliasMatch[1]) && !memOff)
+                mem.setAlias(userId, aliasMatch[1], userId)
 
             const key = `${userId}-${message.channel.id}`
-            if (!this.messageHistory.has(key)) this.messageHistory.set(key, [])
+            if (!memOff && !this.messageHistory.has(key)) this.messageHistory.set(key, [])
 
             let { url: imageUrl, isGif, label: imgLabel, spoilerSkipped } = this._getImageFromMessage(message)
             if (!imageUrl && message.reference?.messageId) {
@@ -1300,17 +1949,24 @@ Answer concisely using the research.`
             if (imageUrl) {
                 const vSys = this.getUserPrompt(userId, message.guild?.id) || this.instructions || ''
                 const { allImages } = this._getImageFromMessage(message)
-                const vRes = await this._callVision(content, imageUrl, isGif, vSys, userId, allImages)
+                const vRes = await this._callVision(content, imageUrl, isGif, vSys, userId, allImages, {
+                    guildId: message?.guild?.id,
+                    priority: String(message?.author?.id) === String(this.ownerId) || !message?.guild,
+                })
                 if (vRes) {
-                    mem.addConversation(userId, message.channel.id, content, vRes)
-                    const hist = this.messageHistory.get(key)
-                    hist.push({ role: 'user', content }, { role: 'assistant', content: vRes })
+                    if (!memOff) mem.addConversation(userId, message.channel.id, content, vRes)
+                    this._histPush(
+                        key,
+                        memOff,
+                        { role: 'user', content },
+                        { role: 'assistant', content: vRes },
+                    )
                     for (const chunk of this.splitResponse(vRes)) await this.secureReply(message, chunk)
                 }
                 return
             }
 
-            const history = this.messageHistory.get(key).slice(-this.maxHistory)
+            const history = memOff ? [] : (this.messageHistory.get(key) ?? []).slice(-this.maxHistory)
 
             let finalContent = content
             const textFiles = await this._processTextAttachments(message)
@@ -1367,18 +2023,36 @@ Answer concisely using the research.`
                 // (when present) is attached to that same message, so note text
                 // and buttons share one fate instead of two separate sends.
                 try {
-                    const recent = await message.channel.messages.fetch({ limit: 5 })
-                    const ours = recent.find(
-                        (m) => m.author.id === this.client.user.id && m.reference?.messageId === message.id,
-                    )
-                    if (ours && (finalText !== response || ui)) {
+                    const foot = this._billingFooter(message)
+                    // Prefer the stashed stub object over a REST re-fetch +
+                    // heuristic match (saves a round trip and can't mismatch a
+                    // different reply to the same message). Fetch only when the
+                    // stub never landed (send failed) or was deleted on streams
+                    // that fell back.
+                    const ours =
+                        message._medusaStreamMsg ??
+                        ((await message.channel.messages
+                            .fetch({ limit: 5 })
+                            .then((recent) =>
+                                recent.find(
+                                    (m) =>
+                                        m.author.id === this.client.user.id &&
+                                        m.reference?.messageId === message.id,
+                                ),
+                            )
+                            .catch(() => null)) ||
+                            null)
+                    if (ours && (finalText !== response || ui || foot)) {
+                        const body = foot
+                            ? this.finalSecurityCheck(finalText).slice(0, 2000 - foot.length) + foot
+                            : this.finalSecurityCheck(finalText).slice(0, 2000)
                         const editPayload = ui
                             ? {
-                                  content: this.finalSecurityCheck(finalText).slice(0, 2000),
+                                  content: body,
                                   embeds: [ui.embed],
                                   components: [ui.row],
                               }
-                            : { content: this.finalSecurityCheck(finalText).slice(0, 2000) }
+                            : { content: body }
                         await ours.edit(editPayload).catch(() => {})
                         if (ui) {
                             await this._watchConfirmUI(ours, ui.key, message)
@@ -1401,12 +2075,13 @@ Answer concisely using the research.`
                 } catch {}
                 const mem = this.getMem(message.guild)
                 if (!execResult.confirmPending)
-                    mem.addConversation(userId, message.channel.id, finalContent, finalText)
+                    if (!memOff) mem.addConversation(userId, message.channel.id, finalContent, finalText)
                 // Streaming path used to swallow captured embeds (warn/av confirmations
                 // never posted). Flush them as a follow-up like the normal path does.
                 if (execResult.embeds?.length) {
                     await this.secureReply(message, '', { embeds: execResult.embeds.slice(0, 10) })
                 }
+                stopTyping()
                 this._secondThought({
                     message,
                     bareQuestion: bareQ,
@@ -1430,7 +2105,7 @@ Answer concisely using the research.`
             if (!response && !extraEmbeds.length) return
 
             // Never store confirmation prompts, they poison future context
-            if (!execResult.confirmPending) {
+            if (!execResult.confirmPending && !memOff) {
                 mem.addConversation(
                     userId,
                     message.channel.id,
@@ -1438,14 +2113,12 @@ Answer concisely using the research.`
                     response || '*(silently executed system tool)*',
                 )
             }
-            let hist = this.messageHistory.get(key)
-            if (!hist) {
-                hist = []
-                this.messageHistory.set(key, hist)
-            }
-            hist.push({ role: 'user', content: finalContent })
+            this._histPush(key, memOff, { role: 'user', content: finalContent })
             if (!execResult.confirmPending) {
-                hist.push({ role: 'assistant', content: response || '*(silently executed system tool)*' })
+                this._histPush(key, memOff, {
+                    role: 'assistant',
+                    content: response || '*(silently executed system tool)*',
+                })
             }
             const media = await this._pickExpressiveMedia(response, message)
             if (media?.explicit) {
@@ -1461,6 +2134,11 @@ Answer concisely using the research.`
                 response = cleaned || 'here you go 💜'
             }
             const chunks = this.splitResponse(response || '')
+            const billingFoot = this._billingFooter(message)
+            if (billingFoot && chunks.length) {
+                const last = chunks.length - 1
+                chunks[last] = chunks[last].slice(0, 2000 - billingFoot.length) + billingFoot
+            }
             const sentMsgs = []
             // Confirm UI rides on the SAME send as the note text: both land
             // together or the send fails loudly together. No second message
@@ -1515,6 +2193,23 @@ Answer concisely using the research.`
                     }
                 } catch {}
             }
+            // File return: explicit ask + fenced block -> attach it as a file
+            // follow-up. Prose flow above is untouched; this only adds.
+            try {
+                const file = this._extractFileBlock(response, message?.content)
+                if (file) {
+                    await message.channel
+                        .send({
+                            content: `📎 \`${file.fname}\``,
+                            files: [{ attachment: Buffer.from(file.text, 'utf8'), name: file.fname }],
+                            allowedMentions: { parse: [] },
+                        })
+                        .catch(() => null)
+                }
+            } catch (e) {
+                console.warn('[AI] file return failed:', String(e?.message ?? e).slice(0, 100))
+            }
+            stopTyping()
             this._secondThought({
                 message,
                 bareQuestion: bareQ,
@@ -1531,6 +2226,8 @@ Answer concisely using the research.`
 
     async processAIMessage(message) {
         if (this.paused || this.shouldIgnore(message)) return
+        // Debug mode looks like a normal AI pause to everyone but the owner.
+        if (this.debugMode && String(message.author.id) !== String(this.ownerId)) return
         if (!this.isTrigger(message)) return
         const guildId = message.guild?.id ?? '0'
         if (this.pausedGuilds.has(guildId)) return
@@ -1539,7 +2236,10 @@ Answer concisely using the research.`
         const isStaff = !!message.member?.permissions?.has(PermissionFlagsBits.ModerateMembers)
         const isOwner = String(userId) === String(this.ownerId)
         const gate = this.client.heart?.rateLimiter?.check(userId, { isStaff, isOwner })
-        if (gate && !gate.ok) return
+        if (gate && !gate.ok) {
+            console.debug(`[AI] Gated ${userId} (${gate.reason ?? 'rate'})`)
+            return
+        }
         const now = Date.now()
 
         // Block new AI responses while a destructive confirmation is pending for this user
@@ -1550,8 +2250,12 @@ Answer concisely using the research.`
         counts = counts.filter((t) => now - t < this.spamWindow)
         counts.push(now)
         this.userMsgCounts.set(userId, counts)
-        if (this.userCooldowns.has(userId) && now < this.userCooldowns.get(userId)) return
+        if (this.userCooldowns.has(userId) && now < this.userCooldowns.get(userId)) {
+            console.debug(`[AI] Cooldown active for ${userId}`)
+            return
+        }
         if (counts.length > this.spamThreshold) {
+            console.debug(`[AI] Spam threshold tripped for ${userId}`)
             this.userCooldowns.set(userId, now + this.cooldownDuration)
             this.userMsgCounts.set(userId, [])
             return
@@ -1953,7 +2657,10 @@ ${cleaned}`
             const row = mem.db
                 .prepare(
                     `
-                SELECT user_id, message_content FROM conversations
+                SELECT user_id, message_content FROM (
+                    SELECT user_id, message_content FROM conversations
+                    ORDER BY id DESC LIMIT 500
+                )
                 WHERE LENGTH(message_content) > 20
                 AND message_content NOT LIKE '%?%'
                 AND message_content NOT LIKE '%how%'
@@ -2006,6 +2713,12 @@ ${cleaned}`
         for (const [key, ts] of this.activeConvs) {
             if (now - ts > this.convTimeout * 2) this.activeConvs.delete(key)
         }
+        // Prune spent /summarize cooldowns: the window itself is 12h, so
+        // anything older is an already-expired record, not live state.
+        const twelveH = now - 12 * 3600_000
+        for (const [uid, uses] of this.summarizeCDs) {
+            if (!uses.length || uses[uses.length - 1] < twelveH) this.summarizeCDs.delete(uid)
+        }
         // Trim message history: keep top 50 active convos.
         if (this.messageHistory.size > 100) {
             const sorted = [...this.messageHistory.entries()].sort(
@@ -2027,6 +2740,18 @@ ${cleaned}`
             const fresh = ts.filter((t) => now - t < 30_000)
             if (!fresh.length) this.spamProtect.delete(uid)
             else this.spamProtect.set(uid, fresh)
+        }
+        // Prune the older twin trackers the same way: userMsgCounts keeps a
+        // permanent (possibly empty) entry per user ever seen, and expired
+        // userCooldowns never clear. Both grow unbounded for the process
+        // lifetime on a busy server.
+        for (const [uid, ts] of this.userMsgCounts) {
+            const fresh = Array.isArray(ts) ? ts.filter((t) => now - t < this.spamWindow) : []
+            if (!fresh.length) this.userMsgCounts.delete(uid)
+            else this.userMsgCounts.set(uid, fresh)
+        }
+        for (const [uid, until] of this.userCooldowns) {
+            if (now > until) this.userCooldowns.delete(uid)
         }
         // Cleanup old DB entries
         for (const mem of [this.globalMem, ...this.isolatedMems.values()]) {

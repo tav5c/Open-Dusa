@@ -4,10 +4,26 @@ import { existsSync, mkdirSync, readFileSync, readdirSync } from 'fs'
 import { mkdir, writeFile } from 'fs/promises'
 import { dirname, join } from 'path'
 import { loadPerformance } from '../performance.js'
-import { GHOST_FILE } from './constants.js'
 import { containsDisallowedHate } from './safety.js'
 
 const PERF = loadPerformance()
+
+// Short date tag for memory context lines ("[Sep 10] "). SQLite timestamps
+// are UTC 'YYYY-MM-DD HH:MM:SS'. Recent (<24h) items stay untagged unless
+// always=true — keeps short context lean while old items carry their date,
+// so recalled events read as past, never present-tense.
+const MONTHS = ['Jan', 'Feb', 'Mar', 'Apr', 'May', 'Jun', 'Jul', 'Aug', 'Sep', 'Oct', 'Nov', 'Dec']
+export function dateTag(ts, always = false) {
+    try {
+        const t = new Date(String(ts ?? '').replace(' ', 'T') + 'Z').getTime()
+        if (isNaN(t)) return ''
+        if (!always && Date.now() - t < 24 * 3600_000) return ''
+        const d = new Date(t)
+        return `[${MONTHS[d.getUTCMonth()]} ${d.getUTCDate()}] `
+    } catch {
+        return ''
+    }
+}
 
 // No-op handle: every consumer already tolerates it (checked via `db._stub`
 // or try/catch), so a dead engine means "no persistence", never a crash.
@@ -32,9 +48,7 @@ class DBPool {
         }
         if (!this._pool.has(path)) {
             mkdirSync(dirname(path) || '.', { recursive: true })
-            const conn = globalThis._openDb
-                ? globalThis._openDb(path)
-                : new globalThis._sqlite3.default(path)
+            const conn = globalThis._openDb ? globalThis._openDb(path) : new globalThis._sqlite3.default(path)
             // EXCLUSIVE locking avoids the need for a -shm file in WAL mode (fixes SQLITE_IOERR_SHMSIZE on cheap hosts)
             conn.pragma('locking_mode = EXCLUSIVE')
             try {
@@ -63,15 +77,6 @@ class DBPool {
             this._pool.set(path, conn)
         }
         return this._pool.get(path)
-    }
-    closeAll() {
-        for (const [, c] of this._pool) {
-            try {
-                if (c._checkpointInterval) clearInterval(c._checkpointInterval)
-                c.close()
-            } catch {}
-        }
-        this._pool.clear()
     }
 }
 const dbPool = new DBPool()
@@ -146,6 +151,19 @@ class AIMemoryManager {
     }
 
     _initSchema() {
+        // Fresh-file pragmas first (no-ops on existing DBs by guard): tighter
+        // packing from byte zero instead of a later VACUUM migration.
+        try {
+            const existing =
+                this.db
+                    .prepare(
+                        "SELECT COUNT(*) AS n FROM sqlite_master WHERE type IN ('table','index','trigger') AND name NOT LIKE 'sqlite_%'",
+                    )
+                    .get()?.n ?? 1
+            if (existing === 0) {
+                this.db.exec('PRAGMA auto_vacuum = INCREMENTAL; PRAGMA page_size = 4096;')
+            }
+        } catch {}
         this.db.exec(`
             CREATE TABLE IF NOT EXISTS users (
                 user_id TEXT PRIMARY KEY, username TEXT, display_name TEXT, avatar_url TEXT,
@@ -199,7 +217,34 @@ class AIMemoryManager {
                 user_id TEXT PRIMARY KEY, summary TEXT,
                 covered INTEGER DEFAULT 0, updated_at DATETIME DEFAULT CURRENT_TIMESTAMP
             );
+            -- FTS5 mirror of conversations for real memory search (recall with
+            -- keywords). Content-sync triggers keep it exact; backfilled below
+            -- for pre-existing rows exactly once (empty index + rows present).
+            CREATE VIRTUAL TABLE IF NOT EXISTS conversations_fts USING fts5(
+                message_content, ai_response,
+                content='conversations', content_rowid='id'
+            );
+            CREATE TRIGGER IF NOT EXISTS conv_fts_insert AFTER INSERT ON conversations BEGIN
+                INSERT INTO conversations_fts(rowid, message_content, ai_response)
+                VALUES (new.id, new.message_content, new.ai_response);
+            END;
+            CREATE TRIGGER IF NOT EXISTS conv_fts_delete AFTER DELETE ON conversations BEGIN
+                INSERT INTO conversations_fts(conversations_fts, rowid, message_content, ai_response)
+                VALUES ('delete', old.id, old.message_content, old.ai_response);
+            END;
         `)
+        // One-time backfill: triggers only cover new writes.
+        try {
+            const ftsCount = this.db.prepare('SELECT COUNT(*) AS n FROM conversations_fts').get()?.n ?? 1
+            const convCount = this.db.prepare('SELECT COUNT(*) AS n FROM conversations').get()?.n ?? 0
+            if (ftsCount === 0 && convCount > 0) {
+                this.db
+                    .prepare(
+                        'INSERT INTO conversations_fts(rowid, message_content, ai_response) SELECT id, message_content, ai_response FROM conversations',
+                    )
+                    .run()
+            }
+        } catch {}
 
         // Pre-prepare frequently-used statements to avoid re-parsing SQL on every call
         if (!this.db._stub) {
@@ -247,18 +292,29 @@ class AIMemoryManager {
         }
     }
 
-
     _purgeUnsafeMemory() {
         if (this.db._stub) return
         try {
             const tx = this.db.transaction(() => {
-                for (const row of this.db.prepare('SELECT id, message_content, ai_response FROM conversations').iterate())
-                    if (containsDisallowedHate(row.message_content) || containsDisallowedHate(row.ai_response))
+                for (const row of this.db
+                    .prepare('SELECT id, message_content, ai_response FROM conversations')
+                    .iterate())
+                    if (
+                        containsDisallowedHate(row.message_content) ||
+                        containsDisallowedHate(row.ai_response)
+                    )
                         this.db.prepare('DELETE FROM conversations WHERE id=?').run(row.id)
                 for (const row of this.db.prepare('SELECT id, fact FROM server_lore').iterate())
-                    if (containsDisallowedHate(row.fact)) this.db.prepare('DELETE FROM server_lore WHERE id=?').run(row.id)
-                for (const row of this.db.prepare('SELECT user_id, traits, preferences, communication_style FROM personality').iterate())
-                    if (containsDisallowedHate([row.traits, row.preferences, row.communication_style].join(' ')))
+                    if (containsDisallowedHate(row.fact))
+                        this.db.prepare('DELETE FROM server_lore WHERE id=?').run(row.id)
+                for (const row of this.db
+                    .prepare('SELECT user_id, traits, preferences, communication_style FROM personality')
+                    .iterate())
+                    if (
+                        containsDisallowedHate(
+                            [row.traits, row.preferences, row.communication_style].join(' '),
+                        )
+                    )
                         this.db.prepare('DELETE FROM personality WHERE user_id=?').run(row.user_id)
             })
             tx()
@@ -310,6 +366,41 @@ class AIMemoryManager {
         })
     }
 
+    // Full-text search over conversation contents (FTS5 mirror, triggers keep
+    // it synced). userId null = whole server. Returns newest first. Terms are
+    // matched with AND semantics; garbage queries return [] instead of throwing.
+    searchConversations(terms, userId = null, limit = 3) {
+        try {
+            const q = String(terms ?? '')
+                .toLowerCase()
+                .split(/[^a-z0-9]+/)
+                .filter((w) => w.length >= 3)
+                .slice(0, 5)
+            if (!q.length) return []
+            const match = q.join(' AND ')
+            const rows = userId
+                ? this.db
+                      .prepare(
+                          `SELECT c.user_id, c.message_content, c.timestamp FROM conversations_fts f
+                           JOIN conversations c ON c.id = f.rowid
+                           WHERE conversations_fts MATCH ? AND c.user_id = ?
+                           ORDER BY c.id DESC LIMIT ?`,
+                      )
+                      .all(match, userId, limit)
+                : this.db
+                      .prepare(
+                          `SELECT c.user_id, c.message_content, c.timestamp FROM conversations_fts f
+                           JOIN conversations c ON c.id = f.rowid
+                           WHERE conversations_fts MATCH ?
+                           ORDER BY c.id DESC LIMIT ?`,
+                      )
+                      .all(match, limit)
+            return rows ?? []
+        } catch {
+            return []
+        }
+    }
+
     getHistory(userId, limit = 10) {
         return this._stmts
             ? this._stmts.getHistory.all(userId, limit)
@@ -332,7 +423,10 @@ class AIMemoryManager {
 
     getSummary(userId) {
         try {
-            return this.db.prepare('SELECT summary FROM user_summaries WHERE user_id=?').get(userId)?.summary ?? null
+            return (
+                this.db.prepare('SELECT summary FROM user_summaries WHERE user_id=?').get(userId)?.summary ??
+                null
+            )
         } catch {
             return null
         }
@@ -357,7 +451,23 @@ class AIMemoryManager {
 
     saveSummaryAndPrune(userId, summary, ids) {
         if (containsDisallowedHate(summary)) return false
+        // Append, don't overwrite: each snapshot is date-stamped and stacked
+        // (newest last, capped at ~4000 chars trimmed from the front), so depth
+        // accumulates instead of the last summary erasing all previous ones.
+        const d = new Date()
+        const stamped = `[${MONTHS[d.getUTCMonth()]} ${d.getUTCDate()}] ${String(summary)
+            .replace(/^\[(Summary as of )?[^\]]+\]\s*/, '')
+            .slice(0, 1500)}`
         try {
+            const prev =
+                this.db.prepare('SELECT summary FROM user_summaries WHERE user_id=?').get(userId)?.summary ??
+                ''
+            let combined = prev ? `${prev}\n${stamped}` : stamped
+            if (combined.length > 4000) {
+                // Trim oldest snapshots from the front, keep the tail.
+                const cut = combined.indexOf('\n[', combined.length - 4000)
+                combined = cut > 0 ? combined.slice(cut + 1) : combined.slice(-4000)
+            }
             const tx = this.db.transaction(() => {
                 this.db
                     .prepare(
@@ -366,7 +476,7 @@ class AIMemoryManager {
                         ON CONFLICT(user_id) DO UPDATE SET summary=excluded.summary,
                             covered=covered+excluded.covered, updated_at=CURRENT_TIMESTAMP`,
                     )
-                    .run(userId, String(summary).slice(0, 1500), ids.length)
+                    .run(userId, combined, ids.length)
                 const del = this.db.prepare('DELETE FROM conversations WHERE id=?')
                 for (const id of ids) del.run(id)
             })
@@ -611,7 +721,7 @@ class AIMemoryManager {
             history.forEach((r, i) => {
                 const msg =
                     r.message_content.length > 60 ? r.message_content.slice(0, 60) + '...' : r.message_content
-                parts.push(`  ${i + 1}. ${msg}`)
+                parts.push(`  ${i + 1}. ${dateTag(r.timestamp)}${msg}`)
             })
         }
 
@@ -636,16 +746,22 @@ class AIMemoryManager {
             }
         } catch {}
 
-        // Cross-session callback
+        // Cross-session callback, always dated: an undated old quote reads as
+        // present-tense and fuels "I already muted X"-class confabulation.
         try {
             if (Math.random() < 0.15) {
                 const old = this.db
                     .prepare(
-                        `SELECT message_content FROM conversations WHERE user_id=? AND timestamp < datetime('now', '-3 days') AND length(message_content) > 20 ORDER BY RANDOM() LIMIT 1`,
+                        `SELECT message_content, timestamp FROM (
+                            SELECT message_content, timestamp FROM conversations
+                            WHERE user_id=? ORDER BY id DESC LIMIT 500
+                        ) WHERE timestamp < datetime('now', '-3 days') AND length(message_content) > 20 ORDER BY RANDOM() LIMIT 1`,
                     )
                     .get(userId)
                 if (old?.message_content) {
-                    parts.push(`Old topic worth remembering: "${old.message_content.slice(0, 80)}"`)
+                    parts.push(
+                        `Old topic worth remembering ${dateTag(old.timestamp, true)}: "${old.message_content.slice(0, 80)}"`,
+                    )
                 }
             }
         } catch {}
@@ -690,7 +806,14 @@ class AIMemoryManager {
     }
 
     wipeUser(userId) {
-        for (const table of ['conversations', 'interests', 'personality', 'relationships', 'user_aliases', 'user_summaries']) {
+        for (const table of [
+            'conversations',
+            'interests',
+            'personality',
+            'relationships',
+            'user_aliases',
+            'user_summaries',
+        ]) {
             try {
                 this.db.prepare(`DELETE FROM ${table} WHERE user_id=?`).run(userId)
             } catch {}
@@ -706,37 +829,42 @@ class AIMemoryManager {
     cleanupOld(days = 30) {
         const safeDays = Math.max(1, Math.floor(Number(days) || 30))
         const cutoff = `-${safeDays}`
-        this.db
-            .prepare(`DELETE FROM conversations WHERE timestamp < datetime('now', ? || ' days')`)
-            .run(cutoff)
-        this.db
-            .prepare(
-                `DELETE FROM interests WHERE last_mentioned < datetime('now', ? || ' days') AND frequency < 3`,
-            )
-            .run(cutoff)
-        // Orphaned aliases: user has no conversations in last N days
-        this.db
-            .prepare(
-                `DELETE FROM user_aliases WHERE user_id NOT IN (SELECT DISTINCT user_id FROM conversations WHERE timestamp > datetime('now', ? || ' days'))`,
-            )
-            .run(cutoff)
-        // Orphaned relationships: both users inactive
-        this.db
-            .prepare(
-                `DELETE FROM relationships WHERE user_id NOT IN (SELECT DISTINCT user_id FROM conversations WHERE timestamp > datetime('now', ? || ' days'))`,
-            )
-            .run(cutoff)
-        this.db
-            .prepare(
-                `DELETE FROM relationships WHERE related_user_id NOT IN (SELECT DISTINCT user_id FROM conversations WHERE timestamp > datetime('now', ? || ' days'))`,
-            )
-            .run(cutoff)
-        // Stale personality profiles
-        this.db
-            .prepare(
-                `DELETE FROM personality WHERE user_id NOT IN (SELECT DISTINCT user_id FROM conversations WHERE timestamp > datetime('now', ? || ' days'))`,
-            )
-            .run(cutoff)
+        // One transaction, not seven: single commit, and a mid-way failure
+        // leaves nothing half-pruned instead of a partial state.
+        const prune = this.db.transaction(() => {
+            this.db
+                .prepare(`DELETE FROM conversations WHERE timestamp < datetime('now', ? || ' days')`)
+                .run(cutoff)
+            this.db
+                .prepare(
+                    `DELETE FROM interests WHERE last_mentioned < datetime('now', ? || ' days') AND frequency < 3`,
+                )
+                .run(cutoff)
+            // Orphaned aliases: user has no conversations in last N days
+            this.db
+                .prepare(
+                    `DELETE FROM user_aliases WHERE user_id NOT IN (SELECT DISTINCT user_id FROM conversations WHERE timestamp > datetime('now', ? || ' days'))`,
+                )
+                .run(cutoff)
+            // Orphaned relationships: both users inactive
+            this.db
+                .prepare(
+                    `DELETE FROM relationships WHERE user_id NOT IN (SELECT DISTINCT user_id FROM conversations WHERE timestamp > datetime('now', ? || ' days'))`,
+                )
+                .run(cutoff)
+            this.db
+                .prepare(
+                    `DELETE FROM relationships WHERE related_user_id NOT IN (SELECT DISTINCT user_id FROM conversations WHERE timestamp > datetime('now', ? || ' days'))`,
+                )
+                .run(cutoff)
+            // Stale personality profiles
+            this.db
+                .prepare(
+                    `DELETE FROM personality WHERE user_id NOT IN (SELECT DISTINCT user_id FROM conversations WHERE timestamp > datetime('now', ? || ' days'))`,
+                )
+                .run(cutoff)
+        })
+        prune()
         this.cleanupLore()
         // Gated VACUUM, defaults to once per 7 days to avoid 3-5s blocking ops
         const now = Date.now()
@@ -779,12 +907,6 @@ class AIMemoryManager {
         } catch {
             return false
         }
-    }
-
-    removeLore(id) {
-        try {
-            this.db.prepare('DELETE FROM server_lore WHERE id=?').run(id)
-        } catch {}
     }
 
     getLore(limit = 12) {
@@ -850,49 +972,76 @@ class AIMemoryManager {
 
 // Ghost users system (persistent per-user filter)
 class GhostUsers {
-    constructor() {
-        this._data = {}
-        this._saveTimer = null
-        this._load()
+    // Backed by the merged medusa-users.json store: getUsers() returns the
+    // live `users` map, save() schedules a persist. API keeps the combined
+    // "guildId:userId" scope keys callers already pass. Stored shape:
+    // users[uid].ghost[gid] = [targetIds]. Sparse — empty entries vanish.
+    constructor(getUsers, save) {
+        this._getUsers = getUsers
+        this._save = save
     }
-    _load() {
-        try {
-            if (existsSync(GHOST_FILE)) this._data = JSON.parse(readFileSync(GHOST_FILE, 'utf8'))
-        } catch {}
+    _split(scope) {
+        const i = String(scope ?? '').lastIndexOf(':')
+        if (i < 0) return null
+        return { gid: scope.slice(0, i), uid: scope.slice(i + 1) }
     }
-    _save() {
-        // Debounce: coalesce rapid add/remove bursts into a single disk write
-        if (this._saveTimer) return
-        this._saveTimer = setTimeout(async () => {
-            this._saveTimer = null
-            try {
-                await mkdir('data/ai', { recursive: true })
-                await writeFile(GHOST_FILE, JSON.stringify(this._data, null, 2))
-            } catch {}
-        }, 2000)
+    _g(uid, gid) {
+        return this._getUsers()?.[uid]?.ghost?.[gid] ?? []
+    }
+    _setG(uid, gid, list) {
+        const users = this._getUsers()
+        if (!users) return
+        if (list.length) {
+            ;((users[uid] ??= {}).ghost ??= {})[gid] = list
+        } else {
+            const g = users[uid]?.ghost
+            if (g) {
+                delete g[gid]
+                if (!Object.keys(g).length) delete users[uid].ghost
+                if (users[uid] && !Object.keys(users[uid]).length) delete users[uid]
+            }
+        }
+        this._save()
     }
     add(userId, targetId) {
-        if (!this._data[userId]) this._data[userId] = []
-        if (!this._data[userId].includes(targetId)) {
-            this._data[userId].push(targetId)
-            this._save()
-        }
+        const s = this._split(userId)
+        if (!s) return
+        const cur = this._g(s.uid, s.gid)
+        if (!cur.includes(targetId)) this._setG(s.uid, s.gid, [...cur, targetId])
     }
     remove(userId, targetId) {
-        if (!this._data[userId]) return
-        this._data[userId] = this._data[userId].filter((id) => id !== targetId)
-        if (!this._data[userId].length) delete this._data[userId]
-        this._save()
+        const s = this._split(userId)
+        if (!s) return
+        this._setG(
+            s.uid,
+            s.gid,
+            this._g(s.uid, s.gid).filter((id) => id !== targetId),
+        )
     }
     list(userId) {
-        return this._data[userId] ?? []
+        const s = this._split(userId)
+        if (!s) return []
+        return this._g(s.uid, s.gid)
     }
     isGhosted(userId, targetId) {
-        return (this._data[userId] ?? []).includes(targetId)
+        const s = this._split(userId)
+        if (!s) return false
+        return this._g(s.uid, s.gid).includes(targetId)
     }
     clear(userId) {
-        delete this._data[userId]
-        this._save()
+        const s = this._split(userId)
+        if (!s) return
+        this._setG(s.uid, s.gid, [])
+    }
+    // Forget-me support: drop every ghost scope belonging to one user id
+    // across all guilds (single-scope clear() can't express that).
+    clearUser(uid) {
+        const users = this._getUsers()
+        if (users?.[uid]) {
+            delete users[uid].ghost
+            if (!Object.keys(users[uid]).length) delete users[uid]
+            this._save()
+        }
     }
 }
 

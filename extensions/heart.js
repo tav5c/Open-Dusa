@@ -1,4 +1,3 @@
-import { LRUCache } from 'lru-cache'
 import { statfsSync } from 'fs'
 import { cpus, loadavg } from 'os'
 import { monitorEventLoopDelay } from 'perf_hooks'
@@ -61,31 +60,6 @@ class GlobalRateLimiter {
     }
 }
 
-class SmartRetrier {
-    constructor(attempts = 3, backoff = 1500, maxDelay = 30_000) {
-        this.attempts = attempts
-        this.backoff = backoff
-        this.maxDelay = maxDelay
-    }
-
-    async retry(fn) {
-        let last
-        for (let i = 0; i < this.attempts; i++) {
-            try {
-                return await fn()
-            } catch (e) {
-                last = e
-                if (i < this.attempts - 1) {
-                    const base = Math.min(this.maxDelay, this.backoff * 1.5 ** i)
-                    const jitter = Math.random() * base * 0.3
-                    await new Promise((r) => setTimeout(r, base + jitter))
-                }
-            }
-        }
-        throw last
-    }
-}
-
 export class MedusaHeart {
     constructor(client) {
         this.client = client
@@ -94,18 +68,7 @@ export class MedusaHeart {
         this._tasks = new Set()
         this._stats = { commands: 0, errors: 0, rateLimited: 0, firedTasks: 0 }
 
-        this.cache = new LRUCache({
-            max: 2048,
-            ttl: 300_000,
-            updateAgeOnGet: false,
-            allowStale: false,
-            maxSize: 50 * 1024 * 1024,
-            sizeCalculation: (value) => (typeof value === 'string' ? value.length : 1024),
-        })
-        this.guildCache = new Map()
-
         this.rateLimiter = new GlobalRateLimiter()
-        this.retrier = new SmartRetrier()
 
         this.monitor = {
             mem: 0,
@@ -247,13 +210,6 @@ export class MedusaHeart {
     _startCleanup() {
         this._cleanupInterval = setInterval(() => {
             this.rateLimiter.cleanup()
-            // Prune dead guilds from heart cache to prevent memory leak on server leaves
-            const now = Date.now()
-            for (const [gid, data] of this.guildCache) {
-                if (data.lastAccess && now - data.lastAccess > 7 * 86400000) {
-                    this.guildCache.delete(gid)
-                }
-            }
         }, 60_000).unref()
     }
 
@@ -262,6 +218,11 @@ export class MedusaHeart {
             if (this._closed) return
             this._closed = true
             console.log(`[Heart] ${sig}, shutting down`)
+            // Flush pending prefs synchronously first: the 500ms debounced
+            // users save would otherwise die with the process on panel stops.
+            try {
+                this.client?.aiCog?._saveUsersNow?.()
+            } catch {}
             if (this.loopHistogram) this.loopHistogram.disable()
             clearInterval(this._monitorInterval)
             clearInterval(this._cleanupInterval)

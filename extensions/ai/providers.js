@@ -5,14 +5,42 @@ import OpenAI from 'openai'
 import { Agent } from 'undici'
 import { DEAD_KEYS_FILE } from './constants.js'
 
+// Tavily client pool: same `.search()` shape as a single client, rotates to
+// the next key on rate-limit/quota errors. Pure factory for testability.
+export function createTavilyPool(tavily, keys) {
+    let idx = 0
+    const clients = keys.map((k) => tavily({ apiKey: k }))
+    return {
+        size: clients.length,
+        search: async (...args) => {
+            const attempt = (i) => clients[i].search(...args)
+            try {
+                return await attempt(idx)
+            } catch (e) {
+                const s = String(e?.message ?? e).toLowerCase()
+                if (clients.length > 1 && /429|rate.?limit|quota|too many|insufficient|credit/.test(s)) {
+                    idx = (idx + 1) % clients.length
+                    console.warn(`[AI] Tavily key rotated (${idx + 1}/${clients.length})`)
+                    return await attempt(idx)
+                }
+                throw e
+            }
+        },
+    }
+}
+
 export const _undiciAgent = new Agent({
     connections: 30,
-    pipelining: 4,
+    pipelining: 1,
     keepAliveTimeout: 60_000,
     keepAliveMaxTimeout: 300_000,
     connectTimeout: 8_000,
-    headersTimeout: 15_000,
-    bodyTimeout: 60_000,
+    // undici defaults (300 s): per-call budgets stay on the openai SDK
+    // timeouts / AbortSignal, which always fire first. A low ceiling here
+    // would truncate @discordjs/rest traffic (it imports undici directly);
+    // pipelining 1 avoids head-of-line blocking on long requests.
+    headersTimeout: 300_000,
+    bodyTimeout: 300_000,
 })
 
 export class ProviderCore {
@@ -49,8 +77,16 @@ export class ProviderCore {
             this._groqResearch = createClient(this.llmBaseUrl, key, 45_000, 0)
 
             const research = this._config.agents.research.resolved
+            // maxRetries 0 like every other client: the SDK's blind retry would
+            // re-fire into the same limited key and delay retry-after-aware
+            // rotation. Manual chain (_callResearchWith) owns all retries.
             this._researchClient = research?.baseUrl
-                ? createClient(research.baseUrl, this.researchKeys[this.currentResearchKeyIdx ?? 0] ?? key, 60_000, 1)
+                ? createClient(
+                      research.baseUrl,
+                      this.researchKeys[this.currentResearchKeyIdx ?? 0] ?? key,
+                      60_000,
+                      0,
+                  )
                 : this._groqResearch
 
             // Dedicated clients for agents pinned to a different provider than chat
@@ -67,14 +103,19 @@ export class ProviderCore {
             this._researchClient = null
         }
 
-        // Optional Tavily client, wakes up the `else if (this._tavily)` branch in _callResearch.
+        // Optional Tavily client pool, wakes up the `else if (this._tavily)` branch in _callResearch.
         // Dynamic import via .then() because _initGroq is synchronous (called from constructor).
-        const tavilyKey = (this._config ?? this.config).search?.tavilyKey
-        if (tavilyKey && !this._tavily) {
+        // Multiple keys rotate on rate-limit/quota errors; a single string still works.
+        const tavilyKeys = (this._config ?? this.config).search?.tavilyKeys ?? []
+        const firstTavily = tavilyKeys[0] ?? (this._config ?? this.config).search?.tavilyKey
+        if (firstTavily && !this._tavily) {
             import('@tavily/core')
                 .then(({ tavily }) => {
-                    this._tavily = tavily({ apiKey: tavilyKey })
-                    console.log('[AI] Tavily client initialized')
+                    const pool = tavilyKeys.length ? tavilyKeys : [firstTavily]
+                    this._tavily = createTavilyPool(tavily, pool)
+                    console.log(
+                        `[AI] Tavily client initialized (${pool.length} key${pool.length === 1 ? '' : 's'})`,
+                    )
                 })
                 .catch((e) => {
                     console.warn('[AI] Tavily import failed, run `npm i @tavily/core` to enable:', e.message)
@@ -90,7 +131,15 @@ export class ProviderCore {
         const pool = this._config?.providers?.filter((p) => p.keys?.length)
         const list = pool?.length
             ? pool
-            : [{ name: 'default', baseUrl: this.llmBaseUrl, keys: this.aiTokens, model: this.aiModel, priority: 1 }]
+            : [
+                  {
+                      name: 'default',
+                      baseUrl: this.llmBaseUrl,
+                      keys: this.aiTokens,
+                      model: this.aiModel,
+                      priority: 1,
+                  },
+              ]
 
         this._providers = list.map((p) => ({
             ...p,
@@ -112,7 +161,8 @@ export class ProviderCore {
                 p.client = new OpenAI({ apiKey: key, baseURL: p.baseUrl, timeout: 12_000, maxRetries: 0 })
             } catch (e) {
                 p.client = null
-                if (this._config?.debug) console.warn(`[AI] Provider '${p.name}' client init failed: ${e.message}`)
+                if (this._config?.debug)
+                    console.warn(`[AI] Provider '${p.name}' client init failed: ${e.message}`)
             }
         }
     }
@@ -122,7 +172,9 @@ export class ProviderCore {
         if (p.state.failures >= 3) {
             p.state.openUntil = Date.now() + openMs // half-open once the window passes
             p.state.failures = 0
-            console.warn(`[AI] Provider '${p.name}' circuit OPEN for ${Math.round(openMs / 1000)}s (${String(err).slice(0, 80)})`)
+            console.warn(
+                `[AI] Provider '${p.name}' circuit OPEN for ${Math.round(openMs / 1000)}s (${String(err).slice(0, 80)})`,
+            )
         }
     }
 
@@ -148,11 +200,14 @@ export class ProviderCore {
         const retryAfter = headers?.get?.('retry-after') ?? headers?.['retry-after']
         if (retryAfter != null) {
             const seconds = Number(retryAfter)
-            if (Number.isFinite(seconds)) return Math.min(Math.max(Math.ceil(seconds * 1000) + 1000, 5_000), 6 * 3600_000)
+            if (Number.isFinite(seconds))
+                return Math.min(Math.max(Math.ceil(seconds * 1000) + 1000, 5_000), 6 * 3600_000)
             const at = Date.parse(retryAfter)
             if (Number.isFinite(at)) return Math.min(Math.max(at - Date.now() + 1000, 5_000), 6 * 3600_000)
         }
-        const m = String(err).match(/try again in\s+(?:(\d+)h)?(?:(\d+)m(?!s))?(?:([\d.]+)s)?(?:([\d.]+)ms)?/i)
+        const m = String(err).match(
+            /try again in\s+(?:(\d+)h)?(?:(\d+)m(?!s))?(?:([\d.]+)s)?(?:([\d.]+)ms)?/i,
+        )
         if (!m || (!m[1] && !m[2] && !m[3] && !m[4])) return 60_000
         const ms =
             (parseInt(m[1] ?? 0) * 3600 + parseInt(m[2] ?? 0) * 60 + parseFloat(m[3] ?? 0)) * 1000 +
@@ -167,13 +222,18 @@ export class ProviderCore {
         if (n < 2) return false
         p.state.keyIdx ??= 0
         p.state.keyCooldowns ??= new Map()
-        p.state.keyCooldowns.set(p.state.keyIdx, Date.now() + Math.max(retryMs, 30_000))
+        p.state.keyCooldowns.set(p.state.keyIdx, Date.now() + Math.max(retryMs, 5_000))
         const now = Date.now()
         for (let step = 1; step <= n; step++) {
             const next = (p.state.keyIdx + step) % n
             if ((p.state.keyCooldowns.get(next) ?? 0) > now) continue
             try {
-                p.client = new OpenAI({ apiKey: p.keys[next], baseURL: p.baseUrl, timeout: 12_000, maxRetries: 0 })
+                p.client = new OpenAI({
+                    apiKey: p.keys[next],
+                    baseURL: p.baseUrl,
+                    timeout: 12_000,
+                    maxRetries: 0,
+                })
                 console.log(
                     `[AI] Provider '${p.name}' key rotated: ${p.state.keyIdx + 1} -> ${next + 1} (${reason}, cooldown ${Math.round(retryMs / 1000)}s)`,
                 )
@@ -191,7 +251,7 @@ export class ProviderCore {
      * honored verbatim, providers already configured for it go first so chat doesn't burn
      * a doomed call (e.g. asking groq for xkiro's qwen model) on every single message.
      */
-    async _routedCall(messages, model, maxTokens, temp, topP) {
+    async _routedCall(messages, model, maxTokens, temp, topP, budget = null) {
         if (!this._providers) this._initProviders()
         const now = Date.now()
         // Stable sort: the agent's pinned provider first (it owns this model family —
@@ -212,6 +272,7 @@ export class ProviderCore {
             if (!firstFailure) firstFailure = `${p.name} (${detail})`
         }
         for (const p of ordered) {
+            if (budget && Date.now() > budget.until) break
             if (!p.client) continue
             if (now < p.state.openUntil) {
                 noteFailure(p, 'breaker open')
@@ -219,11 +280,24 @@ export class ProviderCore {
             }
             attempts++
             const payload = {
-                ...this._buildPayload(model ?? p.model ?? this.aiModel, messages, maxTokens, temp, topP, p.baseUrl),
+                ...this._buildPayload(
+                    model ?? p.model ?? this.aiModel,
+                    messages,
+                    maxTokens,
+                    temp,
+                    topP,
+                    p.baseUrl,
+                ),
                 stream: false,
             }
             try {
-                const r = await p.client.chat.completions.create(payload)
+                // Preferred provider gets a 25s ceiling: its TTFT routinely
+                // exceeds the shared 12s client default, and a premature
+                // timeout here burns the whole chain for a live-but-slow hop.
+                const r = await p.client.chat.completions.create(
+                    payload,
+                    p.baseUrl === preferredBase ? { timeout: 25_000 } : undefined,
+                )
                 const out = r.choices?.[0]?.message?.content
                 if (out) {
                     this._resetBreaker(p)
@@ -242,9 +316,17 @@ export class ProviderCore {
                 this._tripBreaker(p, 'empty response')
             } catch (e) {
                 noteFailure(p, `HTTP ${this._errorStatus(e) ?? '?'} ${String(e?.message ?? e).slice(0, 60)}`)
+                // Dead-provider marking: a timeout/network/5xx on one model
+                // poisons the rest of this reply's chain, so skip sibling
+                // entries on the same base. 404/429 stay per-entry — a
+                // per-model miss must not kill a healthy provider.
+                const st = this._errorStatus(e)
+                if (budget && (st == null || st >= 500)) budget.dead.add(p.baseUrl)
                 const err = String(e).toLowerCase()
                 if (this._config?.debug)
-                    console.warn(`[AI] Provider '${p.name}' failed (${e?.status ?? 'no-status'}): ${err.slice(0, 120)}`)
+                    console.warn(
+                        `[AI] Provider '${p.name}' failed (${e?.status ?? 'no-status'}): ${err.slice(0, 120)}`,
+                    )
                 if (this._isCapacityError(e) || this._isRequestError(e)) continue // changing keys cannot fix these
                 if (this._isBillingError(e)) {
                     // Wallet-level block (pay-as-you-go balance, promo credit that
@@ -267,7 +349,8 @@ export class ProviderCore {
                     for (let hop = 1; hop < ring; hop++) {
                         const retryMs = this._parseRetryMs(lastErr)
                         const status = this._errorStatus(lastErr)
-                        if (!this._rotateProviderKey(p, retryMs, status ? `HTTP ${status}` : 'key error')) break
+                        if (!this._rotateProviderKey(p, retryMs, status ? `HTTP ${status}` : 'key error'))
+                            break
                         try {
                             const r2 = await p.client.chat.completions.create(payload)
                             const out2 = r2.choices?.[0]?.message?.content
@@ -293,13 +376,17 @@ export class ProviderCore {
                     }
                     if (stopReason) {
                         // Keys aren't the problem here, don't punish the whole provider for it
-                        console.warn(`[AI] Provider '${p.name}' key burn stopped (${stopReason}), trying next provider`)
+                        console.warn(
+                            `[AI] Provider '${p.name}' key burn stopped (${stopReason}), trying next provider`,
+                        )
                         continue
                     }
                     // Every key limited: open the breaker until the soonest key frees up
                     const cooldowns = [...(p.state.keyCooldowns?.values() ?? [])]
-                    const wait = cooldowns.length ? Math.min(...cooldowns) - Date.now() : this._parseRetryMs(lastErr)
-                    p.state.openUntil = Date.now() + Math.min(Math.max(wait, 30_000), 30 * 60_000)
+                    const wait = cooldowns.length
+                        ? Math.min(...cooldowns) - Date.now()
+                        : this._parseRetryMs(lastErr)
+                    p.state.openUntil = Date.now() + Math.min(Math.max(wait, 5_000), 30 * 60_000)
                     p.state.failures = 0
                     console.warn(
                         `[AI] Provider '${p.name}' circuit OPEN for ${Math.round((p.state.openUntil - Date.now()) / 1000)}s (all keys rate-limited)`,
@@ -345,9 +432,7 @@ export class ProviderCore {
             // Billing blocks are wallet-level: rotating keys can't help, and must
             // not cool down healthy keys. Bail out and let the caller degrade.
             if (this._isBillingError(errorMsg)) {
-                console.warn(
-                    `[AI] Billing-blocked, not rotating keys: ${String(errorMsg).slice(0, 160)}`,
-                )
+                console.warn(`[AI] Billing-blocked, not rotating keys: ${String(errorMsg).slice(0, 160)}`)
                 return false
             }
             const n = this.aiTokens.length
@@ -361,9 +446,11 @@ export class ProviderCore {
                 console.log(`[AI] Key ${old + 1} permanently blacklisted`)
             } else if (this._isKeyError(errorMsg)) {
                 // Cool the key down for as long as the provider actually asked for.
+                // Floor is 5s (a fast re-hit costs ~1 RTT, not a stall); the old
+                // 30s floor over-cooled by ~5x on Groq's typical "try again" hints.
                 // If all keys are cooling down, we'll wait out the shortest one
                 // rather than ping-ponging.
-                this._keyCooldowns.set(old, Date.now() + Math.max(this._parseRetryMs(errorMsg), 30_000))
+                this._keyCooldowns.set(old, Date.now() + Math.max(this._parseRetryMs(errorMsg), 5_000))
             }
 
             const now = Date.now()
@@ -387,8 +474,11 @@ export class ProviderCore {
                 .filter(([k]) => !this.deadKeys.has(k))
                 .map(([, t]) => t)
             if (aliveCooldowns.length) {
+                // Bounded wait: real retry-afters are seconds; anything past
+                // 15s is a headerless default, and stalling an interactive
+                // reply on it is worse than shedding to fallbacks/breather.
                 const waitMs = Math.max(0, Math.min(...aliveCooldowns) - Date.now())
-                if (waitMs > 0 && waitMs < 60_000) {
+                if (waitMs > 0 && waitMs < 15_000) {
                     console.log(`[AI] All keys cooling down, waiting ${(waitMs / 1000).toFixed(1)}s`)
                     await new Promise((r) => setTimeout(r, waitMs + 100))
                     // Retry once
@@ -422,7 +512,7 @@ export class ProviderCore {
     // Censor toggle: config.json "nsfw". True = the models judge content
     // themselves; every code-level refusal below is bypassed. Defaults off.
     _nsfwAllowed() {
-        return !!((this._config ?? this.config)?.nsfw) || globalThis._medusaNsfw === true
+        return !!(this._config ?? this.config)?.nsfw || globalThis._medusaNsfw === true
     }
     // Billing blocks (pay-as-you-go wallet, credits, deposits) are PROVIDER-level,
     // never key-level: every key shares the same wallet, so rotating burns the
@@ -449,12 +539,9 @@ export class ProviderCore {
         const status = this._errorStatus(e)
         if (status === 429) return true
         if (status && status !== 429) return false
-        return [
-            'rate limit',
-            'quota exceeded',
-            'too many requests',
-            'limit exceeded',
-        ].some((x) => s.includes(x))
+        return ['rate limit', 'quota exceeded', 'too many requests', 'limit exceeded'].some((x) =>
+            s.includes(x),
+        )
     }
     _isKeyError(e) {
         if (this._isRateError(e)) return true
@@ -498,9 +585,9 @@ export class ProviderCore {
             status === 529 ||
             (status === 503 &&
                 (s.includes('over capacity') ||
-                s.includes('service unavailable') ||
-                s.includes('currently unavailable') ||
-                s.includes('capacity')))
+                    s.includes('service unavailable') ||
+                    s.includes('currently unavailable') ||
+                    s.includes('capacity')))
         )
     }
 
@@ -584,7 +671,10 @@ export class ProviderCore {
         }
 
         if (this._config?.stopSequences?.length) payload.stop = this._config.stopSequences
-        if (this._config?.streaming === true) payload.stream = true
+        // Single source of truth: _buildPayload never sets stream. _streamChat
+        // sets stream:true explicitly; every other caller forces stream:false
+        // after the spread. The old `streaming === true` line here silently
+        // streamed non-stream readers (.choices[0]) into nulls.
 
         return payload
     }
@@ -595,6 +685,11 @@ export class ProviderCore {
         if (!client) return null
 
         const payload = this._buildPayload(model, messages, maxTokens, temp, topP)
+        // _groqCall is ALWAYS non-streaming (_streamChat owns streaming): force
+        // it, because _buildPayload sets stream:true when global streaming is
+        // on, and reading .choices[0] off a stream response throws -> null.
+        // That silent null broke the classifier path whenever streaming was on.
+        payload.stream = false
         try {
             const r = await client.chat.completions.create(payload)
             this.keyFailures[this.currentKeyIdx] = 0
@@ -607,12 +702,17 @@ export class ProviderCore {
 
             if (this._isKeyError(e)) {
                 // Check if we have multiple keys to rotate through. If only 1 key, we must respect retry-after.
+                // Capped at 15s: genuine retry-afters are seconds; beyond that,
+                // shed to fallbacks instead of stalling the reply.
                 if (this.aiTokens.length <= 1 && !this._isDeadKeyError(err)) {
-                    const waitMs = Math.min(this._parseRetryMs(e), 30_000)
+                    const waitMs = Math.min(this._parseRetryMs(e), 15_000)
                     console.log(`[AI] 429 retry-after: waiting ${waitMs}ms (only 1 key available)`)
                     await new Promise((r) => setTimeout(r, waitMs))
                 }
-                if (await this.rotateKey(err)) {
+                // Pinned clients (classifier/vision on their own provider) must
+                // never rotate the shared chat ring: a classifier 429 would
+                // otherwise cool down chat keys it never uses.
+                if (!pinned && (await this.rotateKey(err))) {
                     try {
                         const r2 = await (pinned ?? this._groq).chat.completions.create(payload)
                         return r2.choices[0].message.content
@@ -635,24 +735,62 @@ export class ProviderCore {
             .replace(/<{2,3}\s*(?:RUN_CMD|ACTIONS_INTENDED)\s*:[^<>]*>?\s*$/g, '')
             .replace(/<<[^<>]*$/g, '')
     }
-    async _streamChat(messages, model, maxTokens, temp, message) {
+    async _streamChat(messages, model, maxTokens, temp, message, stubHint = null) {
         if (!this._groq) return null
+        // Route the open through the provider pool when it covers this base:
+        // a breaker-open or dead-keyed provider must be skipped instantly,
+        // not waited on for 30s. Falls back to the legacy client otherwise.
+        const routerP = (this._providers ?? []).find((p) => p.baseUrl === this.llmBaseUrl)
+        if (routerP && Date.now() < routerP.state.openUntil)
+            return this._groqCallWithFallbacks(messages, model, maxTokens, temp)
+        const streamClient = routerP?.client ?? this._groq
         const payload = { ...this._buildPayload(model, messages, maxTokens, temp), stream: true }
         let placeholder = null
+        let stubP = null
         let full = ''
         let lastEdit = 0
-        const EDIT_MS = 500 // 2 edits/s
+        // Edit pace: 1/s. Discord rate-limits message edits aggressively, and
+        // sub-second edits 429 silently (swallowed .catch) leaving the stream
+        // stalled-looking until the final edit. First chunk still posts
+        // immediately (lastEdit starts at 0).
+        const editGap = () => 1000
         const MAX_LEN = 1900 // leave room for the streaming cursor glyph
+        // Pondering stub adapts to expected effort (passed in by the caller,
+        // which knows prompt size and token budget) instead of one dry "…".
+        // Short asks stay minimal; long/research-heavy ones narrate the wait.
+        const stubText = stubHint ?? (maxTokens > 800 ? 'give me a sec…' : maxTokens > 500 ? 'one sec…' : '…')
 
         try {
-            const stream = await this._groq.chat.completions.create(payload)
-            placeholder = await this.secureReply(message, '…', { allowedMentions: { parse: [] } })
+            // Open the stream and post the placeholder in parallel: the stub
+            // lands instantly instead of after provider TTFT (9-12s of bare
+            // typing), so perceived latency drops to ~zero. stubP is awaited
+            // in catch too, or a failed open orphans the "…" in-channel.
+            stubP = this.secureReply(message, stubText, { allowedMentions: { parse: [] } }).then((m) => {
+                placeholder = m ?? null
+                // Stash for the caller: handleAIResponse rewrites this exact
+                // message post-parse (confirm UI / footer) and must not pay a
+                // REST re-fetch + heuristic match for an object we hold.
+                if (message && m) message._medusaStreamMsg = m
+                // Discord clears typing client-side the moment WE send. Re-fire
+                // immediately so the indicator survives the stub instead of
+                // gaping until the next 5s tick. Same after the final edit.
+                message.channel?.sendTyping?.().catch(() => {})
+                return m
+            })
+            // Stream-open gets its own 30s ceiling: provider TTFT (notably
+            // xkiro) routinely exceeds the shared 12s client default, and a
+            // timed-out open kills streaming even when the provider would
+            // have answered. Non-stream paths keep 12s + fallbacks.
+            const [stream] = await Promise.all([
+                streamClient.chat.completions.create(payload, { timeout: 30_000 }),
+                stubP,
+            ])
             for await (const chunk of stream) {
                 const delta = chunk.choices?.[0]?.delta?.content ?? ''
                 if (!delta) continue
                 full += delta
                 const now = Date.now()
-                if (placeholder && now - lastEdit >= EDIT_MS && full.length <= MAX_LEN) {
+                if (placeholder && now - lastEdit >= editGap() && full.length <= MAX_LEN) {
                     lastEdit = now
                     placeholder.edit(this._stripPartialTags(full) + ' ▌').catch(() => {})
                 }
@@ -666,7 +804,21 @@ export class ProviderCore {
             return full || null
         } catch (e) {
             console.warn('[AI] stream failed, falling back to non-stream:', String(e).slice(0, 160))
-            if (placeholder) placeholder.delete().catch(() => {})
+            // Feed the failure back into routing state so the next turn doesn't
+            // repeat it: rotate on key errors, trip the breaker otherwise
+            // (request errors like 400/404 are the caller's fault, not the key's).
+            if (routerP) {
+                if (this._isKeyError(e))
+                    this._rotateProviderKey(routerP, this._parseRetryMs(e), 'stream open')
+                else if (!this._isRequestError(e)) this._tripBreaker(routerP, e)
+            }
+            try {
+                const s = stubP ? await stubP : placeholder
+                await s?.delete?.().catch(() => {})
+                // Don't let the caller resurrect it: the streamed branch would
+                // otherwise edit a deleted message (harmless 404, still noise).
+                if (message) message._medusaStreamMsg = null
+            } catch {}
             return this._groqCallWithFallbacks(messages, model, maxTokens, temp)
         }
     }
@@ -684,7 +836,12 @@ export class ProviderCore {
             try {
                 this._fallbackClients.set(
                     id,
-                    new OpenAI({ apiKey: entry.keys[0], baseURL: entry.baseUrl, timeout: 12_000, maxRetries: 0 }),
+                    new OpenAI({
+                        apiKey: entry.keys[0],
+                        baseURL: entry.baseUrl,
+                        timeout: 12_000,
+                        maxRetries: 0,
+                    }),
                 )
             } catch {
                 return null
@@ -696,8 +853,10 @@ export class ProviderCore {
     // One attempt at one fallback entry. Never throws, never rotates keys:
     // failure just means "next entry". Breaker-open router providers are
     // skipped fast without burning a call.
-    async _tryFallbackEntry(entry, messages, maxTokens, temp, topP) {
+    async _tryFallbackEntry(entry, messages, maxTokens, temp, topP, budget = null) {
         if (!entry?.baseUrl || !entry?.keys?.length || !entry?.model) return null
+        if (budget && Date.now() > budget.until) return null
+        if (budget?.dead.has(entry.baseUrl)) return null
         const routerP = (this._providers ?? []).find((p) => p.baseUrl === entry.baseUrl)
         if (routerP && Date.now() < (routerP.state.openUntil ?? 0)) return null
         const client = routerP?.client ?? this._fallbackClient(entry)
@@ -716,25 +875,38 @@ export class ProviderCore {
                 routerP.state.openUntil = Date.now() + 5 * 60_000
                 routerP.state.failures = 0
                 console.warn(`[AI] Fallback provider '${routerP.name}' billing-blocked, skipping`)
+            } else if (budget) {
+                const st = this._errorStatus(e)
+                if (st == null || st >= 500) budget.dead.add(entry.baseUrl)
             }
             return null
         }
     }
 
-    async _groqCallWithFallbacks(messages, model, maxTokens = 2500, temp = this.temperature, topP, agent = 'chat') {
-        // Prefer the multi-provider router when configured. On total miss, walk
-        // this agent's own fallback chain (config agents.*.fallbacks, plus legacy
-        // top-level fallbackModels merged into chat) — each entry carries its own
-        // provider, so dead providers/models are skipped, never retried, and a
-        // 404 on one entry doesn't stop the rest.
+    async _groqCallWithFallbacks(
+        messages,
+        model,
+        maxTokens = 2500,
+        temp = this.temperature,
+        topP,
+        agent = 'chat',
+    ) {
+        // Single-provider installs skip the router; multi-provider installs
+        // route first and walk the chain on miss. The old code always ran
+        // _groqCall after _routedCall, re-hitting the same provider/model the
+        // router just tried (duplicate hop + up to 12s burn, breaker ignored).
+        // _groqCall stays for the single-provider case only.
+        const budget = { until: Date.now() + (this._replyBudgetMs ?? 30_000), dead: new Set() }
         if (this._providers?.length > 1) {
-            const routed = await this._routedCall(messages, model, maxTokens, temp, topP)
+            const routed = await this._routedCall(messages, model, maxTokens, temp, topP, budget)
             if (routed) return routed
+        } else {
+            const result = await this._groqCall(messages, model, maxTokens, temp, topP)
+            if (result && !result.capacityError) return result
         }
-        const result = await this._groqCall(messages, model, maxTokens, temp, topP)
-        if (result && !result.capacityError) return result
         for (const fb of this.agentFallbacks?.[agent] ?? []) {
-            const out = await this._tryFallbackEntry(fb, messages, maxTokens, temp, topP)
+            if (Date.now() > budget.until) break
+            const out = await this._tryFallbackEntry(fb, messages, maxTokens, temp, topP, budget)
             if (out) return out
         }
         return null

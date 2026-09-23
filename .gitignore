@@ -5,6 +5,7 @@ package-lock.json
 # Environment / Secrets
 .env
 config.json
+config.censored.json
 
 # Generated config & data (runtime overlay, callers, priv, performance, slash hash cache)
 configs/
@@ -22,6 +23,7 @@ timezones.json
 # Cache & Temporary Files
 .slash_hash
 *.log
+.tmp-purge/
 
 # OS generated files
 .DS_Store
@@ -29,8 +31,6 @@ Thumbs.db
 
 configs/*
 !configs/performance.json
-
-next.commit.txt
 
 # Local release archives and attachments
 *.zip

@@ -34,7 +34,7 @@ Open-Dusa is built on three load-bearing ideas:
 A second `messageCreate` listener (separate from the AI handler) silently populates a per-channel ring buffer of the last 25 messages. Before every AI response, this buffer is injected into the system prompt as `RECENT CHANNEL ACTIVITY`. The buffer is purely in-memory - nothing is persisted - and it auto-expires entries older than 10 minutes.
 
 **2. Agentic Memory (SQLite WAL)**  
-Per-user and per-server data is stored in `better-sqlite3` databases running in Write-Ahead Logging mode. Tables include `conversations`, `interests`, `personality`, `relationships`, `user_aliases`, `server_lore`, and `user_summaries`. The `AIMemoryManager` class defers all writes through a 150ms flush queue to batch concurrent operations, and pre-prepares all hot SQL statements at init time. A background summarizer periodically folds each user's oldest conversations into a compact `user_summaries` note and deletes the raw rows - long-term context survives, the database doesn't bloat. Each database file also compacts itself (`VACUUM`) shortly after it loads and roughly once a day, on its own independent schedule so no two files ever block each other.
+Per-user and per-server data is stored in `better-sqlite3` databases running in Write-Ahead Logging mode. Tables include `conversations` (+ an FTS5 mirror for full-text memory search), `interests`, `personality`, `relationships`, `user_aliases`, `server_lore`, and `user_summaries`. The `AIMemoryManager` class defers all writes through a 150ms flush queue to batch concurrent operations, and pre-prepares all hot SQL statements at init time. A background summarizer periodically folds each user's oldest conversations into date-stamped `user_summaries` snapshots (appended, newest last — depth accumulates instead of overwriting) and deletes the raw rows - long-term context survives, the database doesn't bloat. Each database file also compacts itself (`VACUUM`) shortly after it loads and roughly once a day, on its own independent schedule so no two files ever block each other.
 
 **3. Dynamic Extension Loader**  
 Any `.js` file dropped into the `/extensions` directory is hot-loaded. Each extension can export `init()`, `handleMessage()`, and `handleInteraction()` hooks. The message pipeline runs each extension in order and stops early if any returns `true` (sinking the message). This is what makes the codebase forkable and composable.
@@ -145,15 +145,15 @@ npm run dev      # development (auto-restart on file changes)
             "baseUrl": "https://api.groq.com/openai/v1",
             "keys": ["gsk_YOUR_GROQ_KEY"],
             "model": "openai/gpt-oss-120b",
-            "priority": 1
+            "priority": 1,
         },
         {
             "name": "nvidia",
             "baseUrl": "https://integrate.api.nvidia.com/v1",
             "keys": ["nvapi-YOUR_NVIDIA_KEY"],
             "model": "mistralai/mistral-small-4-119b-2603",
-            "priority": 2
-        }
+            "priority": 2,
+        },
     ],
 
     // ─── Agents - one shape for all five ───────────────────────────────────────
@@ -168,26 +168,28 @@ npm run dev      # development (auto-restart on file changes)
             "topP": 1.0,
             "maxTokens": 1024,
             "systemPrompt": "You are ...", // Her entire personality - better left as is
-            "identity": "" // Facts that survive any persona swap (creator, links) - personas change her tune, not who she is
+            "identity": "", // Facts that survive any persona swap (creator, links) - personas change her tune, not who she is
         },
         "research": {
             "provider": "groq",
             "model": "openai/gpt-oss-120b", // Reasoning research model - give it token headroom (free tier: 1K req/day)
             "temperature": 0.6, // Lower = more factual
             "topP": 1.0,
-            "maxTokens": 1500
+            "maxTokens": 1500,
         },
         "vision": {
             "model": "nvidia/nemotron-nano-12b-v2-vl", // Image understanding (matches config.example.json)
             "temperature": 0.4,
             "topP": 1.0,
-            "maxTokens": 1024
+            "maxTokens": 1024,
         },
         "classifier": {
             // YES/NO routing - keep it small and fast. Defaults to your NIM provider
             // when one is configured so routing never eats the primary's daily tokens.
             "provider": "nvidia",
-            "model": "meta/llama-3.1-8b-instruct"
+            "model": "meta/llama-3.1-8b-instruct",
+            "temperature": 0,
+            "maxTokens": 64,
         },
         "quickAgent": {
             // The /medusa slash command - stateless, no memory or lore
@@ -196,8 +198,8 @@ npm run dev      # development (auto-restart on file changes)
             "topP": 0.9,
             "maxTokens": 1400,
             "allowResearch": true, // Whether /medusa can trigger web search
-            "systemPrompt": [] // Array of lines (see config.json)
-        }
+            "systemPrompt": [], // Array of lines (see config.json)
+        },
     },
     "fallbackModels": [
         // LEGACY: plain model IDs tried on the CHAT provider only, after every
@@ -206,7 +208,7 @@ npm run dev      # development (auto-restart on file changes)
         // walked past instead of retried. List kept for backwards compatibility
         // and merged into the chat chain automatically.
         "openai/gpt-oss-20b",
-        "qwen/qwen3.6-27b"
+        "qwen/qwen3.6-27b",
     ],
     // ─── Per-agent fallback chains ──────────────────────────────────────────
     // Add "fallback" (compact string) and/or "fallbacks" (array) inside any
@@ -225,7 +227,7 @@ npm run dev      # development (auto-restart on file changes)
     // ─── Optional Integrations ───────────────────────────────────────────────
     "search": {
         "serperKey": "", // serper.dev - free tier: 2500 searches/month
-        "tavilyKey": "" // tavily.com - fallback search provider
+        "tavilyKey": "", // tavily.com - fallback search provider
     },
     "giphyKey": "", // Giphy API key for GIF reactions (fallback if Klipy fails)
     "klipyKey": "", // Klipy API key — primary GIF provider (blank = skip to Giphy, then free fallback)
@@ -243,10 +245,10 @@ npm run dev      # development (auto-restart on file changes)
     // Empty map {} = prefix commands work everywhere. "ai": false disables the AI
     // in that server; "isolatedMemory": true gives it its own memory database.
     "guilds": {
-        "YOUR_GUILD_ID": { "ai": true, "isolatedMemory": false }
+        "YOUR_GUILD_ID": { "ai": true, "isolatedMemory": false },
     },
     "alwaysActiveChannels": [], // Channel IDs: AI always active (no trigger needed)
-    "funChannels": [] // Channel IDs for unprompted messages
+    "funChannels": [], // Channel IDs for unprompted messages
 }
 ```
 
@@ -267,7 +269,7 @@ npm run dev      # development (auto-restart on file changes)
 
 ## Performance Tuning
 
-Open-Dusa ships with safe defaults suitable for cheap shared hosts (256 MB RAM, shared CPU). If you're running on a VPS with more headroom, edit `configs/performance.json` to override any of these knobs. One exception: `memoryDepth` set in `config.json` wins over the perf file — delete it there to single-source history depth from `performance.json`.
+Open-Dusa ships with safe defaults suitable for cheap shared hosts (256 MB RAM, shared CPU). If you're running on a VPS with more headroom, edit `configs/performance.json` to override any of these knobs. One exception: `memoryDepth` set in `config.json` wins over the perf file — delete it there to single-source history depth from `performance.json`. `fairShare` enables per-guild provider budgets + global in-flight cap so one spammy server can't starve the rest; `billingStats` appends a `-# in/out · total · time · t/s` usage footer to replies.
 
 On first startup, if `configs/performance.json` doesn't exist, the bot auto-creates it with defaults. Edit and restart to apply.
 
@@ -310,12 +312,13 @@ On first startup, if `configs/performance.json` doesn't exist, the bot auto-crea
 
 {
   "sqlite":      { "cacheSizeKB": 25000, "mmapSizeBytes": 134217728 },
-  "discord":     { "messageCache": 250, "memberCacheMax": 1000, "userCache": 2500, "messageSweepInterval": 250, "messageSweepLifetime": 1500 },
-  "ai":          { "responseCacheMax": 8192, "responseCacheTTLSec": 1800, "responseCacheMaxMB": 100,
+  "discord":     { "messageCache": 500, "memberCacheMax": 2000, "userCache": 2500, "messageSweepInterval": 250, "messageSweepLifetime": 1500 },
+  "ai":          { "responseCacheMax": 8192, "responseCacheTTLSec": 3600, "responseCacheMaxMB": 100,
                    "userCacheMax": 5000, "userCacheTTLSec": 600,
-                   "messageHistoryMax": 1000, "messageHistoryTTLMin": 120,
+                   "messageHistoryMax": 2000, "messageHistoryTTLMin": 120,
                    "repliedMsgCacheMax": 2000, "repliedMsgCacheTTLMin": 30,
-                   "memoryDepth": 20, "passiveBufferMax": 50, "passiveBufferChannelsMax": 1500 },
+                   "memoryDepth": 20, "passiveBufferMax": 50, "passiveBufferChannelsMax": 2500,
+                   "billingStats": false, "fairShare": true },
   "maintenance": { "cleanupIntervalMin": 45, "retentionDays": 180, "vacuumEveryDays": 7, "loopLagWarnMs": 200 }
 }
 
@@ -330,7 +333,13 @@ npm run start:max      # 6 GB heap, 24 UV threads - 8 GB+ hosts
 | ------------------------------ | ---------------------------------------------------------------- | ----------------------- |
 | `/memory`                      | View what Open-Dusa remembers about you                          | Everyone                |
 | `/forgetme`                    | Permanently delete your stored data                              | Everyone                |
-| `/mode`                        | Switch between `focused` (analytical) and `normal` (casual) mode | Everyone                |
+| `/mode`                        | Switch between `focused` (analytical), `normal` (casual), and `fast` (ultrashort) mode | Everyone                |
+| `/prompt`                      | Set, view, or reset your custom persona (`system` text, `reset:true` wipes) | Everyone                |
+| `/server-prompt`                | Set, view, or reset this server's persona (same args) | Manage Server           |
+| `/streaming`                   | Pick instant replies (`off`, no typing indicator) or fancy streaming (`on`) — just for you | Everyone                |
+| `/memory`                      | View what she remembers — or set `mode: On/Off` to opt out of storing + fetching (ghost-mode by default) | Everyone                |
+| `/ask`                         | Quick precise answer, light memory, instant (server only). `research`: Auto/On/Off, `privacy`: On/Off | Everyone                |
+| `/avatar`, `/banner`, `/mbanner` | Server avatar, server banner, main profile banner (`av`/`bn`/`mbn` still work) | Everyone                |
 | `/summarize`                   | Summarize recent channel conversation                            | Everyone (rate-limited) |
 | `/medusa`                      | Quick one-shot AI answer. No memory. DMs and group chats only.   | Everyone                |
 | `/recall`                      | Look up what she remembers about a member. Fully private (only you see it). Self + mods. | Everyone (self) / Mods (others) |
@@ -339,26 +348,34 @@ npm run start:max      # 6 GB heap, 24 UV threads - 8 GB+ hosts
 | `/ai-pause pause/resume`       | Pause or resume the AI in this server (saved to config.json)     | Admins                  |
 | `/isolation true/false`        | Give a server its own AI memory (resumable)                      | Owner                   |
 | `/configclean`                 | Sweep dead server/channel ids out of config.json                 | Owner                   |
+| `/debug`                        | Toggle debug mode: owner-only replies, scratch DB, verbose logs (hot-swaps, no reboot) | Owner                   |
 
 ## Prefix Commands (`med,`)
 
 Every command below also works with any alias you add to `prefixAliases` in `config.json`.
 
 ```
-med,p <prompt>        - Set a custom AI persona just for you
-med,pr                - Reset to default persona
-med,serverp <prompt>  - Set a server-wide persona (needs Manage Server)
-med,serverpr          - Reset the server persona
-med,mode focused/normal
-med,afk [reason]      - Go AFK with a timestamped reason
+
+med,p <prompt> - Set a custom AI persona just for you
+med,pr - Reset to default persona
+med,serverp <prompt> - Set a server-wide persona (needs Manage Server)
+med,serverpr - Reset the server persona
+med,mode focused/normal/fast
+med,stream on/off - Instant replies (off, no typing) or fancy streaming (on), just for you
+med,afk [reason] - Go AFK with a timestamped reason
 med,unafk
 med,ping / med,stats / med,menu
 med,ban / med,kick / med,unban / med,mute / med,unmute / med,warn / med,clear / med,mpurge
-med,whois <name>        - Look up a member's @mention + ID by name
-med,recall <name>       - Look up what she remembers (self + mods, auto-deletes in 60s)
-med,joinvc / med,leavevc / med,vc  - Voice presence (needs Manage Channels or mod)
-med,remind <1h30m|ISO datetime> <text>  - Set a reminder (units: s/m/h/d/w, or an exact date/time)
-```
+med,createrole <name> [#hexcolor] - Mint a new role (needs Manage Roles, AI asks first)
+med,whois <name> - Look up a member's @mention + ID by name
+med,recall <name> - Look up what she remembers (self + mods, auto-deletes in 60s)
+med,joinvc / med,leavevc / med,vc - Voice presence (needs Manage Channels or mod)
+med,remind <1h30m|ISO datetime> <text> - Set a reminder (units: s/m/h/d/w, or an exact date/time)
+med,remind #channel <when> <text> - Fire it in another channel instead
+med,remind every <1d|friday 17:00> <text> - Repeating schedule (weekly UTC, min every 5m, 10 max)
+med,reminders - Embed list with tap-to-cancel buttons | med,delreminder <id> - Cancel one
+
+`````
 
 > [!NOTE]
 > The prefix `remind` command only accepts a duration or ISO datetime as its first token - it doesn't parse natural language. Mention Medusa instead (`@Medusa remind me to... in 20m`) to set one conversationally; she extracts the timing herself and confirms with a real timestamped reminder line, not just a reply.
@@ -370,35 +387,36 @@ med,remind <1h30m|ISO datetime> <text>  - Set a reminder (units: s/m/h/d/w, or a
 The extension API is the fastest way to add features without touching core files.
 
 ```javascript
-// extensions/myFeature.js
+// extensions/myFeature.js — copy this file, rename the manifest, drop it in
+// /extensions to activate. Delete the file again if you'd rather keep the
+// tree clean; this template lives here now.
 
-// Called once on startup. Receives the live client, db, and heart.
-export function init(client, db, heart) {
-    console.log('[myFeature] Loaded!')
+export const manifest = {
+    name: 'myFeature',
+    version: '1.0.0',
+    author: 'you',
+    description: 'Example extension template',
+    apiVersion: 1,
+    slashCommands: [], // array of SlashCommandBuilder().toJSON() shapes
+    permissions: [], // e.g. ['ManageMessages']
+    dependencies: [], // ['ai', 'moderation', ...]
+}
 
-    // Register a prefix command dynamically
+export async function init(client, db, heart) {
+    console.log(`[${manifest.name}] Loaded v${manifest.version}`)
+    // Register dynamic prefix commands or listeners here
     client.commands.set('hello', async (msg) => {
         await msg.reply('world!')
     })
 }
 
-// Runs on every message before prefix routing.
-// Return true to "sink" the message (stops all further processing).
-// Return false/undefined to let it pass through.
-export async function handleMessage(message) {
-    if (message.content === 'ping') {
-        await message.reply('pong')
-        return true // sink - AI won't see this
-    }
+export async function handleMessage(_message) {
+    // Return true to "sink" (stop pipeline), false/undefined to pass through.
     return false
 }
 
-// Runs on every slash command interaction.
-// Return true if you handled it, false/undefined to pass through.
-export async function handleInteraction(interaction) {
-    if (interaction.commandName !== 'mycommand') return false
-    await interaction.reply('handled!')
-    return true
+export async function handleInteraction(_interaction) {
+    return false
 }
 ```
 
@@ -408,7 +426,7 @@ Drop the file in `/extensions/` and restart. That's it.
 
 - `client` - the full Discord.js Client, including `client.commands` (prefix map) and `client.aiCog` (AI manager)
 - `db` - the main SQLite database (mod logs, warnings)
-- `heart` - the system monitor: `heart.rateLimiter`, `heart.cache` (LRU), `heart.monitor` (CPU/RAM/lag)
+- `heart` - the system monitor: `heart.rateLimiter`, `heart.monitor` (CPU/RAM/lag)
     > [!TIP]
     > The dynamic extension loader makes it easy to add features without touching core files and causing critical issues which makes the project easier to maintain.
 
@@ -430,11 +448,11 @@ message -> needsResearch()            (order matters; first match wins)
     └─ ambiguous             -> classifier LLM (YES/NO, 2.5s timeout -> heuristic fallback)
 ```
 
-The classifier uses a cheap fast model to avoid burning chat quota on conversational messages. If it times out or errors, a heuristic takes over (question-mark or version/year -> research, opinion frames stay direct) instead of silently going dumb. When an NVIDIA NIM provider is configured it rides that by default (`meta/llama-3.1-8b-instruct`) so routing calls never touch the primary provider's daily token budget; otherwise it falls back to `llama-3.1-8b-instant` on the primary. The 2.5s classification timeout means a slow round-trip can never block a reply.
+The classifier uses a cheap fast model to avoid burning chat quota on conversational messages. If it times out or errors, a heuristic takes over (question-mark or version/year -> research, opinion frames stay direct) instead of silently going dumb. When an NVIDIA NIM provider is configured it rides that by default (`meta/llama-3.1-8b-instruct`) so routing calls never touch the primary provider's daily token budget; otherwise it falls back to `openai/gpt-oss-20b` on the primary (`llama-3.1-8b-instant` is dead on Groq and 404s every call). The 2.5s classification timeout means a slow round-trip can never block a reply, and the timed-out chain is stopped, not left burning fallbacks in the background. Token budget comes from `agents.classifier.maxTokens` (default 64 — enough headroom for reasoning models whose thinking counts toward output tokens). `ALWAYS_LIVE` signals match on word boundaries, so "costume" no longer researches via "cost".
 
 ### Key Rotation
 
-Keys within each `providers[]` entry rotate automatically on 429/401/403 key errors, and the router falls through to the next provider when one is rate-limited or down. Cooldowns prefer the provider's `retry-after` header and fall back to the `try again in ...` window from the error body, so a daily-limit (TPD) key sits out until it's actually usable again instead of ping-ponging on a flat 30s timer. Request errors such as 400/413/422 and capacity errors such as 498/503/529 never burn through the key ring because changing credentials cannot fix the request or provider capacity. Rotation logs include the HTTP reason and cooldown, making a real all-account quota sweep distinguishable from a bad request. When one key gets limited the router immediately retries the same provider on its next free key; only when every key is cooling down does the circuit open, and it opens until the soonest key frees up (capped at 30 min) rather than a blind 60s. Keys are permanently blacklisted (`dead_keys.json`) only on organization-level errors (account suspended, org restricted). A transient 401 (expired token) rotates to the next key but doesn't blacklist - the key returns to rotation after restart. Duplicate keys in the array are dropped at load (they'd share the same org quota anyway), and the boot log prints each provider's key count so a mispasted pool is visible immediately.
+Keys within each `providers[]` entry rotate automatically on 429/401/403 key errors, and the router falls through to the next provider when one is rate-limited or down. Cooldowns prefer the provider's `retry-after` header and fall back to the `try again in ...` window from the error body, so a daily-limit (TPD) key sits out until it's actually usable again instead of ping-ponging on a flat 5s floor. Request errors such as 400/413/422 and capacity errors such as 498/503/529 never burn through the key ring because changing credentials cannot fix the request or provider capacity. Rotation logs include the HTTP reason and cooldown, making a real all-account quota sweep distinguishable from a bad request. When one key gets limited the router immediately retries the same provider on its next free key; only when every key is cooling down does the circuit open, and it opens until the soonest key frees up (5s minimum, capped at 30 min). Single-provider all-cooling waits are capped at 15s before shedding to fallbacks — genuine retry-afters (seconds) are honored, headerless defaults are not stalled on. Each reply runs under a 30s failover budget and skips providers that already timed out/5xx'd earlier in the same reply, so one dead provider can't eat the whole chain twice (the old duplicate `_groqCall` hop after `_routedCall` is gone). The preferred provider's non-stream calls get a 25s ceiling since its TTFT routinely exceeds the shared 12s client default. Research runs one Tavily search per turn (shared across primary + fallback hops, not one per hop). Keys are permanently blacklisted (`dead_keys.json`) only on organization-level errors (account suspended, org restricted). A transient 401 (expired token) rotates to the next key but doesn't blacklist - the key returns to rotation after restart. Duplicate keys in the array are dropped at load (they'd share the same org quota anyway), and the boot log prints each provider's key count so a mispasted pool is visible immediately.
 
 ### Confirmation Gate
 
@@ -483,7 +501,7 @@ Servers with `"isolatedMemory": true` in the `guilds` map (or isolated live with
 - Cross-session callbacks: occasionally surfaces old topics ("last time you mentioned X...")
 - Relationship graph: tracks who talks to who, references them naturally
 - Server lore: auto-extracted from conversation, she weaves it in organically
-- User modes: `focused` mode drops the persona for analytical work  
+- User modes: `focused` mode drops the persona for analytical work
 - Quick Agent (`/medusa`): stateless slash command - user-installable, DMs and group chats only, no memory, no tools, dedicated tuning in `config.quickAgent`
 
 **Agentic Actions**
@@ -493,7 +511,7 @@ Servers with `"isolatedMemory": true` in the `guilds` map (or isolated live with
 - Confirm flow: personal embed with ✅/❌/✏️ buttons, reason modals, pick-menus for stacked confirms
 - Second thoughts: hedged or sourceless answers get a silent re-check; only corrections speak up
 - Situational vibe + room climate: her tone follows the message and the room, cold mode forced on moderation asks
-- Persistent reminders: set naturally in conversation or via `remind`/`reminder`/`remindme`, survive restarts, poll every 15s
+- Persistent reminders: set naturally in conversation or via `remind`/`reminder`/`remindme`, survive restarts, poll every 15s. Channel-targeted (`remind #announcements ...`) and repeating (`remind every friday 17:00 ...`, UTC) schedules supported; the list renders as an embed with cancel buttons.
 - All destructive actions go through the confirmation gate
 - Permission-gated: only fires commands the triggering user has permission to run
 
@@ -546,7 +564,7 @@ Config is file-based (`config.json`) but the bot token can also be passed as an 
 
 ```bash
 TOKEN=your_token_here npm start
-````
+`````
 
 The health server port can be overridden:
 
@@ -554,16 +572,20 @@ The health server port can be overridden:
 HEALTH_PORT=3000 npm start
 ```
 
+Console verbosity is gated by `LOG_LEVEL` (`error`|`warn`|`info`|`debug`, default `info`; errors always print). Production hosts usually want `LOG_LEVEL=warn npm start`. A debug channel exists for noisy diagnostics (`console.debug`, only visible at `LOG_LEVEL=debug`).
+
+**Debug mode** (`"debug": true` in `config.json`, or owner-only `/debug` which hot-swaps it with no reboot): the bot goes silent for everyone but the owner (reads like a normal AI pause elsewhere), passive buffering stops on all servers, all memory reads/writes route to an ephemeral scratch DB wiped on boot and on enable, reminders refuse to create, and logging goes verbose. `configs/runtime.json` is the small overlay the bot itself writes at runtime (isolated guilds, model/temp overrides) so those choices survive restarts without hand-editing `config.json` — leave it alone, it's managed. Per-user prefs (mode, persona, streaming, ghosts) and server personas live in one sparse file, `data/ai/medusa-users.json`.
+
 ## Database Maintenance
 
 Open-Dusa uses SQLite with WAL mode. Over months of heavy use, the database files can fragment. Here's how to keep them lean:
 
-| Task           | Command                     | When                                               |
-| -------------- | --------------------------- | -------------------------------------------------- |
-| Full compact   | Automatic (startup + daily) | Every database vacuums itself, nothing to run      |
-| Check size     | `ls -lh data/ai/ data/logs/` | Weekly                                             |
-| WAL cleanup    | Automatic every 5 minutes   | Always running                                     |
-| Auto-prune     | Automatic every 10 minutes  | Deletes conversations/interests older than 30 days |
+| Task         | Command                      | When                                               |
+| ------------ | ---------------------------- | -------------------------------------------------- |
+| Full compact | Automatic (startup + daily)  | Every database vacuums itself, nothing to run      |
+| Check size   | `ls -lh data/ai/ data/logs/` | Weekly                                             |
+| WAL cleanup  | Automatic every 5 minutes    | Always running                                     |
+| Auto-prune   | Automatic every 10 minutes   | Deletes conversations/interests older than 30 days |
 
 **What gets pruned automatically:**
 
@@ -579,17 +601,17 @@ Open-Dusa uses SQLite with WAL mode. Over months of heavy use, the database file
 
 ## Troubleshooting
 
-| Symptom                                    | Cause                                                  | Fix                                                                                                                                     |
-| ------------------------------------------ | ------------------------------------------------------ | --------------------------------------------------------------------------------------------------------------------------------------- |
-| `SQLITE_IOERR_SHMSIZE` on start            | Host doesn't allow shared-memory files                 | Already handled - the bot forces `locking_mode = EXCLUSIVE` to avoid `-shm`                                                             |
-| `SQLITE_FULL` errors                       | Disk quota exceeded on host                            | The bot auto-truncates WAL every 5 min. Free up disk or move DB to a larger partition.                                                  |
-| Bot starts but doesn't respond to mentions | `Message Content Intent` disabled                      | Enable it in the [Discord Developer Portal](https://discord.com/developers/applications) -> Bot -> Privileged Gateway Intents             |
-| High memory usage over time                | Normal - LRU caches grow to their limits               | The bot auto-cleans every 10 min. If RSS exceeds ~400MB, check `[Heart] MEMORY LEAK` warnings.                                          |
-| `better-sqlite3` install fails             | Missing build tools                                    | Run `npm install --build-from-source` or install `python3`, `make`, and `g++`                                                           |
-| Native bindings missing on Pterodactyl  | Host blocks install scripts (`allowScripts`)           | `npm install-scripts approve better-sqlite3 better-sqlite3-multiple-ciphers && npm rebuild better-sqlite3 better-sqlite3-multiple-ciphers`, then restart. Until then she runs memory-less (AI still works, nothing persists) |
-| She answers but never researches         | Classifier voting NO, or all search keys exhausted       | Check for a 🔍 footer (researched) vs none (direct); classifier misses improve by adding signal words to `ALWAYS_LIVE` in `extensions/ai/constants.js` |
-| Confirms never arrive                    | Reply send failing silently, or cropped view            | Look for `[AI] secureReply total failure` in logs; confirm notes + button embeds post as separate messages |
-| `npm start` crashes immediately            | Missing native build toolchain for `better-sqlite3@12` | Install `python3`, `make`, `g++` (Alpine: `apk add python3 make g++`), then `npm rebuild better-sqlite3`. Node 20–24 are all supported. |
+| Symptom                                    | Cause                                                  | Fix                                                                                                                                                                                                                          |
+| ------------------------------------------ | ------------------------------------------------------ | ---------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| `SQLITE_IOERR_SHMSIZE` on start            | Host doesn't allow shared-memory files                 | Already handled - the bot forces `locking_mode = EXCLUSIVE` to avoid `-shm`                                                                                                                                                  |
+| `SQLITE_FULL` errors                       | Disk quota exceeded on host                            | The bot auto-truncates WAL every 5 min. Free up disk or move DB to a larger partition.                                                                                                                                       |
+| Bot starts but doesn't respond to mentions | `Message Content Intent` disabled                      | Enable it in the [Discord Developer Portal](https://discord.com/developers/applications) -> Bot -> Privileged Gateway Intents                                                                                                |
+| High memory usage over time                | Normal - LRU caches grow to their limits               | The bot auto-cleans every 10 min. If RSS exceeds ~400MB, check `[Heart] MEMORY LEAK` warnings.                                                                                                                               |
+| `better-sqlite3` install fails             | Missing build tools                                    | Run `npm install --build-from-source` or install `python3`, `make`, and `g++`                                                                                                                                                |
+| Native bindings missing on Pterodactyl     | Host blocks install scripts (`allowScripts`)           | `npm install-scripts approve better-sqlite3 better-sqlite3-multiple-ciphers && npm rebuild better-sqlite3 better-sqlite3-multiple-ciphers`, then restart. Until then she runs memory-less (AI still works, nothing persists) |
+| She answers but never researches           | Classifier voting NO, or all search keys exhausted     | Check for a 🔍 footer (researched) vs none (direct); classifier misses improve by adding signal words to `ALWAYS_LIVE` in `extensions/ai/constants.js`                                                                       |
+| Confirms never arrive                      | Reply send failing silently, or cropped view           | Look for `[AI] secureReply total failure` in logs; confirm notes + button embeds post as separate messages                                                                                                                   |
+| `npm start` crashes immediately            | Missing native build toolchain for `better-sqlite3@12` | Install `python3`, `make`, `g++` (Alpine: `apk add python3 make g++`), then `npm rebuild better-sqlite3`. Node 20–24 are all supported.                                                                                      |
 
 ---
 
@@ -597,7 +619,7 @@ Open-Dusa uses SQLite with WAL mode. Over months of heavy use, the database file
 
 Open-Dusa can encrypt every SQLite database on disk using **SQLCipher** (via `better-sqlite3-multiple-ciphers`, installed automatically).
 
-- Set a passphrase in the **`DB_ENCRYPTION_KEY`** environment variable (e.g. in your Pterodactyl *Startup* variables, or your shell/systemd env). Keep it secret and out of version control.
+- Set a passphrase in the **`DB_ENCRYPTION_KEY`** environment variable (e.g. in your Pterodactyl _Startup_ variables, or your shell/systemd env). Keep it secret and out of version control.
 - A **`.env`** file in the project root also works - the config loader reads it at boot with no extra dependency. One `KEY=value` per line, `#` comments allowed; real environment variables always take precedence:
 
     ```bash
@@ -619,13 +641,13 @@ Open-Dusa can encrypt every SQLite database on disk using **SQLCipher** (via `be
 
 ### What data is collected
 
-| Data | Why | When |
-| --- | --- | --- |
-| **Message content** | To understand requests and generate relevant AI replies, and to maintain short-term conversational memory | Only from messages that engage Medusa (a mention, a reply to her, or a `med,` prefix command), plus a volatile in-memory buffer of recent channel activity used purely for live context |
-| **Account data** (user ID, username, display name, avatar URL) | To address users by their server nickname and attribute moderation actions | On interaction |
-| **Derived data** (inferred interests, relationship strength, personality notes, per-server "lore") | To make responses contextually aware | Generated from interactions |
-| **Moderation data** (mod-log entries, warnings) | To operate moderation features | On moderator action |
-| **Recall lookups** | `med,recall` / `/recall` shows stored profile data | Self-lookup for anyone; others mods-only; outputs auto-delete (prefix) or stay private (slash) |
+| Data                                                                                               | Why                                                                                                       | When                                                                                                                                                                                    |
+| -------------------------------------------------------------------------------------------------- | --------------------------------------------------------------------------------------------------------- | --------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| **Message content**                                                                                | To understand requests and generate relevant AI replies, and to maintain short-term conversational memory | Only from messages that engage Medusa (a mention, a reply to her, or a `med,` prefix command), plus a volatile in-memory buffer of recent channel activity used purely for live context |
+| **Account data** (user ID, username, display name, avatar URL)                                     | To address users by their server nickname and attribute moderation actions                                | On interaction                                                                                                                                                                          |
+| **Derived data** (inferred interests, relationship strength, personality notes, per-server "lore") | To make responses contextually aware                                                                      | Generated from interactions                                                                                                                                                             |
+| **Moderation data** (mod-log entries, warnings)                                                    | To operate moderation features                                                                            | On moderator action                                                                                                                                                                     |
+| **Recall lookups**                                                                                 | `med,recall` / `/recall` shows stored profile data                                                        | Self-lookup for anyone; others mods-only; outputs auto-delete (prefix) or stay private (slash)                                                                                          |
 
 ### What is NOT collected
 

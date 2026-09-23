@@ -74,10 +74,10 @@ function _rmSidecars(path) {
 // PLAINTEXT database to encrypted on first run once a key is configured.
 export function openDb(path) {
     if (!_Database) throw new Error('[DB] loadSqlite() must be awaited before openDb()')
+    // Short here on purpose: the full fix line already printed once at probe
+    // time (above). Repeating the install command per database would spam boot.
     if (globalThis._sqliteUsable === false)
-        throw new Error(
-            '[DB] SQLite engine unavailable (native bindings missing). Approve install scripts and rebuild, or run without persistence.',
-        )
+        throw new Error('[DB] SQLite engine unavailable (bindings missing — see startup warning).')
     const key = process.env.DB_ENCRYPTION_KEY || ''
 
     // No key, or a driver without cipher support -> plain open (backward compatible).

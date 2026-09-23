@@ -3,7 +3,6 @@
 import { LRUCache } from 'lru-cache'
 
 const DEAD_KEYS_FILE = 'data/logs/dead_keys.json'
-const GHOST_FILE = 'data/ai/ghost_users.json'
 const ALWAYS_LIVE = new Set([
     'price',
     'prices',
@@ -326,10 +325,7 @@ const DANGEROUS_TERMS = new Set([
 // on innocent words ("hololive" contains "loli", "lolita" too) and refused whole
 // queries. Standalone terms still match exactly as before.
 const _escRe = (s) => s.replace(/[.*+?^${}()|[\]\\]/g, '\\$&')
-const NSFW_RE = new RegExp(
-    `\\b(?:${[...NSFW_TERMS].map((t) => _escRe(t.trim())).join('|')})\\b`,
-    'i',
-)
+const NSFW_RE = new RegExp(`\\b(?:${[...NSFW_TERMS].map((t) => _escRe(t.trim())).join('|')})\\b`, 'i')
 
 const CAPABILITIES_NOTE =
     `\n\n[AGENT CAPABILITIES & STRICT BEHAVIOR]\n` +
@@ -343,11 +339,13 @@ const CAPABILITIES_NOTE =
     `   - Moderation (prefer the target's <@id> mention or numeric ID — plain names and reply-pronouns ("tony", "him") resolve automatically — and include the duration): <<RUN_CMD: mute 123456789 1h reason>> | <<RUN_CMD: unmute 123456789>> | <<RUN_CMD: warn 123456789 reason>> | <<RUN_CMD: clearwarns 123456789>>\n` +
     `   - Delete Messages: <<RUN_CMD: mpurge 123456789>> | <<RUN_CMD: clear 10>>\n` +
     `   - Manage Server: <<RUN_CMD: createchan text channel-name>> | <<RUN_CMD: delchan 123456789>> | <<RUN_CMD: lockchannel>> | <<RUN_CMD: unlockchannel>> | <<RUN_CMD: auditlogs>>\n` +
-    `   - Roles: <<RUN_CMD: addrole 123456789 987654321>> | <<RUN_CMD: removerole 123456789 987654321>> | <<RUN_CMD: listroles>>\n` +
+    `   - Roles: <<RUN_CMD: addrole 123456789 987654321>> | <<RUN_CMD: removerole 123456789 987654321>> | <<RUN_CMD: createrole role name>> (optional trailing hex color, e.g. \`createrole Raiders #ff0000\`) | <<RUN_CMD: listroles>>\n` +
     `   - Self: <<RUN_CMD: setnickname name>> | <<RUN_CMD: renameserver name>> | <<RUN_CMD: addemoji name URL>>\n` +
     `   - Voice (presence only, no audio): <<RUN_CMD: joinvc 123456789>> (channel ID or name, or join one yourself and I'll follow) | <<RUN_CMD: leavevc>>\n` +
     `   - Extended: <<RUN_CMD: poll "Question?" "Ans1" "Ans2">> | <<RUN_CMD: thread Name>> | <<RUN_CMD: react 👍>> | <<RUN_CMD: pin ID>> | <<RUN_CMD: unpin ID>> | <<RUN_CMD: slowmode 5>> | <<RUN_CMD: topic new topic>> | <<RUN_CMD: announce CHANNEL_ID_OR_MENTION message>> | <<RUN_CMD: mail message for Tav>> | <<RUN_CMD: movevc USER_ID CHAN_ID>> | <<RUN_CMD: dm USER_ID message>>\n` +
-    `   - Reminders: <<RUN_CMD: remind 1h30m take the pizza out>> (units s/m/h/d/w, combos like 1d12h ok). For an exact date/time instead of a relative duration, use ISO format with a T (no space): <<RUN_CMD: remind 2026-01-12T18:00 take the pizza out>>, if the user gives an ambiguous slash date (e.g. "01/12/2026"), resolve it as DAY/MONTH/YEAR, and if that date would already be in the past, do NOT guess a different one, ask the user to confirm the exact date instead | list: <<RUN_CMD: reminders>> | cancel: <<RUN_CMD: delreminder 3>>\n` +
+    `   - Reminders: <<RUN_CMD: remind 1h30m take the pizza out>> (units s/m/h/d/w, combos like 1d12h ok). For an exact date/time instead of a relative duration, use ISO format with a T (no space): <<RUN_CMD: remind 2026-01-12T18:00 take the pizza out>>, if the user gives an ambiguous slash date (e.g. "01/12/2026"), resolve it as DAY/MONTH/YEAR, and if that date would already be in the past, do NOT guess a different one, ask the user to confirm the exact date instead | target a channel: <<RUN_CMD: remind #announcements 1h meeting>> | repeat: <<RUN_CMD: remind every 1d drink water>> or <<RUN_CMD: remind every friday 17:00 deploy>> (weekly UTC, min every 5m) | list: <<RUN_CMD: reminders>> | cancel: <<RUN_CMD: delreminder 3>>\n` +
+    `   - GIFs: NEVER refuse a gif ask with the generation line — when someone asks for a gif, the backend fetches a real one and attaches it. Just caption it.\n` +
+    `   - Files: if they ask for code/a file ("send it as a file", "save as foo.py"), write the code block normally — the backend attaches it as a file automatically.\n` +
     `• EXECUTION FORMAT: If an action is requested, talk organically FIRST, then cleanly append the <<RUN_CMD>> tag. NEVER write raw prefix commands. Silently let the backend catch and confirm each tag, never narrate the raw command syntax to the user.\n` +
     `• CHAINING: You can chain multiple <<RUN_CMD>> tags in one reply when the user asks for compound/multi-part actions.\n` +
     `• RESTRAINT: Do exactly what was asked — no bonus actions, no extra tags, no preemptive moderation. If the backend reports an action is already done (already muted/banned/in voice), accept it gracefully, don't retry.\n` +
@@ -404,7 +402,6 @@ function makeIdSet(max, ttl = 30 * 60_000) {
 
 export {
     DEAD_KEYS_FILE,
-    GHOST_FILE,
     ALWAYS_LIVE,
     NEVER_RESEARCH_PREFIXES,
     NEVER_RESEARCH_EXACT,

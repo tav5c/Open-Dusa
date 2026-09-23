@@ -21,9 +21,7 @@ export function registerAfk(client, db = null) {
     if (stmts)
         for (const row of stmts.all.all()) {
             if (!afkData.has(row.guild_id)) afkData.set(row.guild_id, new Map())
-            afkData
-                .get(row.guild_id)
-                .set(row.user_id, { reason: row.reason, timestamp: row.timestamp })
+            afkData.get(row.guild_id).set(row.user_id, { reason: row.reason, timestamp: row.timestamp })
         }
 
     function afkGuild(gid) {
@@ -82,7 +80,7 @@ export function registerAfk(client, db = null) {
         if (afk.has(userId)) {
             afk.delete(userId)
             stmts?.del.run(gId, userId)
-            mc.clear()
+            mc.delete(userId)
             if (message.member?.displayName.startsWith('[🪼] '))
                 message.member.setNickname(message.member.displayName.slice(5)).catch(() => {})
             await message.channel.send({

@@ -35,6 +35,11 @@ const KNOWN = {
         jsonSchemaStrict: true,
         maxImages: 0,
         builtInTools: true,
+        // No server-side browsing without an explicit browser_search tool
+        // attached (Groq docs: opt-in). False so research falls through to
+        // the Tavily tool loop instead of shipping a memory answer with a
+        // 🔍 footer.
+        webSearch: false,
     },
     'openai/gpt-oss-20b': {
         vision: false,
@@ -44,6 +49,8 @@ const KNOWN = {
         jsonSchemaStrict: true,
         maxImages: 0,
         builtInTools: true,
+        // Same as gpt-oss-120b: no implicit browsing.
+        webSearch: false,
     },
     'groq/compound': {
         vision: false,
@@ -53,6 +60,7 @@ const KNOWN = {
         jsonSchemaStrict: false,
         maxImages: 0,
         builtInTools: true,
+        webSearch: true,
     },
     'groq/compound-mini': {
         vision: false,
@@ -62,6 +70,7 @@ const KNOWN = {
         jsonSchemaStrict: false,
         maxImages: 0,
         builtInTools: true,
+        webSearch: true,
     },
     'nvidia/nemotron-nano-12b-v2-vl': {
         vision: true,
@@ -96,8 +105,10 @@ const KNOWN = {
 // unknown => vision false, tools true (cheap to attempt, classified on 400).
 const FAMILY = [
     { re: /vl\b|vision|scout|qwen.*3.*(27b|32b)|nemotron.*vl/i, caps: { vision: true, maxImages: 3 } },
+    { re: /sonar|perplexity/i, caps: { tools: true, jsonObject: true, webSearch: true } },
+    { re: /gpt-oss|compound/i, caps: { tools: true, jsonObject: true, webSearch: true } },
     {
-        re: /gpt-oss|compound|llama-3|mistral|qwen|deepseek|moonshot|grok/i,
+        re: /llama-3|mistral|qwen|deepseek|moonshot|grok/i,
         caps: { tools: true, jsonObject: true },
     },
 ]
@@ -118,6 +129,11 @@ const _base = (seed = {}) => ({
     imageGen: false,
     // Server-side exec exists only as Groq built-in tools (compound/gpt-oss).
     codeExec: false,
+    // Native web research: server-side browsing/search built into the model
+    // (Groq compound, gpt-oss built-ins, Perplexity sonar, Grok live-search).
+    // true = Tavily round can be skipped/saved; false/unknown = search via
+    // tools as today. Registry-only: undetectable via cheap probe.
+    webSearch: false,
     // Streaming is per-request (stream:true), not per-model; always attemptable.
     stream: true,
     ...seed,

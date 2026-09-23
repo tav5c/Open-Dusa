@@ -121,7 +121,9 @@ function resolveFallbacks(list, ownResolved, providers) {
             if (entry.provider) {
                 const p = providers.find((x) => x.name === entry.provider)
                 if (!p || !p.keys?.length) {
-                    console.warn(`[Config] fallback provider '${entry.provider}' not found or keyless, skipping`)
+                    console.warn(
+                        `[Config] fallback provider '${entry.provider}' not found or keyless, skipping`,
+                    )
                     continue
                 }
                 push({ provider: p.name, baseUrl: p.baseUrl, keys: p.keys, model })
@@ -192,9 +194,12 @@ export function normalizeConfig(raw) {
         systemPrompt: asPrompt(a.chat?.systemPrompt ?? raw.systemPrompt),
         identity: asPrompt(a.chat?.identity ?? raw.identity),
     }
-    chat.resolved =
-        resolveAgentProvider(providers, chat.provider, raw.llmBaseUrl ?? raw.llm_base_url, raw.llmKeys ?? raw.llm_keys) ??
-        { baseUrl: primary.baseUrl, keys: primary.keys }
+    chat.resolved = resolveAgentProvider(
+        providers,
+        chat.provider,
+        raw.llmBaseUrl ?? raw.llm_base_url,
+        raw.llmKeys ?? raw.llm_keys,
+    ) ?? { baseUrl: primary.baseUrl, keys: primary.keys }
     chat.fallbacks = resolveFallbacks(fallbackRaw(a.chat), chat.resolved, providers)
 
     const research = {
@@ -204,7 +209,12 @@ export function normalizeConfig(raw) {
         topP: a.research?.topP ?? raw.topP ?? 1,
         maxTokens: a.research?.maxTokens ?? raw.searchTokens ?? 1500,
     }
-    research.resolved = resolveAgentProvider(providers, research.provider, raw.research_base_url, raw.research_key)
+    research.resolved = resolveAgentProvider(
+        providers,
+        research.provider,
+        raw.research_base_url,
+        raw.research_key,
+    )
     research.fallbacks = resolveFallbacks(fallbackRaw(a.research), research.resolved, providers)
 
     const vision = {
@@ -228,7 +238,10 @@ export function normalizeConfig(raw) {
         model:
             a.classifier?.model ??
             raw.classifier_model ??
-            (clfResolved?.baseUrl?.includes('nvidia') ? 'meta/llama-3.1-8b-instruct' : 'llama-3.1-8b-instant'),
+            // llama-3.1-8b-instant is DEAD on groq (404s every call, burning the
+            // full 2.5s race) — default non-NVIDIA installs to a live cheap
+            // model instead. Explicit config still wins above.
+            (clfResolved?.baseUrl?.includes('nvidia') ? 'meta/llama-3.1-8b-instruct' : 'openai/gpt-oss-20b'),
         temperature: a.classifier?.temperature ?? 0,
         maxTokens: a.classifier?.maxTokens ?? 5,
     }
@@ -251,7 +264,11 @@ export function normalizeConfig(raw) {
     // Legacy top-level fallbackModels: historically tried on the chat provider
     // only. Merged into the chat chain (deduped) so there is exactly one
     // fallback path instead of two. Entries use the same pair syntax.
-    for (const fb of resolveFallbacks(asArray(raw.fallbackModels ?? raw.fallback_models), chat.resolved, providers)) {
+    for (const fb of resolveFallbacks(
+        asArray(raw.fallbackModels ?? raw.fallback_models),
+        chat.resolved,
+        providers,
+    )) {
         if (!chat.fallbacks.some((f) => f.model === fb.model && f.baseUrl === fb.baseUrl))
             chat.fallbacks.push({ ...fb, provider: fb.provider ?? chat.provider ?? null })
     }
@@ -276,17 +293,32 @@ export function normalizeConfig(raw) {
         fallbackModels: asArray(raw.fallbackModels ?? raw.fallback_models),
         search: {
             serperKey: raw.search?.serperKey ?? raw.serper_key ?? '',
-            tavilyKey: raw.search?.tavilyKey ?? raw.tavily_key ?? '',
+            // Tavily accepts one key or an array — spares rotate in on
+            // rate-limit/quota errors. tavilyKey stays the first (compat).
+            tavilyKeys: asArray(
+                raw.search?.tavilyKeys ?? raw.search?.tavilyKey ?? raw.tavily_key ?? [],
+            ).filter((k) => typeof k === 'string' && k.trim()),
+            tavilyKey:
+                asArray(raw.search?.tavilyKeys ?? raw.search?.tavilyKey ?? raw.tavily_key ?? []).find(
+                    (k) => typeof k === 'string' && k.trim(),
+                ) ?? '',
         },
         giphyKey: raw.giphyKey ?? raw.giphy_api_key ?? '',
         klipyKey: raw.klipyKey ?? raw.klipy_key ?? '',
         siteUrl: raw.siteUrl ?? raw.site_url ?? '',
         streaming: raw.streaming === true,
+        // Debug mode (single flag): owner-only replies, no passive buffering,
+        // prod DBs untouched (ephemeral debug DB wiped on boot), verbose
+        // logging. Toggle live via owner-only /debugmode (hot-swaps, no reboot).
         debug: raw.debug === true,
         // Censor toggle: true disables every code-level NSFW/dangerous/hate refusal
         // (routing + canned replies + slur guard) so the models judge content
         // themselves. Defaults to false (safe).
         nsfw: raw.nsfw === true,
+        // Token saver: true prefers fixed replies for trivial intents
+        // (greetings, acks, self-status) and Tavily-direct research, skipping
+        // LLM calls where templates do. False = full generative everywhere.
+        tokenSaver: raw.tokenSaver === true,
         triggers: asArray(typeof raw.triggers === 'string' ? raw.triggers.split(',') : raw.triggers)
             .map((t) => String(t).trim().toLowerCase())
             .filter(Boolean),
@@ -351,7 +383,8 @@ export function writeConfigRaw(raw) {
 export function setConfigGuild(guildId, patch) {
     try {
         const raw = readConfigRaw()
-        const guilds = raw.guilds && typeof raw.guilds === 'object' && !Array.isArray(raw.guilds) ? raw.guilds : {}
+        const guilds =
+            raw.guilds && typeof raw.guilds === 'object' && !Array.isArray(raw.guilds) ? raw.guilds : {}
         const entry = { ...(guilds[String(guildId)] ?? {}) }
         for (const [k, v] of Object.entries(patch)) {
             if (v === undefined) delete entry[k]
@@ -393,8 +426,12 @@ export function loadConfig() {
     // like every other config value.
     globalThis._medusaNsfw = config.nsfw === true
     if (config.nsfw) console.log('[Config] Censor toggle ON (nsfw:true) — code-level refusals disabled')
-    const keyCounts = config.providers.map((p) => `${p.name}: ${p.keys.length} key${p.keys.length === 1 ? '' : 's'}`).join(', ')
-    console.log(`[Config] ${config.providers.length} provider(s) [${keyCounts}], ${config.guildIds.length} guild(s) in scope`)
+    const keyCounts = config.providers
+        .map((p) => `${p.name}: ${p.keys.length} key${p.keys.length === 1 ? '' : 's'}`)
+        .join(', ')
+    console.log(
+        `[Config] ${config.providers.length} provider(s) [${keyCounts}], ${config.guildIds.length} guild(s) in scope`,
+    )
     _cached = config
     return config
 }

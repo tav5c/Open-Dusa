@@ -209,7 +209,9 @@ export async function cmdWarnings(ctx, member, { db }) {
         const embed = new EmbedBuilder()
             .setTitle(`⚠️ Warnings for ${member.displayName}`)
             .setColor(0xef9f27)
-            .setFooter({ text: pages > 1 ? `Page ${p + 1}/${pages} • Total: ${rows.length}` : `Total: ${rows.length}` })
+            .setFooter({
+                text: pages > 1 ? `Page ${p + 1}/${pages} • Total: ${rows.length}` : `Total: ${rows.length}`,
+            })
         for (const { id, moderator_id, reason, timestamp } of rows.slice(p * PER, (p + 1) * PER)) {
             const mod = ctx.guild.members.cache.get(String(moderator_id))
             embed.addFields({
@@ -370,7 +372,9 @@ export async function cmdClear(ctx, amount = 10) {
 // accepts a raw message ID or a full message link, returns the ID or null
 function parseMessageRef(ref) {
     if (!ref) return null
-    const m = String(ref).trim().match(/(\d{15,20})\s*$/)
+    const m = String(ref)
+        .trim()
+        .match(/(\d{15,20})\s*$/)
     return m ? m[1] : null
 }
 
@@ -483,8 +487,8 @@ export function registerModeration(client, db, config) {
 
     client.commands.set('ban', async (msg, args) => {
         if (!msg.member.permissions.has(PermissionFlagsBits.BanMembers)) return
-        const target = await resolveTarget(msg, args)
-        if (!target) return msg.reply('Member not found.')
+        const target = await resolveTarget(msg, args, false, false)
+        if (!target) return msg.reply('Say who — mention them or give me an ID.')
         await cmdBan(msg, target, args.slice(1).join(' ') || 'No reason provided', ctx_)
     })
     client.commands.set('unban', async (msg, args) => {
@@ -493,26 +497,26 @@ export function registerModeration(client, db, config) {
     })
     client.commands.set('kick', async (msg, args) => {
         if (!msg.member.permissions.has(PermissionFlagsBits.KickMembers)) return
-        const target = await resolveTarget(msg, args)
-        if (!target) return msg.reply('Member not found.')
+        const target = await resolveTarget(msg, args, false, false)
+        if (!target) return msg.reply('Say who — mention them or give me an ID.')
         await cmdKick(msg, target, args.slice(1).join(' ') || 'No reason provided', ctx_)
     })
     client.commands.set('mute', async (msg, args) => {
         if (!msg.member.permissions.has(PermissionFlagsBits.ModerateMembers)) return
-        const target = await resolveTarget(msg, args)
-        if (!target) return msg.reply('Member not found.')
+        const target = await resolveTarget(msg, args, false, false)
+        if (!target) return msg.reply('Say who — mention them or give me an ID.')
         await cmdMute(msg, target, args[1], args.slice(2).join(' ') || 'No reason provided', ctx_)
     })
     client.commands.set('unmute', async (msg, args) => {
         if (!msg.member.permissions.has(PermissionFlagsBits.ModerateMembers)) return
-        const target = await resolveTarget(msg, args)
-        if (!target) return msg.reply('Member not found.')
+        const target = await resolveTarget(msg, args, false, false)
+        if (!target) return msg.reply('Say who — mention them or give me an ID.')
         await cmdUnmute(msg, target, ctx_)
     })
     client.commands.set('warn', async (msg, args) => {
         if (!msg.member.permissions.has(PermissionFlagsBits.ModerateMembers)) return
-        const target = await resolveTarget(msg, args)
-        if (!target) return msg.reply('Member not found.')
+        const target = await resolveTarget(msg, args, false, false)
+        if (!target) return msg.reply('Say who — mention them or give me an ID.')
         await cmdWarn(msg, target, args.slice(1).join(' ') || 'No reason provided', ctx_)
     })
     client.commands.set('warnings', async (msg, args) => {
@@ -547,8 +551,8 @@ export function registerModeration(client, db, config) {
     })
     client.commands.set('clearwarns', async (msg, args) => {
         if (!msg.member.permissions.has(PermissionFlagsBits.ModerateMembers)) return
-        const target = await resolveTarget(msg, args)
-        if (!target) return msg.reply('Member not found.')
+        const target = await resolveTarget(msg, args, false, false)
+        if (!target) return msg.reply('Say who — mention them or give me an ID.')
         db.prepare('UPDATE warnings SET active=FALSE WHERE guild_id=? AND user_id=?').run(
             String(msg.guild.id),
             String(target.id),
@@ -599,7 +603,10 @@ export function registerModeration(client, db, config) {
         // getMember() is null when the target left between opening the menu and
         // submitting — fail soft instead of throwing on member.id downstream.
         const missingMember = () =>
-            interaction.reply({ content: '❌ Member not found (they may have left).', flags: MessageFlags.Ephemeral })
+            interaction.reply({
+                content: '❌ Member not found (they may have left).',
+                flags: MessageFlags.Ephemeral,
+            })
 
         if (commandName === 'ban') {
             const m = interaction.options.getMember('member')

@@ -169,7 +169,10 @@ export class OutputCore extends AgentCommandCore {
     }
 
     async secureReply(message, content, opts = {}) {
-        const validated = this.finalSecurityCheck(String(content || ''), message)
+        // Resolve :emoji: shortcodes against this guild's custom emoji first —
+        // LLMs write shortcodes habitually even when given full <:n:id> format.
+        const withEmojis = this._resolveCustomEmojis(String(content || ''), message?.guild)
+        const validated = this.finalSecurityCheck(withEmojis, message)
         const hasContent = !!validated.trim()
         const hasEmbeds = !!opts.embeds?.length
 
@@ -223,6 +226,14 @@ export class OutputCore extends AgentCommandCore {
         const prefix = `${userId}_`
         for (const k of this.userCache.keys()) if (k.startsWith(prefix)) this.userCache.delete(k)
     }
+    // RAM history respects memory-off: no store when memOff, so every push
+    // site funnels through here instead of touching the LRU directly. Reads
+    // stay at the call sites (memOff ? [] : ...get...).
+    _histPush(key, memOff, ...entries) {
+        if (memOff) return
+        if (!this.messageHistory.has(key)) this.messageHistory.set(key, [])
+        this.messageHistory.get(key).push(...entries)
+    }
     // Resolve :emojiName: shortcodes -> full <:name:ID> Discord format
     // LLMs habitually write :name: even when given the full format, handle it here instead of trusting the prompt
     _resolveCustomEmojis(text, guild) {
@@ -275,8 +286,13 @@ export class OutputCore extends AgentCommandCore {
                     const md = pick.md ?? pick.sm ?? pick.hd ?? {}
                     const url = md.gif?.url || md.webp?.url || null
                     if (url) return url
+                    console.warn('[AI] Klipy returned items but no playable file')
+                } else {
+                    console.warn(`[AI] Klipy: no results for "${q}"`)
                 }
-            } catch {}
+            } catch (e) {
+                console.warn('[AI] Klipy fetch failed:', String(e?.message ?? e).slice(0, 120))
+            }
         }
         const giphyKey = this._config?.giphyKey
         if (q && giphyKey) {
@@ -289,8 +305,12 @@ export class OutputCore extends AgentCommandCore {
                 const results = data?.data ?? []
                 if (results.length)
                     return results[Math.floor(Math.random() * results.length)]?.images?.original?.url ?? null
-            } catch {}
+                console.warn(`[AI] Giphy: no results for "${q}"`)
+            } catch (e) {
+                console.warn('[AI] Giphy fetch failed:', String(e?.message ?? e).slice(0, 120))
+            }
         }
+        if (q && !klipyKey && !giphyKey) console.warn('[AI] GIF fetch: no klipyKey or giphyKey configured')
         return null
     }
 
@@ -307,19 +327,24 @@ export class OutputCore extends AgentCommandCore {
         // the user asked, the subject IS the query.
         const gifSubject = this._extractGifSubject(message?.content)
         if (gifSubject) {
+            console.log(`[AI] Explicit GIF ask, subject="${gifSubject}"`)
             const direct = await this._fetchGifFromProviders(gifSubject)
             if (direct) return { gif: direct, explicit: true }
             // No result anywhere: fall through, the model's prose handles it.
         }
         // Skip if response is just a command execution (no real text)
         if (response.trim().startsWith('⚙️') || response.length < 20) return null
-        // Tone detection
-        const isFunny = /\b(lmao|lol|💀|😭|😂|💀|bruh|bro|omg|dead|crying|aint no way|no cap|bffr)\b/.test(
-            text,
-        )
-        const isHype = /\b(lets go|yesss|slay|bestie|periodt|love|excited|amazing|fire|🔥|💜|✨)\b/.test(text)
-        const isConfused = /\b(wait what|huh|idk|honestly|lowkey|hmm|i mean)\b/.test(text)
-        const isChaos = /\b(skull|💀|😭|unhinged|chaotic|wild|insane|absolutely not)\b/.test(text)
+        // Tone detection. Note: \b never matches emoji (💜/🔥/✨ have no
+        // word boundaries), so emoji are tested with plain includes.
+        const isFunny =
+            /\b(lmao|lol|bruh|bro|omg|dead|crying|aint no way|no cap|bffr)\b/i.test(text) ||
+            /[💀😭😂]/.test(text)
+        const isHype =
+            /\b(lets go|yesss|slay|bestie|periodt|love|excited|amazing|fire)\b/i.test(text) ||
+            /[🔥💜✨]/.test(text)
+        const isConfused = /\b(wait what|huh|idk|honestly|lowkey|hmm|i mean)\b/i.test(text)
+        const isChaos =
+            /\b(skull|unhinged|chaotic|wild|insane|absolutely not)\b/i.test(text) || /[💀😭]/.test(text)
         const isPositive = isHype || isFunny
         const anythingTriggered = isFunny || isHype || isConfused || isChaos
 

@@ -10,9 +10,7 @@ function canSummon(member, ownerId) {
     if (!member) return false
     if (String(member.id ?? member.user?.id) === String(ownerId)) return true
     const p = member.permissions
-    return (
-        p?.has(PermissionFlagsBits.ManageChannels) || p?.has(PermissionFlagsBits.ModerateMembers)
-    )
+    return p?.has(PermissionFlagsBits.ManageChannels) || p?.has(PermissionFlagsBits.ModerateMembers)
 }
 
 export function registerVoice(client, ownerId) {
@@ -34,7 +32,8 @@ export function registerVoice(client, ownerId) {
         const vc = vcById ?? vcByName ?? member?.voice?.channel ?? null
         if (!vc || !vc.isVoiceBased?.())
             return reply({
-                content: "❌ Which voice channel? Give me an ID or name — or join one yourself and I'll follow.",
+                content:
+                    "❌ Which voice channel? Give me an ID or name — or join one yourself and I'll follow.",
             })
         const me = ctx.guild.members.me
         if (!vc.permissionsFor(me)?.has(PermissionFlagsBits.Connect))

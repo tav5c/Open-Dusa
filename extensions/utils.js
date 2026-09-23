@@ -1,6 +1,6 @@
 export const MAX_SECONDS = 2419200
 export const TIME_UNITS = { s: 1, m: 60, h: 3600, d: 86400 }
-export async function resolveTarget(ctx, args, fetchUser = false) {
+export async function resolveTarget(ctx, args, fetchUser = false, allowSelfFallback = true) {
     const isMsg = ctx.content !== undefined
     if (!isMsg) return ctx.options?.getMember?.('user') || ctx.member
 
@@ -14,6 +14,11 @@ export async function resolveTarget(ctx, args, fetchUser = false) {
     }
     const nonBot = ctx.mentions?.members?.filter((m) => m.id !== ctx.client.user.id).first()
     if (nonBot) return fetchUser ? nonBot.user : nonBot
+    // No ID, no mention: only fall back to the caller when the caller opted
+    // in. Destructive commands pass false — a bare `med,kick` must ask who,
+    // not kick the moderator typing it (owner/admin bypasses in canModerate
+    // would otherwise let a self-kick/self-mute straight through).
+    if (!allowSelfFallback) return null
     return fetchUser ? ctx.author : ctx.member
 }
 

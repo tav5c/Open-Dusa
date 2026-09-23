@@ -45,6 +45,19 @@ async function buildRecallText(ai, guild, authorId, isMod, query, { ephemeralHin
     if (ints.length) lines.push(`Interests: ${ints.map((r) => `${r.topic}(${r.frequency})`).join(', ')}`)
     if (pers?.traits) lines.push(`Vibe: ${pers.traits}`)
     if (summary) lines.push(`Notes: ${String(summary).slice(0, 500)}`)
+    // Multi-word queries ("adi mute threats") also pull matching quotes via
+    // full-text search. Single names skip it: one's own messages rarely
+    // contain one's name, so it would only add noise.
+    const qwords = String(query ?? '')
+        .replace(/<@!?\d+>/g, ' ')
+        .split(/[^a-zA-Z0-9]+/)
+        .filter((w) => w.length >= 3)
+    if (qwords.length > 1) {
+        const hits = mem.searchConversations(qwords.join(' '), id, 2)
+        for (const h of hits) {
+            lines.push(`> "${String(h.message_content ?? '').slice(0, 140)}"`)
+        }
+    }
     if (!ephemeralHint) lines.push('-# (auto-deletes in 60s)')
     return lines.join('\n')
 }
@@ -59,14 +72,11 @@ const ownerOnly = (fn) => async (msg, args) => {
 }
 export async function registerAI(client, db, config) {
     OWNER_ID = config.ownerId
-    try {
-        if (!globalThis._sqlite3) {
-            const mod = await import('better-sqlite3')
-            globalThis._sqlite3 = { default: mod.default ?? mod }
-        }
-    } catch (e) {
-        console.error('[AI] better-sqlite3 not available, install on host:', e.message)
-    }
+    // NOTE: sqlite driver init lives ONLY in db.js::loadSqlite (cipher build,
+    // probed at index.js boot). A duplicate plain-build init used to live here
+    // behind `if (!globalThis._sqlite3)` — order-dependent, and losing the race
+    // silently disabled encryption. If the driver is missing, memory.js already
+    // degrades to stubDb; nothing here needs to init it.
     try {
         const dataDir = 'data/ai'
         const sentinel = join(dataDir, '.migrated-v1')
@@ -179,6 +189,8 @@ export async function registerAI(client, db, config) {
 
     client.on('messageCreate', (msg) => {
         if (msg.author.bot) return
+        if (ai.debugMode) return // debug mode: no passive buffering anywhere
+        if (ai.userMemory?.[msg.author.id] === false) return // memory-off: leave no room-context trace
         if (!msg.guild) return
         if (!msg.content?.trim()) return
         if (msg.content.length < 3) return
@@ -276,8 +288,10 @@ export async function registerAI(client, db, config) {
                 })
             }
             const prompt = interaction.options.getString('prompt')
-            const forceSearch = interaction.options.getBoolean('search') ?? false
-            const isPrivate = interaction.options.getBoolean('private') ?? false
+            const searchArg = interaction.options.getString('search') ?? 'auto'
+            const forceSearch = searchArg === 'on'
+            const skipSearch = searchArg === 'off'
+            const isPrivate = (interaction.options.getString('privacy') ?? 'off') === 'on'
             const flags = isPrivate ? MessageFlags.Ephemeral : undefined
 
             await interaction.deferReply(flags ? { flags } : {})
@@ -291,7 +305,11 @@ export async function registerAI(client, db, config) {
             }
 
             try {
-                const response = await ai.generateStatelessResponse({ prompt, forceSearch })
+                const response = await ai.generateStatelessResponse({
+                    prompt,
+                    forceSearch,
+                    skipResearch: skipSearch,
+                })
                 if (!response)
                     return interaction.editReply({ content: '✗ All providers failed. Try again shortly.' })
 
@@ -303,6 +321,82 @@ export async function registerAI(client, db, config) {
                 }
             } catch (e) {
                 console.error('[AI] /medusa error:', e)
+                try {
+                    await interaction.editReply({ content: '✗ Failed to generate response.' })
+                } catch {}
+            }
+            return
+        }
+
+        // /ask — server-only quick answer with light memory. Stateless model
+        // call (never streams: instant by design), persona-aware, writes the
+        // exchange unless the user turned memory off globally.
+        if (commandName === 'ask') {
+            if (!interaction.guild) {
+                return interaction.reply({
+                    content: '💜 /ask is server-only. Use `/medusa` in DMs.',
+                    flags: MessageFlags.Ephemeral,
+                })
+            }
+            const prompt = interaction.options.getString('prompt')
+            const researchArg = interaction.options.getString('research') ?? 'auto'
+            const isPrivate = (interaction.options.getString('privacy') ?? 'off') === 'on'
+            const flags = isPrivate ? MessageFlags.Ephemeral : undefined
+            await interaction.deferReply(flags ? { flags } : {})
+
+            const uid = interaction.user.id
+            const isOwner = String(uid) === String(OWNER_ID)
+            const isStaff = !!interaction.memberPermissions?.has(PermissionFlagsBits.ModerateMembers)
+            const gate = client.heart?.rateLimiter?.check(uid, { isStaff, isOwner })
+            if (gate && !gate.ok) {
+                return interaction.editReply({
+                    content: '⏳ Too many requests. Wait a few seconds and try again.',
+                })
+            }
+
+            try {
+                const memOff = ai.userMemory?.[uid] === false
+                const mem = ai.getMem(interaction.guild)
+                let userCtx = ''
+                if (!memOff) {
+                    const u = mem.getUser(uid)
+                    const summary = mem.getSummary(uid)
+                    const bits = []
+                    if (u?.display_name || u?.username)
+                        bits.push(`Talking to ${u.display_name || u.username}`)
+                    if (summary) bits.push(`What you remember about them: ${String(summary).slice(0, 600)}`)
+                    userCtx = bits.join('\n')
+                }
+                const response = await ai.generateStatelessResponse({
+                    prompt,
+                    forceSearch: researchArg === 'on',
+                    skipResearch: researchArg === 'off',
+                    systemExtra: `${(() => {
+                        const custom = ai.customPrompts?.[uid]
+                        if (typeof custom === 'string' && custom) return `[USER PERSONA] ${custom}\n\n`
+                        const server = ai.serverPrompts?.[interaction.guild.id]
+                        if (typeof server === 'string' && server) return `[SERVER PERSONA] ${server}\n\n`
+                        return ''
+                    })()}QUICKIE: one fast, precise, well-formatted answer. Lead with the answer, minimal throat-clearing, markdown only where it helps.`,
+                    userCtx,
+                })
+                if (!response)
+                    return interaction.editReply({ content: '✗ All providers failed. Try again shortly.' })
+                if (!memOff) {
+                    try {
+                        mem.updateUser(uid, interaction.user.username, interaction.user.username)
+                        const chId = interaction.channel?.id ?? 'ask'
+                        mem.addConversation(uid, chId, prompt.slice(0, 2000), String(response).slice(0, 2000))
+                    } catch {}
+                }
+                const safe = ai.finalSecurityCheck(response, interaction)
+                const chunks = ai.splitResponse(safe, 1900)
+                await interaction.editReply({ content: chunks[0] || '...' })
+                for (let i = 1; i < Math.min(chunks.length, 4); i++) {
+                    await interaction.followUp({ content: chunks[i], ...(flags ? { flags } : {}) })
+                }
+            } catch (e) {
+                console.error('[AI] /ask error:', e)
                 try {
                     await interaction.editReply({ content: '✗ Failed to generate response.' })
                 } catch {}
@@ -431,6 +525,33 @@ export async function registerAI(client, db, config) {
         // /memory
         if (commandName === 'memory') {
             const userId = interaction.user.id
+            const modeArg = interaction.options.getString('mode')
+            if (modeArg === 'on' || modeArg === 'off') {
+                ai.userMemory[String(userId)] = modeArg === 'on'
+                ai._scheduleUsersSave()
+                if (modeArg === 'off') {
+                    // RAM purge so off means off immediately: drop this
+                    // session's short-term history, cached context, and any
+                    // room-buffer entries. DB rows stay (by design) until
+                    // /forgetme — the reply below says exactly that.
+                    try {
+                        for (const k of [...ai.messageHistory.keys()])
+                            if (k.startsWith(`${userId}-`)) ai.messageHistory.delete(k)
+                        ai._invalidateUserCache?.(String(userId))
+                        for (const [chId, buf] of ai._passiveBuf ?? []) {
+                            const kept = buf.filter((e) => e.userId !== String(userId))
+                            if (kept.length !== buf.length) ai._passiveBuf.set(chId, kept)
+                        }
+                    } catch {}
+                }
+                return interaction.reply({
+                    content:
+                        modeArg === 'on'
+                            ? '✅ Memory **on** — I\u2019ll remember our chats again.'
+                            : '✅ Memory **off** — nothing stored, nothing fetched, and you\u2019re left out of room context. Existing data stays put; `/forgetme` wipes it if you want that too.',
+                    flags: MessageFlags.Ephemeral,
+                })
+            }
             const mem = ai.getMem(interaction.guild)
             const user = mem.getUser(userId)
             const ints = mem.getInterests(userId, 10)
@@ -548,13 +669,12 @@ export async function registerAI(client, db, config) {
                 ai._invalidateUserCache(userId)
                 for (const k of [...ai.messageHistory.keys()])
                     if (k.startsWith(`${userId}-`)) ai.messageHistory.delete(k)
+                try {
+                    ai.ghost?.clearUser?.(userId)
+                } catch {}
                 if (ai.customPrompts[userId]) {
                     delete ai.customPrompts[userId]
-                    if (ai._promptSaveTimer) clearTimeout(ai._promptSaveTimer)
-                    ai._promptSaveTimer = setTimeout(() => {
-                        ai._saveJSON('data/ai/custom_prompts.json', ai.customPrompts)
-                        ai._promptSaveTimer = null
-                    }, 500)
+                    ai._scheduleUsersSave()
                 }
                 await i.update({
                     content: '✅ Done, Medusa has forgotten everything about you. Fresh start 🌸',
@@ -573,28 +693,144 @@ export async function registerAI(client, db, config) {
             if (!input) {
                 const cur = ai.userModes[uid2] ?? 0
                 return interaction.reply({
-                    content: `Your current mode is: **${cur === 1 ? 'focused' : 'normal'}** (${cur}).\nUse \`/mode focused\` or \`/mode normal\` to switch.`,
+                    content: `Your current mode: **${['normal', 'focused', 'fast'][cur] ?? 'normal'}** (${cur}).\nUse \`/mode focused\`, \`/mode normal\`, or \`/mode fast\` to switch.`,
                     flags: MessageFlags.Ephemeral,
                 })
             }
             if (['focused', '1'].includes(input)) {
                 ai.userModes[uid2] = 1
-                ai._saveJSON('data/ai/user_modes.json', ai.userModes)
+                ai._scheduleUsersSave()
                 return interaction.reply({
                     content: '✅ Switched to **focused mode** - task-oriented responses',
                     flags: MessageFlags.Ephemeral,
                 })
             }
+            if (['fast', '2'].includes(input)) {
+                ai.userModes[uid2] = 2
+                ai._scheduleUsersSave()
+                return interaction.reply({
+                    content: '✅ Switched to **fast mode** - ultrashort replies',
+                    flags: MessageFlags.Ephemeral,
+                })
+            }
             if (['normal', '0'].includes(input)) {
                 ai.userModes[uid2] = 0
-                ai._saveJSON('data/ai/user_modes.json', ai.userModes)
+                ai._scheduleUsersSave()
                 return interaction.reply({
                     content: '✅ Switched to **normal mode** - Full personality and casual responses',
                     flags: MessageFlags.Ephemeral,
                 })
             }
             return interaction.reply({
-                content: '❌ Invalid mode. Use `focused`/`1` or `normal`/`0`',
+                content: '❌ Invalid mode. Use `focused`/`1`, `normal`/`0`, or `fast`/`2`',
+                flags: MessageFlags.Ephemeral,
+            })
+        }
+
+        // /streaming
+        if (commandName === 'streaming') {
+            const input = interaction.options.getString('mode')
+            const uid2 = interaction.user.id
+            if (!input) {
+                const cur = ai.userStreams[uid2] !== false
+                return interaction.reply({
+                    content: `Your streaming is currently **${cur ? 'on' : 'off'}** (on = typing + fancy streaming text, off = whole replies with no typing).\nUse \`/streaming on\` or \`/streaming off\` to switch.`,
+                    flags: MessageFlags.Ephemeral,
+                })
+            }
+            ai.userStreams[uid2] = input === 'on'
+            ai._scheduleUsersSave()
+            return interaction.reply({
+                content:
+                    input === 'on'
+                        ? '✅ Streaming **on** — normal typing indicator + streaming text.'
+                        : '✅ Streaming **off** — whole replies, no typing indicator (same provider speed, just silent until it lands).',
+                flags: MessageFlags.Ephemeral,
+            })
+        }
+
+        // /prompt — view, set, or reset your custom persona.
+        if (commandName === 'prompt') {
+            const uid2 = String(interaction.user.id)
+            if (interaction.options.getString('reset') === 'on') {
+                if (ai.customPrompts[uid2]) {
+                    delete ai.customPrompts[uid2]
+                    ai._scheduleUsersSave()
+                    return interaction.reply({
+                        content: '✅ Prompt reset to default.',
+                        flags: MessageFlags.Ephemeral,
+                    })
+                }
+                return interaction.reply({
+                    content: "You don't have a custom prompt set.",
+                    flags: MessageFlags.Ephemeral,
+                })
+            }
+            const system = (interaction.options.getString('system') ?? '').trim()
+            if (!system) {
+                const cur = ai.customPrompts[uid2]
+                return interaction.reply({
+                    content: cur
+                        ? `Your custom persona: ${cur.slice(0, 900)}`
+                        : 'No custom persona set. Pass `system` to set one, or `reset:true` to wipe it.',
+                    flags: MessageFlags.Ephemeral,
+                })
+            }
+            if (containsDisallowedHate(system, { persona: true })) {
+                return interaction.reply({ content: safetyRefusal(system), flags: MessageFlags.Ephemeral })
+            }
+            ai.customPrompts[uid2] = system.slice(0, 2000)
+            ai._scheduleUsersSave()
+            return interaction.reply({
+                content: '✅ Custom persona set.',
+                flags: MessageFlags.Ephemeral,
+            })
+        }
+
+        // /server-prompt — guild persona, Manage Server only.
+        if (commandName === 'server-prompt') {
+            if (!interaction.guild)
+                return interaction.reply({ content: 'Server only.', flags: MessageFlags.Ephemeral })
+            const canManage =
+                String(interaction.user.id) === String(OWNER_ID) ||
+                !!interaction.memberPermissions?.has(PermissionFlagsBits.ManageGuild)
+            if (!canManage)
+                return interaction.reply({
+                    content: 'You need **Manage Server**.',
+                    flags: MessageFlags.Ephemeral,
+                })
+            const gid = interaction.guild.id
+            if (interaction.options.getString('reset') === 'on') {
+                if (ai.serverPrompts[gid]) {
+                    delete ai.serverPrompts[gid]
+                    ai._scheduleUsersSave()
+                    return interaction.reply({
+                        content: '✅ Server persona reset to default.',
+                        flags: MessageFlags.Ephemeral,
+                    })
+                }
+                return interaction.reply({
+                    content: 'This server has no custom persona.',
+                    flags: MessageFlags.Ephemeral,
+                })
+            }
+            const system = (interaction.options.getString('system') ?? '').trim()
+            if (!system) {
+                const cur = ai.serverPrompts[gid]
+                return interaction.reply({
+                    content: cur
+                        ? `Current server persona: ${cur.slice(0, 900)}`
+                        : 'No server persona set. Pass `system` to set one.',
+                    flags: MessageFlags.Ephemeral,
+                })
+            }
+            if (containsDisallowedHate(system, { persona: true })) {
+                return interaction.reply({ content: safetyRefusal(system), flags: MessageFlags.Ephemeral })
+            }
+            ai.serverPrompts[gid] = system.slice(0, 2000)
+            ai._scheduleUsersSave()
+            return interaction.reply({
+                content: `✅ Server persona set for **${interaction.guild.name}**.`,
                 flags: MessageFlags.Ephemeral,
             })
         }
@@ -617,11 +853,9 @@ export async function registerAI(client, db, config) {
             return interaction.reply({ content: text || '…', flags: MessageFlags.Ephemeral })
         }
 
-
         if (commandName === 'ai-pause') {
             const guild = interaction.guild
-            if (!guild)
-                return interaction.reply({ content: 'Server only.', flags: MessageFlags.Ephemeral })
+            if (!guild) return interaction.reply({ content: 'Server only.', flags: MessageFlags.Ephemeral })
             if (!isOwner && !interaction.memberPermissions?.has(PermissionFlagsBits.Administrator))
                 return interaction.reply({ content: 'Administrator only.', flags: MessageFlags.Ephemeral })
             const action = interaction.options.getString('action')
@@ -645,16 +879,43 @@ export async function registerAI(client, db, config) {
                 })
             ai.pausedGuilds.delete(guild.id)
             setConfigGuild(guild.id, { ai: undefined })
-            return interaction.reply({ content: `\u25b6\ufe0f AI resumed in **${guild.name}**, she's listening again.` })
+            return interaction.reply({
+                content: `\u25b6\ufe0f AI resumed in **${guild.name}**, she's listening again.`,
+            })
         }
 
         // owner-only commands
         if (!isOwner) return
+        if (commandName === 'debug') {
+            ai.debugMode = !ai.debugMode
+            globalThis._medusaDebug = ai.debugMode
+            if (ai.debugMode) {
+                // Fresh scratch state per session: prod DBs stay untouched.
+                try {
+                    const { rmSync } = await import('fs')
+                    rmSync('data/ai/debug - debug', { recursive: true, force: true })
+                } catch {}
+                ai._debugMem = null
+            }
+            try {
+                const raw = readConfigRaw()
+                raw.debug = ai.debugMode
+                writeConfigRaw(raw)
+            } catch {}
+            console.warn(
+                `[AI] Debug mode ${ai.debugMode ? 'ON — owner-only, scratch DB, no passive buffering' : 'OFF — normal operation'}`,
+            )
+            return interaction.reply({
+                content: ai.debugMode
+                    ? '🔧 Debug mode **ON** — I only answer you now (looks paused to everyone else), memory goes to a scratch DB, passive buffering is off, logs are verbose. Toggle again to go back.'
+                    : '🔧 Debug mode **OFF** — normal operation resumed.',
+                flags: MessageFlags.Ephemeral,
+            })
+        }
         if (commandName === 'isolation') {
             const guild = interaction.guild
-            if (!guild)
-                return interaction.reply({ content: 'Server only.', flags: MessageFlags.Ephemeral })
-            const wantIsolated = interaction.options.getBoolean('active')
+            if (!guild) return interaction.reply({ content: 'Server only.', flags: MessageFlags.Ephemeral })
+            const wantIsolated = interaction.options.getString('active') === 'on'
             const isIsolated = ai.isolatedServers.has(guild.id)
             if (wantIsolated === isIsolated)
                 return interaction.reply({
@@ -701,7 +962,12 @@ export async function registerAI(client, db, config) {
                     }
                     if (!Object.keys(raw.guilds).length) delete raw.guilds
                 }
-                for (const key of ['alwaysActiveChannels', 'funChannels', 'always_active_channels', 'fun_channels']) {
+                for (const key of [
+                    'alwaysActiveChannels',
+                    'funChannels',
+                    'always_active_channels',
+                    'fun_channels',
+                ]) {
                     if (!Array.isArray(raw[key])) continue
                     const keep = []
                     for (const id of raw[key].map(String)) {
@@ -721,11 +987,16 @@ export async function registerAI(client, db, config) {
                 removed.push(`isolation \`${id}\``)
             }
             if (staleIso.length) saveRuntime({ isolatedGuilds: [...ai.isolatedServers] })
-            for (const id of [...ai.pausedGuilds]) if (!client.guilds.cache.has(id)) ai.pausedGuilds.delete(id)
+            for (const id of [...ai.pausedGuilds])
+                if (!client.guilds.cache.has(id)) ai.pausedGuilds.delete(id)
             if (!removed.length)
                 return interaction.editReply({ content: 'Config is clean, nothing stale in there.' })
             return interaction.editReply({
-                content: `🧽 Cleaned ${removed.length} stale entr${removed.length === 1 ? 'y' : 'ies'}:\n${removed.map((r) => `• ${r}`).join('\n')}`.slice(0, 1900),
+                content:
+                    `🧽 Cleaned ${removed.length} stale entr${removed.length === 1 ? 'y' : 'ies'}:\n${removed.map((r) => `• ${r}`).join('\n')}`.slice(
+                        0,
+                        1900,
+                    ),
             })
         }
     })
@@ -736,27 +1007,34 @@ export async function registerAI(client, db, config) {
         if (!text) return msg.reply('Please provide a prompt.')
         const uid = String(msg.author.id)
         if (containsDisallowedHate(text, { persona: true })) {
-            if (msg.guild) logAction(db, msg.guild.id, uid, client.user.id, 'AI safety block', 'Unsafe custom persona prompt')
+            if (msg.guild)
+                logAction(
+                    db,
+                    msg.guild.id,
+                    uid,
+                    client.user.id,
+                    'AI safety block',
+                    'Unsafe custom persona prompt',
+                )
             return msg.reply(safetyRefusal(text))
         }
         ai.customPrompts[uid] = text
-        if (ai._promptSaveTimer) clearTimeout(ai._promptSaveTimer)
-        ai._promptSaveTimer = setTimeout(() => {
-            ai._saveJSON('data/ai/custom_prompts.json', ai.customPrompts)
-            ai._promptSaveTimer = null
-        }, 500)
+        ai._scheduleUsersSave()
         const modeNote =
             ai.userModes[uid] === 1
-                ? `, heads up, focused mode overrides it (\`${config.prefix}mode normal\` to switch back)`
-                : ''
+                ? ` (focused mode stays on and styles it)`
+                : ai.userModes[uid] === 2
+                  ? ` (fast mode stays on and keeps replies ultrashort)`
+                  : ''
         await msg.reply(`✅ Custom prompt set for ${msg.author.displayName}${modeNote}`)
     })
     client.commands.set('prompt', client.commands.get('p'))
+    client.commands.set('promptreset', client.commands.get('pr'))
     client.commands.set('pr', async (msg) => {
         const uid = String(msg.author.id)
         if (ai.customPrompts[uid]) {
             delete ai.customPrompts[uid]
-            ai._saveJSON('data/ai/custom_prompts.json', ai.customPrompts)
+            ai._scheduleUsersSave()
             await msg.reply(`✅ Prompt reset to default for ${msg.author.displayName}`)
         } else await msg.reply("You don't have a custom prompt set.")
     })
@@ -772,11 +1050,18 @@ export async function registerAI(client, db, config) {
             return msg.reply(cur ? `Current server persona: ${cur.slice(0, 600)}` : 'No server persona set.')
         }
         if (containsDisallowedHate(text, { persona: true })) {
-            logAction(db, msg.guild.id, String(msg.author.id), client.user.id, 'AI safety block', 'Unsafe server persona')
+            logAction(
+                db,
+                msg.guild.id,
+                String(msg.author.id),
+                client.user.id,
+                'AI safety block',
+                'Unsafe server persona',
+            )
             return msg.reply(safetyRefusal(text))
         }
         ai.serverPrompts[msg.guild.id] = text
-        ai._saveJSON('data/ai/server_prompts.json', ai.serverPrompts)
+        ai._scheduleUsersSave()
         await msg.reply(`✅ Server persona set for ${msg.guild.name}`)
     })
     client.commands.set('serverpr', async (msg) => {
@@ -787,31 +1072,48 @@ export async function registerAI(client, db, config) {
         if (!canManage) return msg.reply('You need **Manage Server** to reset the server persona.')
         if (!ai.serverPrompts[msg.guild.id]) return msg.reply('This server has no custom persona.')
         delete ai.serverPrompts[msg.guild.id]
-        ai._saveJSON('data/ai/server_prompts.json', ai.serverPrompts)
+        ai._scheduleUsersSave()
         await msg.reply('✅ Server persona reset to default')
     })
+    client.commands.set('serverprompt', client.commands.get('serverp'))
+    client.commands.set('serverpromptreset', client.commands.get('serverpr'))
     client.commands.set('mode', async (msg, args) => {
         const input = args[0]?.toLowerCase()
         const uid = String(msg.author.id)
         if (!input) {
             const cur = ai.userModes[uid] ?? 0
             return msg.reply(
-                `Your current mode: **${cur === 1 ? 'focused' : 'normal'}** (${cur}). Use \`${config.prefix}mode focused\` or \`${config.prefix}mode normal\`.`,
+                `Your current mode: **${['normal', 'focused', 'fast'][cur] ?? 'normal'}** (${cur}). Use \`${config.prefix}mode focused\`, \`${config.prefix}mode normal\`, or \`${config.prefix}mode fast\`.`,
             )
         }
         let newMode = null
         if (['focused', '1'].includes(input)) newMode = 1
+        else if (['fast', '2'].includes(input)) newMode = 2
         else if (['normal', '0'].includes(input)) newMode = 0
-        else return msg.reply('❌ Invalid mode. Use `focused`/`1` or `normal`/`0`')
+        else return msg.reply('❌ Invalid mode. Use `focused`/`1`, `normal`/`0`, or `fast`/`2`')
 
         ai.userModes[uid] = newMode
-        // Async save with debounce to prevent disk thrashing
-        if (ai._modeSaveTimer) clearTimeout(ai._modeSaveTimer)
-        ai._modeSaveTimer = setTimeout(() => {
-            ai._saveJSON('data/ai/user_modes.json', ai.userModes)
-            ai._modeSaveTimer = null
-        }, 500)
-        return msg.reply(`✅ Switched to **${newMode === 1 ? 'focused' : 'normal'} mode**`)
+        ai._scheduleUsersSave()
+        const modeName = ['normal', 'focused', 'fast'][newMode]
+        return msg.reply(`✅ Switched to **${modeName} mode**`)
+    })
+    client.commands.set('stream', async (msg, args) => {
+        const input = args[0]?.toLowerCase()
+        const uid = String(msg.author.id)
+        if (!input) {
+            const cur = ai.userStreams[uid] !== false
+            return msg.reply(
+                `Your streaming is currently **${cur ? 'on' : 'off'}** (on = typing + fancy streaming text, off = whole replies with no typing). Use \`${config.prefix}stream on\` or \`${config.prefix}stream off\`.`,
+            )
+        }
+        if (!['on', 'off'].includes(input)) return msg.reply('❌ Use `on` or `off`.')
+        ai.userStreams[uid] = input === 'on'
+        ai._scheduleUsersSave()
+        return msg.reply(
+            input === 'on'
+                ? '✅ Streaming **on** — normal typing indicator + streaming text.'
+                : '✅ Streaming **off** — whole replies, no typing indicator (same provider speed, just silent until it lands).',
+        )
     })
     // Memory lookup by name: what the server roster says + what she remembers.
     // Results post visibly (and land in history), so "who is X / is X here" gets
@@ -853,6 +1155,9 @@ export async function registerAI(client, db, config) {
             ai._invalidateUserCache(uid)
             for (const k of [...ai.messageHistory.keys()])
                 if (k.startsWith(`${uid}-`)) ai.messageHistory.delete(k)
+            try {
+                ai.ghost?.clearUser?.(uid)
+            } catch {}
             await msg.reply(`Cleared all data for user ${uid}`)
         }),
     )
@@ -903,21 +1208,67 @@ export function buildAISlashCommands() {
     return [
         new SlashCommandBuilder()
             .setName('memory')
-            .setDescription('Peek at everything Medusa remembers about you')
-            .setContexts(0),
+            .setDescription('Peek at what Medusa remembers — or turn memory On/Off for you')
+            .setContexts(0)
+            .addStringOption((o) =>
+                o
+                    .setName('mode')
+                    .setDescription('On = she remembers chats, Off = nothing stored or fetched')
+                    .addChoices({ name: 'On', value: 'on' }, { name: 'Off', value: 'off' }),
+            ),
         new SlashCommandBuilder()
             .setName('forgetme')
             .setContexts(0)
             .setDescription('Delete everything Medusa remembers about you'),
         new SlashCommandBuilder()
+            .setName('prompt')
+            .setContexts(0)
+            .setDescription('Set, view, or reset your custom persona')
+            .addStringOption((o) =>
+                o.setName('system').setDescription('Your custom persona/instructions (omit to view current)'),
+            )
+            .addStringOption((o) =>
+                o
+                    .setName('reset')
+                    .setDescription('On wipes your custom persona back to default')
+                    .addChoices({ name: 'On', value: 'on' }, { name: 'Off', value: 'off' }),
+            ),
+        new SlashCommandBuilder()
+            .setName('server-prompt')
+            .setContexts(0)
+            .setDescription('Set, view, or reset this server persona (Manage Server)')
+            .addStringOption((o) =>
+                o.setName('system').setDescription('Server persona/instructions (omit to view current)'),
+            )
+            .addStringOption((o) =>
+                o
+                    .setName('reset')
+                    .setDescription('On wipes the server persona back to default')
+                    .addChoices({ name: 'On', value: 'on' }, { name: 'Off', value: 'off' }),
+            ),
+        new SlashCommandBuilder()
             .setName('mode')
             .setContexts(0)
-            .setDescription('Switch between focused/normal AI mode')
+            .setDescription('Switch between focused/normal/fast AI mode')
             .addStringOption((o) =>
                 o
                     .setName('mode')
-                    .setDescription('focused or normal')
-                    .addChoices({ name: 'focused', value: 'focused' }, { name: 'normal', value: 'normal' }),
+                    .setDescription('focused, normal, or fast')
+                    .addChoices(
+                        { name: 'focused', value: 'focused' },
+                        { name: 'normal', value: 'normal' },
+                        { name: 'fast', value: 'fast' },
+                    ),
+            ),
+        new SlashCommandBuilder()
+            .setName('streaming')
+            .setContexts(0)
+            .setDescription('Pick instant replies or fancy streaming text (just for you)')
+            .addStringOption((o) =>
+                o
+                    .setName('mode')
+                    .setDescription('on = typing + streaming, off = instant, no typing indicator')
+                    .addChoices({ name: 'on', value: 'on' }, { name: 'off', value: 'off' }),
             ),
         new SlashCommandBuilder()
             .setName('recall')
@@ -945,8 +1296,12 @@ export function buildAISlashCommands() {
             .setDescription('Give this server its own AI memory (owner)')
             .setContexts(0)
             .setDefaultMemberPermissions('0')
-            .addBooleanOption((o) =>
-                o.setName('active').setDescription('true isolates, false goes back to global memory').setRequired(true),
+            .addStringOption((o) =>
+                o
+                    .setName('active')
+                    .setDescription('On isolates, Off goes back to global memory')
+                    .setRequired(true)
+                    .addChoices({ name: 'On', value: 'on' }, { name: 'Off', value: 'off' }),
             ),
         new SlashCommandBuilder()
             .setName('configclean')
@@ -954,14 +1309,23 @@ export function buildAISlashCommands() {
             .setContexts(0)
             .setDefaultMemberPermissions('0'),
         new SlashCommandBuilder()
+            .setName('debug')
+            .setDescription('Toggle debug mode: owner-only replies, scratch DB, verbose logs (owner)')
+            .setContexts(0)
+            .setDefaultMemberPermissions('0'),
+        new SlashCommandBuilder()
             .setName('summarize')
             .setDescription('Summarize recent conversation')
             .setIntegrationTypes(0, 1)
             .setContexts(0, 1, 2)
-            .addStringOption((o) => o.setName('start-from').setDescription('Message ID or link to start from')),
+            .addStringOption((o) =>
+                o.setName('start-from').setDescription('Message ID or link to start from'),
+            ),
         new SlashCommandBuilder()
             .setName('medusa')
-            .setDescription('Ask Medusa one quick question, nothing gets remembered. DMs and group chats only.')
+            .setDescription(
+                'Ask Medusa one quick question, nothing gets remembered. DMs and group chats only.',
+            )
             .setIntegrationTypes(0, 1)
             .setContexts(1, 2)
             .addStringOption((o) =>
@@ -971,11 +1335,48 @@ export function buildAISlashCommands() {
                     .setRequired(true)
                     .setMaxLength(1800),
             )
-            .addBooleanOption((o) =>
-                o.setName('search').setDescription('Force a live web search (default: auto-detect)'),
+            .addStringOption((o) =>
+                o
+                    .setName('search')
+                    .setDescription('Web research: Auto, On, or Off (default Auto)')
+                    .addChoices(
+                        { name: 'Auto', value: 'auto' },
+                        { name: 'On', value: 'on' },
+                        { name: 'Off', value: 'off' },
+                    ),
             )
-            .addBooleanOption((o) =>
-                o.setName('private').setDescription('Show only to you (ephemeral). Default: visible.'),
+            .addStringOption((o) =>
+                o
+                    .setName('privacy')
+                    .setDescription('On = only you see it (default Off)')
+                    .addChoices({ name: 'On', value: 'on' }, { name: 'Off', value: 'off' }),
+            ),
+        new SlashCommandBuilder()
+            .setName('ask')
+            .setContexts(0)
+            .setDescription('Quick precise answer with light memory (server only, instant)')
+            .addStringOption((o) =>
+                o
+                    .setName('prompt')
+                    .setDescription('What do you want to ask?')
+                    .setRequired(true)
+                    .setMaxLength(1800),
+            )
+            .addStringOption((o) =>
+                o
+                    .setName('research')
+                    .setDescription('Web research: Auto, On, or Off (default Auto)')
+                    .addChoices(
+                        { name: 'Auto', value: 'auto' },
+                        { name: 'On', value: 'on' },
+                        { name: 'Off', value: 'off' },
+                    ),
+            )
+            .addStringOption((o) =>
+                o
+                    .setName('privacy')
+                    .setDescription('On = only you see it (default Off)')
+                    .addChoices({ name: 'On', value: 'on' }, { name: 'Off', value: 'off' }),
             ),
     ].map((c) => c.toJSON())
 }
