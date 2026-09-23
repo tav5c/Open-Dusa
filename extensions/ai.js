@@ -311,6 +311,7 @@ export async function registerAI(client, db, config) {
                     skipResearch: skipSearch,
                     guildId: interaction.guild?.id ?? null,
                     isOwner,
+                    userId: interaction.user.id,
                 })
                 if (!response)
                     return interaction.editReply({ content: '✗ All providers failed. Try again shortly.' })
@@ -383,6 +384,7 @@ export async function registerAI(client, db, config) {
                     userCtx,
                     guildId: interaction.guild?.id ?? null,
                     isOwner,
+                    userId: interaction.user.id,
                 })
                 if (!response)
                     return interaction.editReply({ content: '✗ All providers failed. Try again shortly.' })

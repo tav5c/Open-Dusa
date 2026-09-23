@@ -899,6 +899,7 @@ TIME: ${new Date().toISOString().slice(0, 16)} UTC${personaOwned ? '' : '\nVOICE
         userCtx = '',
         guildId = null,
         isOwner = false,
+        userId = null,
     }) {
         if (!this._groq) return null
 
@@ -920,6 +921,22 @@ TIME: ${new Date().toISOString().slice(0, 16)} UTC${personaOwned ? '' : '\nVOICE
         // the model, which answers non-explicitly per its prompt, the old flat refusal
         // fired on merely edgy questions and read as closed-minded.
         if (routing === 'dangerous') return "I can't help with that."
+
+        // Personal time ask ("what time is it for me") with a saved zone:
+        // answer from data like the main path does instead of pleading
+        // ignorance. Stateless has no memory, but a saved timezone is a
+        // setting, not a recollection.
+        let finalPrompt = prompt
+        if (
+            userId &&
+            /\bwhat(\'s| is)( the)? time\b/i.test(String(prompt ?? '')) &&
+            /\b(me|my|mine|for me)\b/i.test(String(prompt ?? ''))
+        ) {
+            try {
+                const line = getLocalTimeLine(getSavedTimezone(userId))
+                if (line) finalPrompt += `\n\n[TIME DATA, state as fact: it is ${line} for the asker.]`
+            } catch {}
+        }
 
         const runDirect = async (finalPrompt, sys) => {
             const messages = [
@@ -960,7 +977,7 @@ ${text.slice(0, 3500)}
 ${'-'.repeat(32)}
 
 ` +
-                    `Question: ${prompt}
+                    `Question: ${finalPrompt}
 
 Answer concisely using the research.`
                 // Research answers must pass the same hard-strip as direct ones -
@@ -981,7 +998,7 @@ Answer concisely using the research.`
             }
         }
 
-        const raw = await runDirect(prompt, systemPrompt)
+        const raw = await runDirect(finalPrompt, systemPrompt)
         return raw ? this._sanitizeStateless(raw) : null
     }
 
