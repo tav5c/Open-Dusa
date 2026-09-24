@@ -6,6 +6,7 @@ package-lock.json
 .env
 config.json
 config.censored.json
+config-gpt.json
 
 # Generated config & data (runtime overlay, callers, priv, performance, slash hash cache)
 configs/
