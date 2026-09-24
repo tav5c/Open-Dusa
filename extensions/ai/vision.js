@@ -176,7 +176,10 @@ export class VisionCore extends ResearchCore {
                 if (this._isKeyError(e)) {
                     if (await this.rotateKey(err)) {
                         try {
-                            const r2 = await client.chat.completions.create({
+                            // rotateKey() rebuilt the shared client around the
+                            // fresh key — retry on that, not the stale local
+                            // object (same limited key, guaranteed 429).
+                            const r2 = await (this._visionClient ?? this._groq).chat.completions.create({
                                 model,
                                 messages: s1msgs,
                                 max_completion_tokens: this.visionTokens,
@@ -364,7 +367,10 @@ export class VisionCore extends ResearchCore {
                     s1msgs,
                     userText,
                     staticUrl,
-                    true,
+                    // Only the chat-provider client may rotate the chat ring.
+                    // A pinned vision client (own provider/key) rotating it
+                    // cools down chat keys the vision call never uses.
+                    !this._visionClient,
                 ))
             // Hard failure (not expired/format, which are terminal answers) -> walk
             // this agent's own fallback chain before giving up to text-only.

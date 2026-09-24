@@ -272,7 +272,16 @@ export class ProviderCore {
             if (!firstFailure) firstFailure = `${p.name} (${detail})`
         }
         for (const p of ordered) {
-            if (budget && Date.now() > budget.until) break
+            // Hard per-reply cap: attempts share one deadline, and each
+            // attempt gets at most what the budget has left.
+            const remainMs = budget ? budget.until - Date.now() : Infinity
+            if (remainMs < 1000) break
+            // This reply already proved the base dead (stream-open timeout /
+            // 5xx): skip it here too, not only in the fallback chain.
+            if (budget?.dead.has(p.baseUrl)) {
+                noteFailure(p, 'dead this reply')
+                continue
+            }
             if (!p.client) continue
             if (now < p.state.openUntil) {
                 noteFailure(p, 'breaker open')
@@ -294,10 +303,11 @@ export class ProviderCore {
                 // Preferred provider gets a 25s ceiling: its TTFT routinely
                 // exceeds the shared 12s client default, and a premature
                 // timeout here burns the whole chain for a live-but-slow hop.
-                const r = await p.client.chat.completions.create(
-                    payload,
-                    p.baseUrl === preferredBase ? { timeout: 25_000 } : undefined,
-                )
+                // Never more than the budget has left, though.
+                const ceiling = p.baseUrl === preferredBase ? 25_000 : 12_000
+                const r = await p.client.chat.completions.create(payload, {
+                    timeout: Math.min(ceiling, remainMs),
+                })
                 const out = r.choices?.[0]?.message?.content
                 if (out) {
                     this._resetBreaker(p)
@@ -306,8 +316,11 @@ export class ProviderCore {
                     // a single provider took a while — including WHAT missed first.
                     const elapsed = Date.now() - now
                     if (attempts > 1 || elapsed > 8000) {
+                        // Prefill size rides along so slow turns can be split
+                        // into provider-side vs payload-side after the fact.
+                        const prefill = messages.reduce((a, m) => a + String(m.content ?? '').length, 0)
                         console.log(
-                            `[AI] Routed via '${p.name}' in ${(elapsed / 1000).toFixed(1)}s (${attempts} attempt${attempts === 1 ? '' : 's'}${firstFailure ? `, first miss: ${firstFailure}` : ''})`,
+                            `[AI] Routed via '${p.name}' in ${(elapsed / 1000).toFixed(1)}s (${attempts} attempt${attempts === 1 ? '' : 's'}${firstFailure ? `, first miss: ${firstFailure}` : ''}, prefill ${(prefill / 1024).toFixed(1)}k chars)`,
                         )
                     }
                     return out
@@ -704,7 +717,10 @@ export class ProviderCore {
                 // Check if we have multiple keys to rotate through. If only 1 key, we must respect retry-after.
                 // Capped at 15s: genuine retry-afters are seconds; beyond that,
                 // shed to fallbacks instead of stalling the reply.
-                if (this.aiTokens.length <= 1 && !this._isDeadKeyError(err)) {
+                // Never for pinned clients (classifier/vision on their own
+                // provider): the failing key isn't from aiTokens, and the wait
+                // outlives the 2.5s classifier race as a dangling sleeper.
+                if (!pinned && this.aiTokens.length <= 1 && !this._isDeadKeyError(err)) {
                     const waitMs = Math.min(this._parseRetryMs(e), 15_000)
                     console.log(`[AI] 429 retry-after: waiting ${waitMs}ms (only 1 key available)`)
                     await new Promise((r) => setTimeout(r, waitMs))
@@ -749,6 +765,7 @@ export class ProviderCore {
         let stubP = null
         let full = ''
         let lastEdit = 0
+        const t0 = Date.now()
         // Edit pace: 1/s. Discord rate-limits message edits aggressively, and
         // sub-second edits 429 silently (swallowed .catch) leaving the stream
         // stalled-looking until the final edit. First chunk still posts
@@ -785,16 +802,27 @@ export class ProviderCore {
                 streamClient.chat.completions.create(payload, { timeout: 30_000 }),
                 stubP,
             ])
+            const openMs = Date.now() - t0
+            let firstMs = null
             for await (const chunk of stream) {
                 const delta = chunk.choices?.[0]?.delta?.content ?? ''
                 if (!delta) continue
+                if (firstMs === null) {
+                    firstMs = Date.now() - t0
+                    if (this._config?.debug)
+                        console.log(`[AI] Stream open ${openMs}ms, first chunk +${firstMs - openMs}ms`)
+                }
                 full += delta
                 const now = Date.now()
                 if (placeholder && now - lastEdit >= editGap() && full.length <= MAX_LEN) {
                     lastEdit = now
                     placeholder.edit(this._stripPartialTags(full) + ' ▌').catch(() => {})
                 }
-                if (full.length > MAX_LEN) break // let splitResponse + secureReply handle the rest
+                // No early break past MAX_LEN: edits stop (gate above) but the
+                // stream keeps draining, so the caller gets the COMPLETE reply
+                // and splitResponse can post the overflow. Breaking here used
+                // to silently truncate every reply longer than ~1900 chars
+                // (and drop any RUN_CMD tag the model emitted late).
             }
             if (placeholder) {
                 const finalText = this.finalSecurityCheck(this._stripPartialTags(full).slice(0, 2000))
@@ -819,7 +847,16 @@ export class ProviderCore {
                 // otherwise edit a deleted message (harmless 404, still noise).
                 if (message) message._medusaStreamMsg = null
             } catch {}
-            return this._groqCallWithFallbacks(messages, model, maxTokens, temp)
+            // The stream open already spent up to 30s of the user's patience;
+            // hand the fallback chain a SHORT shared budget seeded with this
+            // base as dead (timeout/5xx = provider-side, not our payload), so
+            // the chain skips straight to a healthy provider instead of
+            // re-hitting the corpse for another 25s inside a fresh 30s budget.
+            const budget = {
+                until: Date.now() + 15_000,
+                dead: new Set(this._isKeyError(e) || this._isRequestError(e) ? [] : [this.llmBaseUrl]),
+            }
+            return this._groqCallWithFallbacks(messages, model, maxTokens, temp, undefined, 'chat', budget)
         }
     }
 
@@ -863,7 +900,12 @@ export class ProviderCore {
         if (!client) return null
         try {
             const payload = this._buildPayload(entry.model, messages, maxTokens, temp, topP, entry.baseUrl)
-            const r = await client.chat.completions.create({ ...payload, stream: false })
+            // Same hard-cap rule as _routedCall: an attempt that starts inside
+            // the budget must not outlive it by the full 12s client default.
+            const opts = budget
+                ? { timeout: Math.max(1000, Math.min(12_000, budget.until - Date.now())) }
+                : undefined
+            const r = await client.chat.completions.create({ ...payload, stream: false }, opts)
             const out = r.choices?.[0]?.message?.content
             if (out) {
                 if (routerP) this._resetBreaker(routerP)
@@ -890,13 +932,17 @@ export class ProviderCore {
         temp = this.temperature,
         topP,
         agent = 'chat',
+        budgetIn = null,
     ) {
         // Single-provider installs skip the router; multi-provider installs
         // route first and walk the chain on miss. The old code always ran
         // _groqCall after _routedCall, re-hitting the same provider/model the
         // router just tried (duplicate hop + up to 12s burn, breaker ignored).
         // _groqCall stays for the single-provider case only.
-        const budget = { until: Date.now() + (this._replyBudgetMs ?? 30_000), dead: new Set() }
+        const budget = budgetIn ?? {
+            until: Date.now() + (this._replyBudgetMs ?? 30_000),
+            dead: new Set(),
+        }
         if (this._providers?.length > 1) {
             const routed = await this._routedCall(messages, model, maxTokens, temp, topP, budget)
             if (routed) return routed

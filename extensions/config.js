@@ -243,7 +243,7 @@ export function normalizeConfig(raw) {
             // model instead. Explicit config still wins above.
             (clfResolved?.baseUrl?.includes('nvidia') ? 'meta/llama-3.1-8b-instruct' : 'openai/gpt-oss-20b'),
         temperature: a.classifier?.temperature ?? 0,
-        maxTokens: a.classifier?.maxTokens ?? 5,
+        maxTokens: a.classifier?.maxTokens ?? 64,
     }
     classifier.resolved = clfResolved
     classifier.fallbacks = resolveFallbacks(fallbackRaw(a.classifier), clfResolved, providers)

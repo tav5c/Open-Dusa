@@ -63,6 +63,13 @@ export class ResearchCore extends ProviderCore {
                 if (out) return out
             }
             for (const fb of this.agentFallbacks?.research ?? []) {
+                // Same model on the same provider the primary just tried:
+                // re-hitting it burns a hop for identical results.
+                if (
+                    fb.model === this.researchModel &&
+                    fb.baseUrl === this._config?.agents?.research?.resolved?.baseUrl
+                )
+                    continue
                 try {
                     const client = this._fallbackClient(fb)
                     if (!client) continue
@@ -75,25 +82,13 @@ export class ResearchCore extends ProviderCore {
                     }
                 } catch {}
             }
-            // Last-ditch: ask the primary chat client to answer from its own knowledge
-            if (this._groq) {
-                try {
-                    const r = await this._groq.chat.completions.create({
-                        model: this.aiModel,
-                        messages: [
-                            {
-                                role: 'system',
-                                content:
-                                    'Answer factually from your knowledge. If unsure, say so briefly. No fake URLs.',
-                            },
-                            { role: 'user', content: prompt.slice(0, 800) },
-                        ],
-                        max_completion_tokens: 800,
-                        temperature: 0.3,
-                    })
-                    return r.choices[0]?.message?.content ?? null
-                } catch {}
-            }
+            // No last-ditch knowledge call here anymore: it returned a memory
+            // answer DISGUISED as research — callers stamped 🔍/"researched
+            // live" footers on it and the stateless path re-chewed it through
+            // a second synthesis call (double LLM spend, lying footer). null
+            // makes every caller take its own honest brain path instead:
+            // stateless -> direct quick-agent answer (with its own fallback
+            // chain), chat -> persona fallback with no research footer.
             return null
         }
         if (!fairCtx || PERF.ai.fairShare === false) return await run()
@@ -119,6 +114,7 @@ export class ResearchCore extends ProviderCore {
                 maxResults: 5,
                 searchDepth: 'basic',
                 includeAnswer: true,
+                timeout: 8,
             })
             const snippets = (tr.results ?? [])
                 .map((r, i) => {
@@ -169,10 +165,13 @@ export class ResearchCore extends ProviderCore {
                 const content = r.choices?.[0]?.message?.content
                 if (content?.trim()) return content
             } catch {}
-            // Synthesis failed: fall through to the tool loop below.
+            // Synthesis failed: fall through to the tool loop below — unless
+            // Tavily already ran this turn and Serper isn't configured, in
+            // which case the loop would just re-run the same dead search.
+            const serperKey = (this._config ?? this.config).search?.serperKey
+            if (pre !== undefined && !serperKey) return null
         }
 
-        const serperKey = (this._config ?? this.config).search?.serperKey
         const tavilyKey = (this._config ?? this.config).search?.tavilyKey
         const searchTool = {
             type: 'function',
@@ -240,6 +239,12 @@ export class ResearchCore extends ProviderCore {
             // model called a tool). The round cap prevents runaway search loops.
             const MAX_ROUNDS = 4
             const convo = [...messages]
+            // Did ANY tool round bring back real data? An all-failed loop must
+            // not return the model's honest "found nothing" apology as if it
+            // were research — callers would synthesize on it and stamp a
+            // "researched live" footer on zero data.
+            let toolDataSeen = false
+            const NO_DATA_RE = /^(No results found\.|No results\.|Search failed:|No external search tool)/
             for (let round = 0; round < MAX_ROUNDS; round++) {
                 // Lower temp on tool rounds, high temp is the main cause of malformed tool-call JSON.
                 const toolRoundTemp = Math.min(this.researchTemp, 0.3)
@@ -277,6 +282,9 @@ export class ResearchCore extends ProviderCore {
 
                 // No tool call means this is the final synthesized answer.
                 if (!msg.tool_calls?.length) {
+                    // Tools ran but every round came back failed/empty: this
+                    // "answer" is knowledge + an apology, not research.
+                    if (!toolDataSeen && convo.some((m) => m.role === 'tool')) return null
                     return msg.content ?? null
                 }
 
@@ -314,6 +322,7 @@ export class ResearchCore extends ProviderCore {
                                     maxResults: 5,
                                     searchDepth: 'basic',
                                     includeAnswer: true,
+                                    timeout: 8,
                                 })
                                 const snippets = (tr.results ?? [])
                                     .map((r, i) => {
@@ -347,10 +356,14 @@ export class ResearchCore extends ProviderCore {
                 )
 
                 // Feed results back; the loop decides whether to search again or synthesize.
+                if (toolResults.some((tr) => tr.content && !NO_DATA_RE.test(tr.content))) toolDataSeen = true
                 convo.push(...toolResults)
             }
 
             // Round cap reached without a plain-text answer, force one final synthesis pass.
+            // Unless every search round failed — then there is nothing to
+            // synthesize and the extra call is pure spend.
+            if (!toolDataSeen) return null
             const fin = await client.chat.completions.create({
                 model,
                 messages: [

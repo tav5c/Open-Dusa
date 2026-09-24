@@ -328,12 +328,14 @@ export class AgentCommandCore extends VisionCore {
             const who = /^\d{15,20}$/.test(target ?? '') ? `<@${target}>` : target || 'that action'
             const hk = `${message.author.id}-${message.channel.id}`
             this.messageHistory ??= new Map()
-            const hist = this.messageHistory.get(hk) ?? []
-            hist.push({
+            // Funnel through _histPush like every other write: this direct
+            // LRU push was the last path around the memory-off guard, so
+            // opted-out users still got RAM rows (which resurfaced the moment
+            // they turned memory back on).
+            this._histPush(hk, this.userMemory?.[message.author.id] === false, {
                 role: 'assistant',
                 content: `(${cmdName} ${who} was ${outcome} — nothing was executed.)`,
             })
-            this.messageHistory.set(hk, hist)
         } catch {}
     }
     // Collector wiring for an already-posted confirm UI message. Called by

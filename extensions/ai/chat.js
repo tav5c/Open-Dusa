@@ -24,6 +24,7 @@ import { join } from 'path'
 import { performance } from 'perf_hooks'
 import { loadPerformance } from '../performance.js'
 import {
+    ALWAYS_LIVE,
     CAPABILITIES_NOTE,
     DESTRUCTIVE_CMDS,
     NEVER_RESEARCH_PREFIXES,
@@ -622,6 +623,12 @@ export class AIChatManager extends OutputCore {
             message._medusaReplyCtx = null
             return null
         }
+        // Memory-off covers quoted users too: never pull an opted-out
+        // author's message into context, whoever is asking.
+        if (this.userMemory?.[ref.author.id] === false) {
+            message._medusaReplyCtx = null
+            return null
+        }
 
         const authorName = ref.member?.displayName ?? ref.author.username
         const isBot = ref.author.id === this.client.user.id
@@ -927,11 +934,20 @@ TIME: ${new Date().toISOString().slice(0, 16)} UTC${personaOwned ? '' : '\nVOICE
         // ignorance. Stateless has no memory, but a saved timezone is a
         // setting, not a recollection.
         let finalPrompt = prompt
-        if (
-            userId &&
-            /\bwhat(\'s| is)( the)? time\b/i.test(String(prompt ?? '')) &&
-            /\b(me|my|mine|for me)\b/i.test(String(prompt ?? ''))
-        ) {
+        const pStr = String(prompt ?? '')
+        // Widened: the old pattern only caught "what('s| is)( the)? time" AND a
+        // me/my word — so the two most natural DM phrasings ("what time is it
+        // for me?", "what's my time") missed the fast path and the model was
+        // free to confabulate cities again. A bare "what time is it" in a DM
+        // resolves to the asker's saved zone (parity with the chat fast path)
+        // unless the ask names a place ("...in Berlin"), which stays with the model.
+        const timeAsk =
+            /\b(what('?s| is)( the)? time|what time is it|current time|what'?s my time|my time|time (check|now|pls|please))\b/i.test(
+                pStr,
+            )
+        const selfRef = /\b(me|my|mine)\b/i.test(pStr)
+        const placeRef = /\bin\s+[A-Z][\w']*/i.test(pStr)
+        if (userId && timeAsk && (selfRef || !placeRef)) {
             try {
                 const line = getLocalTimeLine(getSavedTimezone(userId))
                 if (line) finalPrompt += `\n\n[TIME DATA, state as fact: it is ${line} for the asker.]`
@@ -967,8 +983,14 @@ TIME: ${new Date().toISOString().slice(0, 16)} UTC${personaOwned ? '' : '\nVOICE
                 guildId: guildId ?? 'dm',
                 priority: isOwner || !guildId,
             })
-            if (raw) {
-                const { text, sources } = this._parseSources(raw)
+            let parsed = raw ? this._parseSources(raw) : null
+            // A truthy `raw` can still be ZERO data: the tool loop's honest
+            // "found nothing" apology, or a SOURCES-only shell. Synthesizing
+            // on that narrates the empty research to the user, so treat it
+            // as no data: fall through to the direct answer, no footer.
+            if (parsed && !parsed.text.trim() && !parsed.sources.length) parsed = null
+            if (parsed) {
+                const { text, sources } = parsed
                 const researchPrompt =
                     `Research data for the question below. Today is ${new Date().toISOString().slice(0, 10)} — weigh the newest sources heaviest; if sources conflict or look stale, say so and give as-of dates instead of picking one silently.
 ` +
@@ -981,7 +1003,9 @@ ${'-'.repeat(32)}
 
 Answer concisely using the research. Ground every claim in the question
 or the data above: never say the user mentioned, provided, or fed you
-places, names, or dates that appear only in the research results.`
+places, names, or dates that appear only in the research results. If the
+data above is thin or unusable, answer from your own knowledge instead —
+and never narrate the research itself or its quality either way.`
                 // Research answers must pass the same hard-strip as direct ones -
                 // RUN_CMD/mass-ping stripping is not optional on any path.
                 const final = this._sanitizeStateless(await runDirect(researchPrompt, systemPrompt))
@@ -1065,14 +1089,21 @@ places, names, or dates that appear only in the research results.`
             // otherwise reduce cache hits in active channels to near-zero.
             let cacheKey = null
             if (userId && prompt.length < 200) {
-                const cacheSys = (systemPrompt ?? '')
-                    .replace(/\[CURRENT VIBE\][^\n]*\n?/g, '')
-                    .replace(/\[ROOM CLIMATE\][^\n]*\n?/g, '')
+                // Also strip the per-message volatile lines (second-resolution
+                // TIME, ping/uptime/memory STATS): they churn the key every
+                // turn, so on the trigger path (fullSys embeds the whole live
+                // context) this cache NEVER hit and repeated short asks always
+                // paid full LLM latency.
+                const volatileStrip = (s) =>
+                    s
+                        .replace(/\[CURRENT VIBE\][^\n]*\n?/g, '')
+                        .replace(/\[ROOM CLIMATE\][^\n]*\n?/g, '')
+                        .replace(/^TIME:.*$/m, '')
+                        .replace(/^YOUR SYSTEM STATS:.*$/m, '')
+                const cacheSys = volatileStrip(systemPrompt ?? '')
                 // extraSys carries mood outside systemPrompt on some paths — same
                 // stripping, or different moods would collide on one cached answer.
-                const cacheExtra = (extraSys ?? '')
-                    .replace(/\[CURRENT VIBE\][^\n]*\n?/g, '')
-                    .replace(/\[ROOM CLIMATE\][^\n]*\n?/g, '')
+                const cacheExtra = volatileStrip(extraSys ?? '')
                 cacheKey = crypto
                     .createHash('md5')
                     .update(`${userId}:${prompt}:${cacheSys}:${cacheExtra}`)
@@ -1379,8 +1410,14 @@ places, names, or dates that appear only in the research results.`
         let researched = false
         let hadSources = false
         let verifyCtx = null
-        let fallbackStreamed = false
-        if (!rawResearch) {
+        // Same no-data rule as the stateless path: a truthy rawResearch can be
+        // the tool loop's "found nothing" apology or a SOURCES-only shell.
+        // Treating that as research launders a failed search into a 🔍 footer,
+        // an empty-data synthesis prompt, and a guaranteed second-thought pass
+        // (researched && !hadSources) that burns another round on nothing.
+        const parsedResearch = rawResearch ? this._parseSources(rawResearch) : null
+        const researchEmpty = parsedResearch && !parsedResearch.text.trim() && !parsedResearch.sources.length
+        if (!rawResearch || researchEmpty) {
             // Silence the "shame" footer, if brain fallback works, say nothing about search failure
             responsePayload = await this.generateResponse({
                 prompt,
@@ -1392,11 +1429,11 @@ places, names, or dates that appear only in the research results.`
                 systemPrompt,
             })
             // This path passes `message` to generateResponse, so it may have
-            // streamed live; report the artifact, not the intent, so the
-            // caller doesn't post a duplicate — or drop a fallback.
-            fallbackStreamed = !!responsePayload && !!message?._medusaStreamMsg
+            // streamed live; the return below reports the artifact, not the
+            // intent, so the caller doesn't post a duplicate — or drop a
+            // fallback. Same artifact covers the streamed rewrite.
         } else {
-            const { text: researchData, sources } = this._parseSources(rawResearch)
+            const { text: researchData, sources } = parsedResearch
             const trimmed = researchData.slice(0, 4096)
             researched = true
             hadSources = sources.length > 0
@@ -1416,6 +1453,13 @@ places, names, or dates that appear only in the research results.`
                 prompt: kPrompt,
                 history,
                 userId,
+                // Stream the persona rewrite: it is the longest serial block of
+                // a research reply (10-25s of bare typing on the live primary)
+                // and there is no reason it can't land progressively in the
+                // stub like every other chat turn. MAY_EMIT verbs inside the
+                // research data still suppress streaming for that turn, and
+                // the caller reads the artifact, never the intent.
+                message,
                 systemPrompt: kSys,
                 guildId: message?.guild?.id ?? null,
             })
@@ -1439,7 +1483,13 @@ places, names, or dates that appear only in the research results.`
             } catch {}
         }
 
-        return { response: responsePayload, streamed: fallbackStreamed, researched, hadSources, verifyCtx }
+        return {
+            response: responsePayload,
+            streamed: !!responsePayload && !!message?._medusaStreamMsg,
+            researched,
+            hadSources,
+            verifyCtx,
+        }
     }
 
     // Second thoughts: after answering, reconsider when there's reason to doubt —
@@ -1472,9 +1522,22 @@ places, names, or dates that appear only in the research results.`
         try {
             let ctx = verifyCtx
             if (!ctx) {
-                // No ground truth at hand: only spend a small research round when the
-                // question itself looks research-worthy, never for casual-chat hedges.
-                if (!this._heuristicNeedsResearch(bareQuestion)) return
+                // No ground truth at hand: only spend a research round on asks
+                // carrying a static live signal (ALWAYS_LIVE term or a
+                // version/year token). The old _heuristicNeedsResearch gate
+                // passed on ANY '?', so every hedged answer to any question
+                // ("is 6*7 still 42?") burned a Tavily credit + synthesis +
+                // verdict 6-14s later, usually to print nothing.
+                const bt = String(bareQuestion ?? '').toLowerCase()
+                const liveAsk =
+                    /\b(20[2-9]\d|v?\d+\.\d+[\d.]*)\b/.test(bt) ||
+                    [...ALWAYS_LIVE].some((s) => {
+                        const n = s.trim()
+                        return (
+                            n && new RegExp(`\\b${n.replace(/[.*+?^${}()|[\]\\]/g, '\\$&')}\\b`, 'i').test(bt)
+                        )
+                    })
+                if (!liveAsk) return
                 const raw = await this._callResearch(bareQuestion, {
                     guildId: message?.guild?.id,
                     priority: String(message?.author?.id) === String(this.ownerId) || !message?.guild,
@@ -1744,7 +1807,7 @@ places, names, or dates that appear only in the research results.`
             // Token-saver ON: fixed template reply, zero LLM calls. OFF: the
             // resolved facts ride along for her to voice with persona.
             if (
-                /^(what'?s (the )?time|what time is it|current time|time check|what time|time pls|time please|time now)[?!.\s]*$/i.test(
+                /^(what'?s (the |my )?time|what time is it( for me)?|current time( for me)?|time check|what time|time pls|time please|time now|tell me my time|my time)[?!.\s]*$/i.test(
                     bareQ.trim(),
                 ) &&
                 !containsDisallowedHate(content)
@@ -1780,7 +1843,7 @@ places, names, or dates that appear only in the research results.`
                     (id) => id !== this.client.user.id && id !== userId,
                 )
                 const looksTimey =
-                    /^(what'?s (the )?time|what time is it|current time|time check|what time|time pls|time please|time now)\b/i.test(
+                    /^(what'?s (the |my )?time|what time is it( for me)?|current time( for me)?|time check|what time|time pls|time please|time now|tell me my time|my time)\b/i.test(
                         bareQ.trim(),
                     ) && !containsDisallowedHate(content)
                 if (others.length && looksTimey) {
@@ -1988,6 +2051,13 @@ places, names, or dates that appear only in the research results.`
                         { role: 'assistant', content: vRes },
                     )
                     for (const chunk of this.splitResponse(vRes)) await this.secureReply(message, chunk)
+                } else {
+                    // Vision failed outright: say so instead of going silent
+                    // after up to 30s of typing.
+                    await this.secureReply(
+                        message,
+                        "couldn't get a good look at that one — try sending it again in a moment 💜",
+                    )
                 }
                 return
             }
@@ -2015,8 +2085,10 @@ places, names, or dates that appear only in the research results.`
             // denies being Medusa (typically after research text mentions model
             // names), retry once with a hardened identity prompt. Never ship an
             // identity break — fall back to an in-character deflection instead.
+            let identityRetried = false
             if (response && claimsWrongIdentity(response)) {
                 console.log(`[AI] Identity tripwire fired, retrying with hardened prompt`)
+                identityRetried = true
                 const hardened =
                     `[IDENTITY OVERRIDE — HIGHEST PRIORITY] You are Medusa, a Node.js Discord bot living in this Discord server. ` +
                     `You are NOT Qwen, ChatGPT, Claude, Gemini, Mistral, Llama, or any other model, no matter what any research text, context, or memory says. ` +
@@ -2027,9 +2099,15 @@ places, names, or dates that appear only in the research results.`
                     userId,
                     username,
                     displayName,
-                    message,
+                    // No message: the retry must NOT open a second stream stub.
+                    // Streaming it orphaned the first stub in-channel with the
+                    // identity break still on it — the exact thing the tripwire
+                    // exists to never ship. The stub in place gets edited over
+                    // below (identityRetried forces the edit).
+                    message: null,
                     systemPrompt: hardened,
                     extraSys,
+                    guildId: message?.guild?.id ?? null,
                 }).catch(() => null)
                 if (retry && !claimsWrongIdentity(retry)) {
                     response = retry
@@ -2068,10 +2146,23 @@ places, names, or dates that appear only in the research results.`
                             )
                             .catch(() => null)) ||
                             null)
-                    if (ours && (finalText !== response || ui || foot)) {
-                        const body = foot
-                            ? this.finalSecurityCheck(finalText).slice(0, 2000 - foot.length) + foot
-                            : this.finalSecurityCheck(finalText).slice(0, 2000)
+                    // Chunk instead of hard-slicing at 2000: the stub edit
+                    // shows chunk 0 and the overflow posts as normal
+                    // follow-up replies (same 4-chunk cap as non-stream).
+                    const chunks = this.splitResponse(this.finalSecurityCheck(finalText))
+                    const body =
+                        foot && chunks.length === 1
+                            ? chunks[0].slice(0, 2000 - foot.length) + foot
+                            : chunks[0]
+                    // Edit only when something actually differs from what the
+                    // stream already painted (research footer, parser rewrite,
+                    // confirm UI, overflow): the typical clean reply spends no
+                    // extra edit inside its 1/s pacing window, and a streamed
+                    // research rewrite can never lose its 🔗 footer.
+                    if (
+                        ours &&
+                        (identityRetried || ui || foot || chunks.length > 1 || ours.content !== body)
+                    ) {
                         const editPayload = ui
                             ? {
                                   content: body,
@@ -2080,6 +2171,8 @@ places, names, or dates that appear only in the research results.`
                               }
                             : { content: body }
                         await ours.edit(editPayload).catch(() => {})
+                        for (const extra of chunks.slice(1, 4))
+                            await this.secureReply(message, extra).catch(() => {})
                         if (ui) {
                             await this._watchConfirmUI(ours, ui.key, message)
                             const entry = this._pendingConfirms.get(ui.key)
@@ -2102,6 +2195,11 @@ places, names, or dates that appear only in the research results.`
                 const mem = this.getMem(message.guild)
                 if (!execResult.confirmPending)
                     if (!memOff) mem.addConversation(userId, message.channel.id, finalContent, finalText)
+                // Mirror the non-stream branch: DB line plus both RAM roles,
+                // so the verbatim recent exchange survives to the next turn.
+                this._histPush(key, memOff, { role: 'user', content: finalContent })
+                if (!execResult.confirmPending)
+                    this._histPush(key, memOff, { role: 'assistant', content: finalText })
                 // Streaming path used to swallow captured embeds (warn/av confirmations
                 // never posted). Flush them as a follow-up like the normal path does.
                 if (execResult.embeds?.length) {
@@ -2146,7 +2244,14 @@ places, names, or dates that appear only in the research results.`
                     content: response || '*(silently executed system tool)*',
                 })
             }
-            const media = await this._pickExpressiveMedia(response, message)
+            // Cap the media chain: Klipy -> Giphy -> nekos.best is sequential
+            // with 3s timeouts each (worst 9s), and this await sits BEFORE the
+            // text chunks are sent. The 4s race keeps dead GIF APIs from
+            // holding the reply; the loser promise is inert (plain fetches).
+            const media = await Promise.race([
+                this._pickExpressiveMedia(response, message),
+                new Promise((r) => setTimeout(() => r(null), 4000).unref()),
+            ])
             if (media?.explicit) {
                 // A real GIF is attached below: drop the model's no-generation
                 // refusal instead of shipping "I can't" next to a GIF.

@@ -459,7 +459,7 @@ export async function registerAI(client, db, config) {
                 const fetched = await interaction.channel.messages.fetch({ limit: 100, after: startMsg.id })
                 const sorted = [...fetched.values()].sort((a, b) => a.createdTimestamp - b.createdTimestamp)
                 for (const m of sorted) {
-                    if (!m.author.bot && m.content.trim()) {
+                    if (!m.author.bot && m.content.trim() && ai.userMemory?.[m.author.id] !== false) {
                         messages.push({
                             author: m.member?.displayName ?? m.author.username,
                             content: m.content,
@@ -468,7 +468,11 @@ export async function registerAI(client, db, config) {
                         if (messages.length >= 100) break
                     }
                 }
-                if (!startMsg.author.bot && startMsg.content.trim())
+                if (
+                    !startMsg.author.bot &&
+                    startMsg.content.trim() &&
+                    ai.userMemory?.[startMsg.author.id] !== false
+                )
                     messages.unshift({
                         author: startMsg.member?.displayName ?? startMsg.author.username,
                         content: startMsg.content,
@@ -484,7 +488,7 @@ export async function registerAI(client, db, config) {
                     if (!fetched.size) break
                     for (const [, m] of fetched) {
                         cursor = m.id
-                        if (!m.author.bot && m.content.trim()) {
+                        if (!m.author.bot && m.content.trim() && ai.userMemory?.[m.author.id] !== false) {
                             messages.push({
                                 author: m.member?.displayName ?? m.author.username,
                                 content: m.content,
@@ -643,7 +647,7 @@ export async function registerAI(client, db, config) {
             const embed = new EmbedBuilder()
                 .setTitle('⚠️ Are you sure?')
                 .setDescription(
-                    'This will **permanently delete** everything Medusa remembers about you:\n• Conversation history\n• Interests & topics\n• Personality profile\n• Aliases',
+                    'This will **permanently delete** everything Medusa remembers about you:\n• Conversation history\n• Interests & topics\n• Personality profile\n• Aliases\n• Your custom persona (`/prompt` setting)',
                 )
                 .setColor(0xef9f27)
             const response = await interaction.reply({
@@ -762,6 +766,7 @@ export async function registerAI(client, db, config) {
                 if (ai.customPrompts[uid2]) {
                     delete ai.customPrompts[uid2]
                     ai._scheduleUsersSave()
+                    ai._invalidateUserCache?.(uid2)
                     return interaction.reply({
                         content: '✅ Prompt reset to default.',
                         flags: MessageFlags.Ephemeral,
@@ -787,6 +792,7 @@ export async function registerAI(client, db, config) {
             }
             ai.customPrompts[uid2] = system.slice(0, 2000)
             ai._scheduleUsersSave()
+            ai._invalidateUserCache?.(uid2)
             return interaction.reply({
                 content: '✅ Custom persona set.',
                 flags: MessageFlags.Ephemeral,
@@ -810,6 +816,8 @@ export async function registerAI(client, db, config) {
                 if (ai.serverPrompts[gid]) {
                     delete ai.serverPrompts[gid]
                     ai._scheduleUsersSave()
+                    for (const k of ai.userCache?.keys?.() ?? [])
+                        if (k.endsWith(`_${gid}`)) ai.userCache.delete(k)
                     return interaction.reply({
                         content: '✅ Server persona reset to default.',
                         flags: MessageFlags.Ephemeral,
@@ -835,6 +843,7 @@ export async function registerAI(client, db, config) {
             }
             ai.serverPrompts[gid] = system.slice(0, 2000)
             ai._scheduleUsersSave()
+            for (const k of ai.userCache?.keys?.() ?? []) if (k.endsWith(`_${gid}`)) ai.userCache.delete(k)
             return interaction.reply({
                 content: `✅ Server persona set for **${interaction.guild.name}**.`,
                 flags: MessageFlags.Ephemeral,
@@ -1041,6 +1050,7 @@ export async function registerAI(client, db, config) {
         if (ai.customPrompts[uid]) {
             delete ai.customPrompts[uid]
             ai._scheduleUsersSave()
+            ai._invalidateUserCache?.(uid)
             await msg.reply(`✅ Prompt reset to default for ${msg.author.displayName}`)
         } else await msg.reply("You don't have a custom prompt set.")
     })
