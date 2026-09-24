@@ -274,7 +274,7 @@ export class ProviderCore {
         const ordered = [...this._providers].sort((a, b) => {
             const pref = (b.baseUrl === preferredBase ? 1 : 0) - (a.baseUrl === preferredBase ? 1 : 0)
             if (pref !== 0) return pref
-            return (b.model === model ? 1 : 0) - (a.model === model ? 1 : 0)
+            return (b.priority ?? 99) - (a.priority ?? 99)
         })
         let attempts = 0
         // First-miss forensics: "Routed via x in Ns (2 attempts)" never says what
@@ -301,14 +301,7 @@ export class ProviderCore {
             }
             attempts++
             const payload = {
-                ...this._buildPayload(
-                    model ?? p.model ?? this.aiModel,
-                    messages,
-                    maxTokens,
-                    temp,
-                    topP,
-                    p.baseUrl,
-                ),
+                ...this._buildPayload(model ?? this.aiModel, messages, maxTokens, temp, topP, p.baseUrl),
                 stream: false,
             }
             try {

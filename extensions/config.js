@@ -42,11 +42,13 @@ const asPrompt = (v) => (Array.isArray(v) ? v.join('\n') : typeof v === 'string'
 const realKeys = (v) => asArray(v).filter((k) => typeof k === 'string' && k.trim().length > 0)
 
 function normalizeProviders(raw) {
+    // NOTE: a per-provider `model` key is accepted but ignored (agents pin
+    // their own models; it only ever served as a sort hint). Kept silent so
+    // old configs don't sprout warnings.
     const entries = asArray(raw.providers).map((p) => ({
         name: p.name ?? 'provider',
         baseUrl: p.baseUrl ?? p.base_url ?? '',
         keys: [...new Set(realKeys(p.keys ?? p.key))], // dupes collapse to one slot, they share the same org quota anyway
-        model: p.model,
         priority: p.priority ?? 99,
     }))
     // Legacy flat pair joins the pool so old configs keep routing identically
@@ -63,7 +65,6 @@ function normalizeProviders(raw) {
         else {
             prev.keys.push(...p.keys.filter((k) => !prev.keys.includes(k)))
             prev.priority = Math.min(prev.priority, p.priority)
-            prev.model ??= p.model
         }
     }
     return [...merged.values()].sort((a, b) => a.priority - b.priority)
