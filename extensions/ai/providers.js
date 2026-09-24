@@ -10,21 +10,33 @@ import { DEAD_KEYS_FILE } from './constants.js'
 export function createTavilyPool(tavily, keys) {
     let idx = 0
     const clients = keys.map((k) => tavily({ apiKey: k }))
+    if (!clients.length) throw new Error('[AI] Tavily pool needs at least one key')
+    const retryable = (e) =>
+        /429|rate.?limit|quota|too many|insufficient|credit|401|403|unauthorized|invalid.*key/.test(
+            String(e?.message ?? e).toLowerCase(),
+        )
     return {
         size: clients.length,
         search: async (...args) => {
-            const attempt = (i) => clients[i].search(...args)
-            try {
-                return await attempt(idx)
-            } catch (e) {
-                const s = String(e?.message ?? e).toLowerCase()
-                if (clients.length > 1 && /429|rate.?limit|quota|too many|insufficient|credit/.test(s)) {
-                    idx = (idx + 1) % clients.length
-                    console.warn(`[AI] Tavily key rotated (${idx + 1}/${clients.length})`)
-                    return await attempt(idx)
+            let err = null
+            // Walk the whole ring from the current key: a dead first key
+            // (bad/expired key, spent quota) shouldn't burn the spares
+            // sitting behind it, and non-retryable errors pass through.
+            for (let step = 0; step < clients.length; step++) {
+                const i = (idx + step) % clients.length
+                try {
+                    const out = await clients[i].search(...args)
+                    if (step > 0) {
+                        idx = i
+                        console.warn(`[AI] Tavily key rotated (${idx + 1}/${clients.length})`)
+                    }
+                    return out
+                } catch (e) {
+                    err = e
+                    if (!retryable(e)) break
                 }
-                throw e
             }
+            throw err
         },
     }
 }
