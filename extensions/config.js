@@ -107,28 +107,52 @@ function resolveFallbacks(list, ownResolved, providers) {
     const push = (fb) => {
         if (fb && !out.some((x) => x.model === fb.model && x.baseUrl === fb.baseUrl)) out.push(fb)
     }
+    // Group form: { provider: "xkiro", models: [...] } expands in order,
+    // each model resolving against the group provider by default.
+    const items = []
     for (const entry of asArray(list)) {
-        if (typeof entry === 'string') {
+        if (entry && typeof entry === 'object' && !Array.isArray(entry) && Array.isArray(entry.models)) {
+            const p = entry.provider ? providers.find((x) => x.name === entry.provider) : null
+            if (entry.provider && (!p || !p.keys?.length)) {
+                console.warn(
+                    `[Config] fallback group provider '${entry.provider}' not found or keyless, skipping`,
+                )
+                continue
+            }
+            const own = p ? { provider: p.name, baseUrl: p.baseUrl, keys: p.keys } : ownResolved
+            for (const m of entry.models) {
+                if (typeof m === 'string') items.push({ text: m, own })
+                else if (m && typeof m === 'object')
+                    items.push({ obj: m.provider ? m : { ...m, provider: entry.provider }, own })
+            }
+            continue
+        }
+        items.push(
+            typeof entry === 'string' ? { text: entry, own: ownResolved } : { obj: entry, own: ownResolved },
+        )
+    }
+    for (const { text, obj, own } of items) {
+        if (typeof text === 'string') {
             // Comma-separated pairs allowed: "groq/compound, groq/compound-mini"
-            for (const part of entry.split(',')) {
+            for (const part of text.split(',')) {
                 const t = part.trim()
                 if (!t) continue
-                push(parseFallbackString(t, ownResolved, providers))
+                push(parseFallbackString(t, own, providers))
             }
-        } else if (entry && typeof entry === 'object') {
-            const model = typeof entry.model === 'string' ? entry.model.trim() : ''
+        } else if (obj && typeof obj === 'object') {
+            const model = typeof obj.model === 'string' ? obj.model.trim() : ''
             if (!model) continue
-            if (entry.provider) {
-                const p = providers.find((x) => x.name === entry.provider)
+            if (obj.provider) {
+                const p = providers.find((x) => x.name === obj.provider)
                 if (!p || !p.keys?.length) {
                     console.warn(
-                        `[Config] fallback provider '${entry.provider}' not found or keyless, skipping`,
+                        `[Config] fallback provider '${obj.provider}' not found or keyless, skipping`,
                     )
                     continue
                 }
                 push({ provider: p.name, baseUrl: p.baseUrl, keys: p.keys, model })
-            } else if (ownResolved?.baseUrl && ownResolved?.keys?.length) {
-                push({ provider: null, baseUrl: ownResolved.baseUrl, keys: ownResolved.keys, model })
+            } else if (own?.baseUrl && own?.keys?.length) {
+                push({ provider: null, baseUrl: own.baseUrl, keys: own.keys, model })
             }
         }
     }
@@ -323,6 +347,12 @@ export function normalizeConfig(raw) {
             .map((t) => String(t).trim().toLowerCase())
             .filter(Boolean),
         allowDMs: raw.allowDMs === true,
+        // Memory master switch: false means no stored reads or writes for
+        // anyone (conversations, interests, summaries, timezones, room
+        // buffer). Prompts, modes, streams, and /forgetme keep working —
+        // those are settings and deletion, not memories. Per-user /memory
+        // still applies on top when this is true. Defaults to true.
+        memory: raw.memory !== false,
         memoryDepth: raw.memoryDepth,
         funMsgInterval: raw.funMsgInterval ?? raw.FunMsgInterval ?? 5400,
         stopSequences: asArray(raw.stopSequences ?? raw.stop_sequences),
