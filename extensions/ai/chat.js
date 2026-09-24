@@ -74,6 +74,7 @@ export function mergeUsersData(prevU, prevS, maps, pruneAbsent = false) {
         ...Object.keys(maps.customPrompts ?? {}),
         ...Object.keys(maps.userStreams ?? {}),
         ...Object.keys(maps.userMemory ?? {}),
+        ...Object.keys(maps.userBilling ?? {}),
     ])
     for (const uid of ids) {
         const entry = { ...(prevU?.[uid] ?? {}) }
@@ -85,6 +86,8 @@ export function mergeUsersData(prevU, prevS, maps, pruneAbsent = false) {
         else if (pruneAbsent) delete entry.stream
         if (maps.userMemory?.[uid] !== undefined) entry.memory = maps.userMemory[uid]
         else if (pruneAbsent) delete entry.memory
+        if (maps.userBilling?.[uid] !== undefined) entry.billing = maps.userBilling[uid]
+        else if (pruneAbsent) delete entry.billing
         const g = entry.ghost
         if (!g || !Object.keys(g).length) delete entry.ghost
         if (Object.keys(entry).length) users[uid] = entry
@@ -288,11 +291,13 @@ export class AIChatManager extends OutputCore {
         this.userModes = {}
         this.userStreams = {}
         this.userMemory = {}
+        this.userBilling = {}
         for (const [uid, u] of Object.entries(this.userData.users)) {
             if (u?.mode !== undefined) this.userModes[uid] = u.mode
             if (typeof u?.prompt === 'string') this.customPrompts[uid] = u.prompt
             if (u?.stream !== undefined) this.userStreams[uid] = u.stream
             if (u?.memory !== undefined) this.userMemory[uid] = u.memory
+            if (u?.billing !== undefined) this.userBilling[uid] = u.billing
         }
         for (const [gid, s] of Object.entries(this.userData.servers)) {
             if (typeof s?.persona === 'string') this.serverPrompts[gid] = s.persona
@@ -1255,10 +1260,11 @@ and never narrate the research itself or its quality either way.`
             if (!response) return null
             // Usage receipt for the billing footer (handleAIResponse reads and
             // clears it). Keyed by message id (not the object — no strong refs
-            // pinning discord.js Messages) and only recorded when the footer
-            // is actually on; otherwise this Map would anchor 500 Messages
-            // nobody reads.
-            if (message && PERF.ai.billingStats === true) {
+            // pinning discord.js Messages) and only recorded when someone will
+            // read it (global flag or this user's own toggle); otherwise this
+            // Map would anchor 500 Messages nobody reads.
+            // Per-user toggle lives in medusa-users.json (absent = off).
+            if (message && (PERF.ai.billingStats === true || this.userBilling?.[userId] === true)) {
                 this._usageByMsg ??= new Map()
                 if (this._usageByMsg.size > 500) {
                     const firstKey = this._usageByMsg.keys().next().value
@@ -1666,11 +1672,12 @@ and never narrate the research itself or its quality either way.`
     }
     // Billing footer: "-# 2.4k/46 · 2.5k T · 6.7s · 364 t/s" (in/out,
     // total, wall time, throughput). Estimates (chars/4), read from the
-    // usage receipt generateResponse left on this message. Off unless
-    // PERF.ai.billingStats is true. Appended to the sent chunk/edit only —
-    // stored history and memory never see it.
+    // usage receipt generateResponse left on this message. Shows when the
+    // host has billingStats on, or when this user flipped /billing on.
+    // Appended to the sent chunk/edit only — stored history and memory
+    // never see it.
     _billingFooter(message) {
-        if (PERF.ai.billingStats !== true || !message) return ''
+        if (PERF.ai.billingStats !== true && this.userBilling?.[message?.author?.id] !== true) return ''
         const u = this._usageByMsg?.get(message.id)
         this._usageByMsg?.delete(message.id)
         if (!u) return ''

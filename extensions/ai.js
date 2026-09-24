@@ -803,7 +803,7 @@ export async function registerAI(client, db, config) {
                 })
             }
             if (['normal', '0'].includes(input)) {
-                ai.userModes[uid2] = 0
+                delete ai.userModes[uid2]
                 ai._scheduleUsersSave()
                 return interaction.reply({
                     content: '✅ Switched to **normal mode** - Full personality and casual responses',
@@ -827,13 +827,37 @@ export async function registerAI(client, db, config) {
                     flags: MessageFlags.Ephemeral,
                 })
             }
-            ai.userStreams[uid2] = input === 'on'
+            // Sparse default: absent means on (host gate decides), so
+            // reverting just deletes the key instead of writing `true`.
+            if (input === 'on') delete ai.userStreams[uid2]
+            else ai.userStreams[uid2] = false
             ai._scheduleUsersSave()
             return interaction.reply({
                 content:
                     input === 'on'
                         ? '✅ Streaming **on** — normal typing indicator + streaming text.'
                         : '✅ Streaming **off** — whole replies, no typing indicator (same provider speed, just silent until it lands).',
+                flags: MessageFlags.Ephemeral,
+            })
+        }
+
+        // /billing — per-user usage footer. Sparse like everything else:
+        // on writes `true`, off deletes the key (absent = off).
+        if (commandName === 'billing') {
+            const input = interaction.options.getString('mode')
+            const uid2 = interaction.user.id
+            if (input === 'on') {
+                ai.userBilling[uid2] = true
+                ai._scheduleUsersSave()
+                return interaction.reply({
+                    content: '✅ Billing footer **on** — replies show usage (`in/out · total · time · t/s`).',
+                    flags: MessageFlags.Ephemeral,
+                })
+            }
+            delete ai.userBilling[uid2]
+            ai._scheduleUsersSave()
+            return interaction.reply({
+                content: '✅ Billing footer **off** — clean replies.',
                 flags: MessageFlags.Ephemeral,
             })
         }
@@ -1202,12 +1226,32 @@ export async function registerAI(client, db, config) {
             )
         }
         if (!['on', 'off'].includes(input)) return msg.reply('❌ Use `on` or `off`.')
-        ai.userStreams[uid] = input === 'on'
+        if (input === 'on') delete ai.userStreams[uid]
+        else ai.userStreams[uid] = false
         ai._scheduleUsersSave()
         return msg.reply(
             input === 'on'
                 ? '✅ Streaming **on** — normal typing indicator + streaming text.'
                 : '✅ Streaming **off** — whole replies, no typing indicator (same provider speed, just silent until it lands).',
+        )
+    })
+    client.commands.set('billing', async (msg, args) => {
+        const input = args[0]?.toLowerCase()
+        const uid = String(msg.author.id)
+        if (!input) {
+            const cur = ai.userBilling[uid] === true
+            return msg.reply(
+                `Your billing footer is currently **${cur ? 'on' : 'off'}**. Use \`${config.prefix}billing on\` or \`${config.prefix}billing off\`.`,
+            )
+        }
+        if (!['on', 'off'].includes(input)) return msg.reply('❌ Use `on` or `off`.')
+        if (input === 'on') ai.userBilling[uid] = true
+        else delete ai.userBilling[uid]
+        ai._scheduleUsersSave()
+        return msg.reply(
+            input === 'on'
+                ? '✅ Billing footer **on** — replies show usage (`in/out · total · time · t/s`).'
+                : '✅ Billing footer **off** — clean replies.',
         )
     })
     // Memory lookup by name: what the server roster says + what she remembers.
@@ -1364,6 +1408,17 @@ export function buildAISlashCommands() {
                     .setName('mode')
                     .setDescription('on = typing + streaming, off = instant, no typing indicator')
                     .addChoices({ name: 'on', value: 'on' }, { name: 'off', value: 'off' }),
+            ),
+        new SlashCommandBuilder()
+            .setName('billing')
+            .setContexts(0)
+            .setDescription('Show token usage footer on replies (just for you)')
+            .addStringOption((o) =>
+                o
+                    .setName('mode')
+                    .setDescription('on = usage footer, off = clean replies')
+                    .setRequired(true)
+                    .addChoices({ name: 'On', value: 'on' }, { name: 'Off', value: 'off' }),
             ),
         new SlashCommandBuilder()
             .setName('recall')

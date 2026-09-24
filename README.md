@@ -339,6 +339,7 @@ npm run start:max      # 6 GB heap, 24 UV threads - 8 GB+ hosts
 | `/prompt`                      | Set, view, or reset your custom persona (`system` text, `reset:true` wipes) | Everyone                |
 | `/server-prompt`                | Set, view, or reset this server's persona (same args) | Manage Server           |
 | `/streaming`                   | Pick instant replies (`off`, no typing indicator) or fancy streaming (`on`) — just for you | Everyone                |
+| `/billing`                     | Show token usage footer on replies (`mode`: On/Off) — just for you | Everyone                |
 | `/memory`                      | View what she remembers — or set `mode: On/Off` to opt out of storing + fetching (ghost-mode by default). Disabled entirely when `memory: false` in config | Everyone                |
 | `/ask`                         | Quick precise answer, light memory, instant (server only). `research`: Auto/On/Off, `privacy`: On/Off | Everyone                |
 | `/avatar`, `/banner`, `/mbanner` | Server avatar, server banner, main profile banner (`av`/`bn`/`mbn` still work) | Everyone                |
@@ -365,6 +366,7 @@ med,serverp <prompt> - Set a server-wide persona (needs Manage Server)
 med,serverpr - Reset the server persona
 med,mode focused/normal/fast
 med,stream on/off - Instant replies (off, no typing) or fancy streaming (on), just for you
+med,billing on/off - Token usage footer on replies, just for you
 med,afk [reason] - Go AFK with a timestamped reason
 med,unafk
 med,ping / med,stats / med,menu
@@ -577,7 +579,7 @@ HEALTH_PORT=3000 npm start
 
 Console verbosity is gated by `LOG_LEVEL` (`error`|`warn`|`info`|`debug`, default `info`; errors always print). Production hosts usually want `LOG_LEVEL=warn npm start`. A debug channel exists for noisy diagnostics (`console.debug`, only visible at `LOG_LEVEL=debug`).
 
-**Debug mode** (`"debug": true` in `config.json`, or owner-only `/debug` which hot-swaps it with no reboot): the bot goes silent for everyone but the owner (reads like a normal AI pause elsewhere), passive buffering stops on all servers, all memory reads/writes route to an ephemeral scratch DB wiped on boot and on enable, reminders refuse to create, and logging goes verbose. `configs/runtime.json` is the small overlay the bot itself writes at runtime (isolated guilds, model/temp overrides) so those choices survive restarts without hand-editing `config.json` — leave it alone, it's managed. Per-user prefs (mode, persona, streaming, ghosts) and server personas live in one sparse file, `data/ai/medusa-users.json`.
+**Debug mode** (`"debug": true` in `config.json`, or owner-only `/debug` which hot-swaps it with no reboot): the bot goes silent for everyone but the owner (reads like a normal AI pause elsewhere), passive buffering stops on all servers, all memory reads/writes route to an ephemeral scratch DB wiped on boot and on enable, reminders refuse to create, and logging goes verbose. `configs/runtime.json` is the small overlay the bot itself writes at runtime (isolated guilds, model/temp overrides) so those choices survive restarts without hand-editing `config.json` — leave it alone, it's managed. Per-user prefs (mode, persona, streaming, billing, memory, ghosts) and server personas live in one sparse file, `data/ai/medusa-users.json` — only deviations from defaults are stored, reverting a setting deletes its key.
 
 ## Database Maintenance
 
