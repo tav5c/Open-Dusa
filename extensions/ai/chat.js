@@ -277,6 +277,10 @@ export class AIChatManager extends OutputCore {
         console.log(
             `[AI] User prefs loaded: ${Object.keys(this.userData.users).length} user(s), ${Object.keys(this.userData.servers).length} server(s)`,
         )
+        // Host-level memory switch (config memory:false): no stored reads or
+        // writes for anyone. isMemOff() folds it together with the per-user
+        // /memory toggle so every gate below stays a single check.
+        this._memoryOff = config.memory === false
         // Working maps hydrated from the file (kept as the live structures;
         // _saveUsersNow serializes everything back on change).
         this.customPrompts = {}
@@ -561,7 +565,7 @@ export class AIChatManager extends OutputCore {
     // Memory summarization: fold each user's oldest conversations into one compact note,
     // then delete the summarized rows. Context stays smart while the DB stays small.
     async _runMemorySummarization() {
-        if (this._summarizing || this.paused) return
+        if (this._summarizing || this.paused || this._memoryOff) return
         this._summarizing = true
         try {
             const keep = Math.max((this.maxHistory ?? 25) * 3, 60)
@@ -575,6 +579,7 @@ export class AIChatManager extends OutputCore {
                     continue
                 }
                 for (const { user_id } of candidates) {
+                    if (this.isMemOff(user_id)) continue
                     const rows = mem.oldConversations(user_id, keep)
                     if (rows.length < 15) continue
                     const prev = mem.getSummary(user_id)
@@ -625,7 +630,7 @@ export class AIChatManager extends OutputCore {
         }
         // Memory-off covers quoted users too: never pull an opted-out
         // author's message into context, whoever is asking.
-        if (this.userMemory?.[ref.author.id] === false) {
+        if (this.isMemOff(ref.author.id)) {
             message._medusaReplyCtx = null
             return null
         }
@@ -716,7 +721,7 @@ export class AIChatManager extends OutputCore {
         // minimum TTFT, and memory/room context is the most expensive prefill.
         // Memory-off users take it too: no DB reads, no writes, no trace.
         const fastMode = this.userModes?.[userId] === 2
-        const memOff = this.userMemory?.[userId] === false
+        const memOff = this.isMemOff(userId)
         const msgText = (message?.content ?? '').trim()
         const msgLower = msgText.toLowerCase()
         const msgWords = msgText ? msgText.split(/\s+/).length : 0
@@ -917,13 +922,11 @@ TIME: ${new Date().toISOString().slice(0, 16)} UTC${personaOwned ? '' : '\nVOICE
         if (systemExtra) systemPrompt += `\n\n${systemExtra}`
 
         const routing =
-            skipResearch || !allowResearch
+            skipResearch || !allowResearch || this._searchOff()
                 ? 'direct'
-                : allowResearch && forceSearch
+                : forceSearch
                   ? 'research'
-                  : allowResearch
-                    ? await this.needsResearch(prompt)
-                    : 'direct'
+                  : await this.needsResearch(prompt)
         // Only 'dangerous' (illegal) hard-refuses. 'nsfw'-labelled prompts fall through to
         // the model, which answers non-explicitly per its prompt, the old flat refusal
         // fired on merely edgy questions and read as closed-minded.
@@ -1537,7 +1540,7 @@ and never narrate the research itself or its quality either way.`
                             n && new RegExp(`\\b${n.replace(/[.*+?^${}()|[\]\\]/g, '\\$&')}\\b`, 'i').test(bt)
                         )
                     })
-                if (!liveAsk) return
+                if (!liveAsk || this._searchOff()) return
                 const raw = await this._callResearch(bareQuestion, {
                     guildId: message?.guild?.id,
                     priority: String(message?.author?.id) === String(this.ownerId) || !message?.guild,
@@ -1752,7 +1755,7 @@ and never narrate the research itself or its quality either way.`
             const userId = message.author.id
             // Memory-off: no DB reads (mini context) and no DB writes anywhere
             // below. Ghost-mode by default: also excluded from others' context.
-            const memOff = this.userMemory?.[userId] === false
+            const memOff = this.isMemOff(userId)
             const username = message.author.username
             const displayName = message.member?.displayName ?? username
             let content = customPrompt || message.content
@@ -1912,10 +1915,12 @@ and never narrate the research itself or its quality either way.`
             // Residence auto-learn: "i live in berlin" saves the zone natively
             // (single-zone matches only — ambiguous places get a question, not
             // a guess). Mirrors the existing alias-learn pattern below. Never
-            // in debug mode (prod data stays untouched).
+            // in debug mode (prod data stays untouched), never for opted-out
+            // users (nothing stored means nothing stored).
             {
                 const liveM =
                     !this.debugMode &&
+                    !this.isMemOff(userId) &&
                     bareQ
                         .trim()
                         .match(/^(?:i live in|i'm from|im from|i live at|moved to|based in)\s+(.+?)[.!]*$/i)

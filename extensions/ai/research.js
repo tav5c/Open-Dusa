@@ -548,6 +548,8 @@ export class ResearchCore extends ProviderCore {
     }
 
     async needsResearch(prompt) {
+        // Master switch off: everything answers directly, classifier never runs.
+        if (this._searchOff()) return 'direct'
         // Pre-resolved by a fast-path (time data, explicit context): answering
         // directly, never researching what we already computed.
         if (String(prompt ?? '').includes('[TIME DATA')) return 'direct'

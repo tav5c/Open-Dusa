@@ -17,7 +17,6 @@ import {
     ChannelType,
     EmbedBuilder,
     MessageFlags,
-    PermissionFlagsBits,
     SlashCommandBuilder,
 } from 'discord.js'
 import fs, { existsSync, readFileSync, renameSync, writeFileSync } from 'fs'
@@ -42,6 +41,15 @@ export const manifest = {
 // Data cache, machine-written user data (migrates forward from legacy spots).
 const DATA_FILE = 'data/ai/timezones.json'
 let _cache = null
+
+// Host-level amnesia (config memory:false): the AI pipeline neither
+// reads zones nor auto-learns them. Manual /tz commands keep working
+// (explicit user action, like prompts and /forgetme) — only the
+// model-facing accessors below are gated. Set once at boot.
+let _tzStoreOn = true
+export function setTzStoreEnabled(on) {
+    _tzStoreOn = on !== false
+}
 
 // one-time moves from legacy locations (repo root, then configs/)
 for (const legacy of ['configs/timezones.json', 'timezones.json']) {
@@ -253,12 +261,6 @@ export function lookupLocation(input) {
     return null
 }
 
-function canManageUser(interaction, targetId) {
-    if (interaction.user.id === targetId) return true
-    if (!interaction.guild) return false // DMs: only self allowed
-    return interaction.memberPermissions?.has(PermissionFlagsBits.ManageMessages) ?? false
-}
-
 // Who's actually in the room: guild members in servers, the two heads in a DM,
 // everyone in a group chat. Never the whole saved file.
 async function tzVisibleIds(interaction, allIds) {
@@ -310,15 +312,11 @@ async function tzVisibleIds(interaction, allIds) {
 // COMMAND HANDLERS
 // ─────────────────────────────────────────────────────────────────────────────
 async function cmdTzset(interaction) {
-    const user = interaction.options.getUser('user')
+    // Self-only: timezone writes belong to the invoker, never to someone
+    // else's row. (Older builds took a user arg gated on ManageMessages;
+    // that let anyone re-pin anyone else's clock on a wrong report.)
+    const user = interaction.user
     const rawInput = interaction.options.getString('timezone')
-
-    if (!canManageUser(interaction, user.id)) {
-        return interaction.reply({
-            content: '❌ You can only set your own timezone unless you have ManageMessages.',
-            flags: MessageFlags.Ephemeral,
-        })
-    }
 
     const result = lookupLocation(rawInput)
     if (!result) {
@@ -343,8 +341,7 @@ async function cmdTzset(interaction) {
                     .setColor('#FFA500')
                     .setTitle(`⚠️ Multiple timezones for ${result.display}`)
                     .setDescription(
-                        lines.join('\n') +
-                            `\n\nRe-run with a specific one:\n\`/tzset @${user.username} <timezone>\``,
+                        lines.join('\n') + `\n\nRe-run with a specific one:\n\`/tzset <timezone>\``,
                     ),
             ],
         })
@@ -375,15 +372,10 @@ async function cmdTzset(interaction) {
 }
 
 async function cmdTzremove(interaction) {
-    const user = interaction.options.getUser('user')
+    // Self-only, same rule as /tzset.
+    const user = interaction.user
     const cache = getCache()
 
-    if (!canManageUser(interaction, user.id)) {
-        return interaction.reply({
-            content: '❌ You can only remove your own timezone unless you have ManageMessages.',
-            flags: MessageFlags.Ephemeral,
-        })
-    }
     if (!cache[user.id]) {
         return interaction.reply({
             content: `${user.username} doesn't have a timezone set.`,
@@ -415,7 +407,7 @@ async function cmdTz(interaction) {
     if (target) {
         if (!cache[target.id]) {
             return interaction.reply({
-                content: `❌ No timezone set for ${target.username}. Use \`/tzset @${target.username} TIMEZONE\` first.`,
+                content: `❌ No timezone set for ${target.username}. Use \`/tzset TIMEZONE\` first.`,
                 flags: MessageFlags.Ephemeral,
             })
         }
@@ -447,7 +439,7 @@ async function cmdTz(interaction) {
     const allIds = Object.keys(cache)
     if (!allIds.length) {
         return interaction.reply({
-            content: '❌ No timezones saved yet. Use `/tzset @user TIMEZONE` to add one.',
+            content: '❌ No timezones saved yet. Use `/tzset TIMEZONE` to add one.',
             flags: MessageFlags.Ephemeral,
         })
     }
@@ -831,20 +823,16 @@ function _tzCmd(name, desc) {
 
 function buildTzSlashCommands() {
     return [
-        _tzCmd('tzset', 'Set timezone for a user')
-            .addUserOption((o) => o.setName('user').setDescription('User').setRequired(true))
-            .addStringOption((o) =>
-                o
-                    .setName('timezone')
-                    .setDescription('e.g. Malaysia, ET, UTC+8, America/New_York')
-                    .setRequired(true),
-            ),
+        _tzCmd('tzset', 'Set your own timezone').addStringOption((o) =>
+            o
+                .setName('timezone')
+                .setDescription('e.g. Malaysia, ET, UTC+8, America/New_York')
+                .setRequired(true),
+        ),
         _tzCmd('tz', 'Show current time for everyone (or a specific user)')
             .addUserOption((o) => o.setName('user').setDescription('User to check (optional)'))
             .addBooleanOption((o) => o.setName('private').setDescription('Only you see the answer')),
-        _tzCmd('tzremove', 'Remove timezone for a user').addUserOption((o) =>
-            o.setName('user').setDescription('User').setRequired(true),
-        ),
+        _tzCmd('tzremove', 'Remove your own saved timezone'),
         _tzCmd('tzbesttime', 'Find the best time for people to meet')
             .addStringOption((o) =>
                 o.setName('users').setDescription('Tag people to include (omit = everyone)'),
@@ -1871,6 +1859,7 @@ export function getSlashCommands() {
 // ─────────────────────────────────────────────────────────────────────────────
 export function getSavedTimezone(userId) {
     try {
+        if (!_tzStoreOn) return null
         return getCache()?.[String(userId)] ?? null
     } catch {
         return null
@@ -1879,8 +1868,21 @@ export function getSavedTimezone(userId) {
 
 export function saveUserTimezone(userId, entry) {
     try {
+        if (!_tzStoreOn) return false
         const cache = getCache()
         cache[String(userId)] = entry
+        persistCache()
+        return true
+    } catch {
+        return false
+    }
+}
+
+export function deleteUserTimezone(userId) {
+    try {
+        const cache = getCache()
+        if (!cache?.[String(userId)]) return false
+        delete cache[String(userId)]
         persistCache()
         return true
     } catch {
@@ -1949,31 +1951,23 @@ async function prefixTzis(msg, args) {
 }
 
 async function prefixTzset(msg, args) {
-    const mentioned = firstMentionedUser(msg)
-    const parts = [...args]
-    if (mentioned) {
-        // strip the mention token, whatever form it took
-        const idx = parts.findIndex((t) => /<@!?\d+>/.test(t) || t === `@${mentioned.username}`)
-        if (idx >= 0) parts.splice(idx, 1)
-    }
-    const zone = parts.join(' ').trim()
+    // Self-only: mentions are ignored, the zone always lands on the invoker.
+    const zone = [...args].join(' ').trim()
     if (!zone)
         return msg.reply({
-            content:
-                'Usage: `m.tzset <timezone>` — e.g. `m.tzset Malaysia` (or mention someone with ManageMessages)',
+            content: '`Usage: m.tzset <timezone>` — e.g. `m.tzset Malaysia`',
             allowedMentions: { parse: [] },
         })
     return cmdTzset(
         shimInteraction(msg, {
-            users: { user: mentioned ?? msg.author },
+            users: {},
             strings: { timezone: zone },
         }),
     )
 }
 
 async function prefixTzremove(msg) {
-    const mentioned = firstMentionedUser(msg)
-    return cmdTzremove(shimInteraction(msg, { users: { user: mentioned ?? msg.author } }))
+    return cmdTzremove(shimInteraction(msg, { users: {} }))
 }
 
 async function prefixTzbesttime(msg, args) {

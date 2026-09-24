@@ -226,6 +226,11 @@ export class OutputCore extends AgentCommandCore {
         const prefix = `${userId}_`
         for (const k of this.userCache.keys()) if (k.startsWith(prefix)) this.userCache.delete(k)
     }
+    // Single memory gate: host switch off, or this user opted out.
+    // Every read/write/buffer site checks this instead of the map directly.
+    isMemOff(userId) {
+        return this._memoryOff === true || this.userMemory?.[userId] === false
+    }
     // RAM history respects memory-off: no store when memOff, so every push
     // site funnels through here instead of touching the LRU directly. Reads
     // stay at the call sites (memOff ? [] : ...get...).

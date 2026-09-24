@@ -226,6 +226,7 @@ npm run dev      # development (auto-restart on file changes)
 
     // ─── Optional Integrations ───────────────────────────────────────────────
     "search": {
+        "enabled": true, // Master switch: false disables all web research (chat, slash, second thoughts)
         "serperKey": "", // serper.dev - free tier: 2500 searches/month
         "tavilyKey": "", // tavily.com - fallback search provider
     },
@@ -235,6 +236,7 @@ npm run dev      # development (auto-restart on file changes)
     // ─── Behavior ────────────────────────────────────────────────────────────
     "triggers": "meddy,medusa,med", // Words that wake her up (comma-separated)
     "allowDMs": false, // Whether she responds to DMs
+    "memory": true, // Master switch: false disables all stored reads/writes for everyone (prompts, modes, /forgetme keep working)
     "streaming": false, // Live-edit replies token-by-token as they generate
     "nsfw": false, // Censor toggle: true disables ALL code-level NSFW/dangerous/hate refusals (routing + canned replies + slur guard) so the models judge content themselves. Defaults to false (safe)
     "funMsgInterval": 5400, // Seconds between unprompted messages (0 to disable)
@@ -337,7 +339,7 @@ npm run start:max      # 6 GB heap, 24 UV threads - 8 GB+ hosts
 | `/prompt`                      | Set, view, or reset your custom persona (`system` text, `reset:true` wipes) | Everyone                |
 | `/server-prompt`                | Set, view, or reset this server's persona (same args) | Manage Server           |
 | `/streaming`                   | Pick instant replies (`off`, no typing indicator) or fancy streaming (`on`) — just for you | Everyone                |
-| `/memory`                      | View what she remembers — or set `mode: On/Off` to opt out of storing + fetching (ghost-mode by default) | Everyone                |
+| `/memory`                      | View what she remembers — or set `mode: On/Off` to opt out of storing + fetching (ghost-mode by default). Disabled entirely when `memory: false` in config | Everyone                |
 | `/ask`                         | Quick precise answer, light memory, instant (server only). `research`: Auto/On/Off, `privacy`: On/Off | Everyone                |
 | `/avatar`, `/banner`, `/mbanner` | Server avatar, server banner, main profile banner (`av`/`bn`/`mbn` still work) | Everyone                |
 | `/summarize`                   | Summarize recent channel conversation                            | Everyone (rate-limited) |
@@ -667,7 +669,7 @@ All persistent data lives in **SQLite databases on the bot operator's own server
 
 ### Your rights & how to delete your data
 
-- **`/forgetme`** - any user can permanently wipe **all** of their stored data (conversations, profile, interests, relationships, aliases) at any time.
+- **`/forgetme`** - any user can permanently wipe **all** of their stored data (conversations, profile, interests, relationships, aliases) at any time. Afterwards you're offered to also forget your saved timezone (separate from chat history).
 - Server-level wipes are handled by the operator (deleting that server's memory database folder).
 - Questions or deletion requests can also be sent to the bot operator via the **`/mail`** command.
 

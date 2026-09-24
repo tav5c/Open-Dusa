@@ -17,6 +17,7 @@ import { loadPerformance } from './performance.js'
 import { readConfigRaw, saveRuntime, setConfigGuild, writeConfigRaw } from './config.js'
 import { AIChatManager } from './ai/chat.js'
 import { AIMemoryManager } from './ai/memory.js'
+import { deleteUserTimezone, getSavedTimezone, setTzStoreEnabled } from './timezones.js'
 import { containsDisallowedHate, safetyRefusal } from './ai/safety.js'
 import { logAction } from './moderation.js'
 
@@ -72,6 +73,20 @@ const ownerOnly = (fn) => async (msg, args) => {
 }
 export async function registerAI(client, db, config) {
     OWNER_ID = config.ownerId
+    // Blank ownerName falls back to the cached owner user (one fetch at
+    // boot, then cache) instead of shipping empty creator-lore lines.
+    // An explicit non-blank name, including the 'My Developer' default,
+    // is left alone.
+    if (!String(config.ownerName ?? '').trim()) {
+        try {
+            const u =
+                client.users.cache.get(String(config.ownerId)) ??
+                (await client.users.fetch(String(config.ownerId)).catch(() => null))
+            config.ownerName = u?.displayName ?? u?.username ?? 'My Developer'
+        } catch {
+            config.ownerName = 'My Developer'
+        }
+    }
     // NOTE: sqlite driver init lives ONLY in db.js::loadSqlite (cipher build,
     // probed at index.js boot). A duplicate plain-build init used to live here
     // behind `if (!globalThis._sqlite3)` — order-dependent, and losing the race
@@ -167,6 +182,9 @@ export async function registerAI(client, db, config) {
     const ai = new AIChatManager(client, db, config)
     client.aiCog = ai
     ai._passiveBuf = _passiveBuf // wire buffer so getUserContext() can inject live channel activity
+    // Host amnesia covers the AI side of timezones (no model reads, no
+    // auto-learn writes). Manual /tz commands keep working on purpose.
+    setTzStoreEnabled(config.memory !== false)
 
     client.on('messageCreate', async (msg) => {
         try {
@@ -178,6 +196,7 @@ export async function registerAI(client, db, config) {
 
     client.on('guildMemberAdd', (member) => {
         if (!member.guild) return
+        if (ai.isMemOff(member.id)) return
         const mem = ai.getMem(member.guild)
         mem.updateUser(member.id, member.user.username, member.displayName)
     })
@@ -190,7 +209,7 @@ export async function registerAI(client, db, config) {
     client.on('messageCreate', (msg) => {
         if (msg.author.bot) return
         if (ai.debugMode) return // debug mode: no passive buffering anywhere
-        if (ai.userMemory?.[msg.author.id] === false) return // memory-off: leave no room-context trace
+        if (ai.isMemOff(msg.author.id)) return // memory-off: leave no room-context trace
         if (!msg.guild) return
         if (!msg.content?.trim()) return
         if (msg.content.length < 3) return
@@ -295,6 +314,12 @@ export async function registerAI(client, db, config) {
             const flags = isPrivate ? MessageFlags.Ephemeral : undefined
 
             await interaction.deferReply(flags ? { flags } : {})
+            // Master switch wins over explicit On: answer from knowledge
+            // with a notice instead of silently going stale.
+            const searchOffNote =
+                forceSearch && ai._searchOff?.()
+                    ? '🔍 Web research is disabled on this host — answering from knowledge.\n\n'
+                    : ''
 
             const isStaff = !!interaction.memberPermissions?.has(PermissionFlagsBits.ModerateMembers)
             const gate = client.heart?.rateLimiter?.check(uid, { isStaff, isOwner })
@@ -318,6 +343,7 @@ export async function registerAI(client, db, config) {
 
                 const safe = ai.finalSecurityCheck(response, interaction)
                 const chunks = ai.splitResponse(safe, 1900)
+                if (searchOffNote && chunks.length) chunks[0] = searchOffNote + chunks[0]
                 await interaction.editReply({ content: chunks[0] || '...' })
                 for (let i = 1; i < Math.min(chunks.length, 4); i++) {
                     await interaction.followUp({ content: chunks[i], ...(flags ? { flags } : {}) })
@@ -345,6 +371,11 @@ export async function registerAI(client, db, config) {
             const researchArg = interaction.options.getString('research') ?? 'auto'
             const isPrivate = (interaction.options.getString('privacy') ?? 'off') === 'on'
             const flags = isPrivate ? MessageFlags.Ephemeral : undefined
+            // Same master-switch notice as /medusa below.
+            const searchOffNote =
+                researchArg === 'on' && ai._searchOff?.()
+                    ? '🔍 Web research is disabled on this host — answering from knowledge.\n\n'
+                    : ''
             await interaction.deferReply(flags ? { flags } : {})
 
             const uid = interaction.user.id
@@ -358,7 +389,7 @@ export async function registerAI(client, db, config) {
             }
 
             try {
-                const memOff = ai.userMemory?.[uid] === false
+                const memOff = ai.isMemOff(uid)
                 const mem = ai.getMem(interaction.guild)
                 let userCtx = ''
                 if (!memOff) {
@@ -397,6 +428,7 @@ export async function registerAI(client, db, config) {
                 }
                 const safe = ai.finalSecurityCheck(response, interaction)
                 const chunks = ai.splitResponse(safe, 1900)
+                if (searchOffNote && chunks.length) chunks[0] = searchOffNote + chunks[0]
                 await interaction.editReply({ content: chunks[0] || '...' })
                 for (let i = 1; i < Math.min(chunks.length, 4); i++) {
                     await interaction.followUp({ content: chunks[i], ...(flags ? { flags } : {}) })
@@ -459,7 +491,7 @@ export async function registerAI(client, db, config) {
                 const fetched = await interaction.channel.messages.fetch({ limit: 100, after: startMsg.id })
                 const sorted = [...fetched.values()].sort((a, b) => a.createdTimestamp - b.createdTimestamp)
                 for (const m of sorted) {
-                    if (!m.author.bot && m.content.trim() && ai.userMemory?.[m.author.id] !== false) {
+                    if (!m.author.bot && m.content.trim() && !ai.isMemOff(m.author.id)) {
                         messages.push({
                             author: m.member?.displayName ?? m.author.username,
                             content: m.content,
@@ -468,11 +500,7 @@ export async function registerAI(client, db, config) {
                         if (messages.length >= 100) break
                     }
                 }
-                if (
-                    !startMsg.author.bot &&
-                    startMsg.content.trim() &&
-                    ai.userMemory?.[startMsg.author.id] !== false
-                )
+                if (!startMsg.author.bot && startMsg.content.trim() && !ai.isMemOff(startMsg.author.id))
                     messages.unshift({
                         author: startMsg.member?.displayName ?? startMsg.author.username,
                         content: startMsg.content,
@@ -488,7 +516,7 @@ export async function registerAI(client, db, config) {
                     if (!fetched.size) break
                     for (const [, m] of fetched) {
                         cursor = m.id
-                        if (!m.author.bot && m.content.trim() && ai.userMemory?.[m.author.id] !== false) {
+                        if (!m.author.bot && m.content.trim() && !ai.isMemOff(m.author.id)) {
                             messages.push({
                                 author: m.member?.displayName ?? m.author.username,
                                 content: m.content,
@@ -535,6 +563,13 @@ export async function registerAI(client, db, config) {
         // /memory
         if (commandName === 'memory') {
             const userId = interaction.user.id
+            if (ai._memoryOff === true) {
+                return interaction.reply({
+                    content:
+                        '🔒 Memory is disabled on this host — nothing is stored or fetched for anyone. Prompts, modes, and `/forgetme` still work.',
+                    flags: MessageFlags.Ephemeral,
+                })
+            }
             const modeArg = interaction.options.getString('mode')
             if (modeArg === 'on' || modeArg === 'off') {
                 ai.userMemory[String(userId)] = modeArg === 'on'
@@ -691,6 +726,50 @@ export async function registerAI(client, db, config) {
                     embeds: [],
                     components: [],
                 })
+                // Optional second wipe: saved timezone, which has nothing to
+                // do with chat history. Only offered when one exists.
+                if (getSavedTimezone(userId)) {
+                    const tzRow = new ActionRowBuilder().addComponents(
+                        new ButtonBuilder()
+                            .setCustomId('fm_tz_yes')
+                            .setLabel('Forget it too')
+                            .setStyle(ButtonStyle.Danger)
+                            .setEmoji('✅'),
+                        new ButtonBuilder()
+                            .setCustomId('fm_tz_no')
+                            .setLabel('Keep it')
+                            .setStyle(ButtonStyle.Secondary)
+                            .setEmoji('❌'),
+                    )
+                    const follow = await i.followUp({
+                        content:
+                            'One more thing — you have a saved timezone. That lives apart from chat history; forgetting it only stops time answers knowing your zone. Forget it too?',
+                        components: [tzRow],
+                        flags: MessageFlags.Ephemeral,
+                    })
+                    const tzCol = follow.createMessageComponentCollector({
+                        componentType: ComponentType.Button,
+                        time: 30_000,
+                    })
+                    tzCol.on('collect', async (ti) => {
+                        if (ti.user.id !== userId)
+                            return ti.reply({ content: 'Not your button.', flags: MessageFlags.Ephemeral })
+                        tzCol.stop()
+                        if (ti.customId === 'fm_tz_yes' && deleteUserTimezone(userId)) {
+                            return ti.update({
+                                content: '✅ Timezone forgotten too.',
+                                embeds: [],
+                                components: [],
+                            })
+                        }
+                        return ti.update({
+                            content: 'Kept your timezone 💜',
+                            embeds: [],
+                            components: [],
+                        })
+                    })
+                    tzCol.on('end', () => follow.edit({ components: [] }).catch(() => {}))
+                }
             })
             col.on('end', () => interaction.editReply({ components: [] }).catch(() => {}))
             return

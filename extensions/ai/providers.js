@@ -602,6 +602,12 @@ export class ProviderCore {
         ]
         return HARD_DEAD.some((x) => s.includes(x))
     }
+    // Research master switch (config search.enabled:false): every web
+    // path checks this, so one flag quiets chat routing, slash commands,
+    // and second thoughts together. Defaults on.
+    _searchOff() {
+        return (this._config ?? this.config)?.search?.enabled === false
+    }
     _isCapacityError(e) {
         const s = String(e).toLowerCase()
         const status = this._errorStatus(e)

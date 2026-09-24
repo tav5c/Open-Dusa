@@ -316,6 +316,11 @@ export function normalizeConfig(raw) {
         agents: { chat, research, vision, classifier, quickAgent },
         fallbackModels: asArray(raw.fallbackModels ?? raw.fallback_models),
         search: {
+            // Master switch: false disables every web-research path
+            // (chat routing, slash commands, second thoughts). Explicit
+            // per-command "on" gets a disabled notice instead of silence.
+            // Defaults to true.
+            enabled: raw.search?.enabled !== false,
             serperKey: raw.search?.serperKey ?? raw.serper_key ?? '',
             // Tavily accepts one key or an array — spares rotate in on
             // rate-limit/quota errors. tavilyKey stays the first (compat).

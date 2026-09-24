@@ -96,6 +96,7 @@
     },
     "fallbackModels": ["mistralai/mistral-small-4-119b-2603", "qwen/qwen3-next-80b-a3b-instruct"],
     "search": {
+        "enabled": true,
         "serperKey": "",
         "tavilyKey": ""
     },
