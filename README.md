@@ -510,7 +510,7 @@ Servers with `"isolatedMemory": true` in the `guilds` map (or isolated live with
 - Runs Discord actions autonomously: fetch avatars/banners, create polls/threads, set slowmode, move users in VC, pin messages, manage channels, join/leave voice
 - Moderation targets resolve from names, reply-pronouns ("mute him"), learned aliases, fuzzy spellings, and live roster search — not just mentions
 - Confirm flow: personal embed with ✅/❌/✏️ buttons, reason modals, pick-menus for stacked confirms
-- Second thoughts: hedged or sourceless answers get a silent re-check; only corrections speak up
+- Second thoughts: hedged answers to live questions get a silent re-check; only corrections speak up
 - Situational vibe + room climate: her tone follows the message and the room, cold mode forced on moderation asks
 - Persistent reminders: set naturally in conversation or via `remind`/`reminder`/`remindme`, survive restarts, poll every 15s. Channel-targeted (`remind #announcements ...`) and repeating (`remind every friday 17:00 ...`, UTC) schedules supported; the list renders as an embed with cancel buttons.
 - All destructive actions go through the confirmation gate
