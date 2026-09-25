@@ -224,6 +224,15 @@ npm run dev      # development (auto-restart on file changes)
     //     "mistralai/mistral-small-4-119b-2603"
     //   ]
 
+    // ─── Named chat modes (/mode focused, /mode fast) ───────────────────────
+    // Each mode optionally pins its own provider/model/fallback chain plus a
+    // style prompt. No model = style-only mode on the chat default. The
+    // custom persona still applies first; the mode only tunes how it talks.
+    // "modes": {
+    //     "focused": { "provider": "groq", "model": "openai/gpt-oss-120b" },
+    //     "fast": { "provider": "groq", "model": "openai/gpt-oss-20b" }
+    // },
+
     // ─── Optional Integrations ───────────────────────────────────────────────
     "search": {
         "enabled": true, // Master switch: false disables all web research (chat, slash, second thoughts)
@@ -335,7 +344,7 @@ npm run start:max      # 6 GB heap, 24 UV threads - 8 GB+ hosts
 | ------------------------------ | ---------------------------------------------------------------- | ----------------------- |
 | `/memory`                      | View what Open-Dusa remembers about you                          | Everyone                |
 | `/forgetme`                    | Permanently delete your stored data                              | Everyone                |
-| `/mode`                        | Switch between `focused` (analytical), `normal` (casual), and `fast` (ultrashort) mode | Everyone                |
+| `/mode`                        | Switch between `focused` (analytical), `normal` (casual), and `fast` (ultrashort) mode. Named modes can pin their own model + fallbacks via `modes{}` in config | Everyone                |
 | `/prompt`                      | Set, view, or reset your custom persona (`system` text, `reset:true` wipes) | Everyone                |
 | `/server-prompt`                | Set, view, or reset this server's persona (same args) | Manage Server           |
 | `/streaming`                   | Pick instant replies (`off`, no typing indicator) or fancy streaming (`on`) — just for you | Everyone                |

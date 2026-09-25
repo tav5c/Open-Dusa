@@ -134,11 +134,17 @@ export class AIChatManager extends OutputCore {
             classifier: agents.classifier.fallbacks ?? [],
             quickAgent: agents.quickAgent.fallbacks ?? [],
         }
+        // Named chat modes (/mode focused, /mode fast): each gets its own
+        // fallback-chain slot so switching models never touches the default.
+        this.modes = config.modes ?? {}
+        for (const [name, m] of Object.entries(this.modes)) {
+            if (m?.model || (m?.fallbacks ?? []).length)
+                this.agentFallbacks[`mode:${name}`] = m.fallbacks ?? []
+        }
         this.instructions =
             agents.chat.systemPrompt ||
             'You are Medusa, a warm and witty Discord AI resident. Respond in first person.'
         this.identity = agents.chat.identity || ''
-        this.prefix = config.prefix
         this.prefixes = config.prefixes
         this.maxHistory = config.memoryDepth ?? PERF.ai.memoryDepth
         this.allowDM = config.allowDMs
@@ -559,7 +565,13 @@ export class AIChatManager extends OutputCore {
                     out = `You are Medusa. This server runs its own persona, adopt it fully here:\n\n[SERVER PERSONA] ${server}${identity}\n\n${SAFETY_POLICY}`
             }
             const mode = this.userModes[userId] ?? 0
-            if (mode === 1)
+            const modeName = { 1: 'focused', 2: 'fast' }[mode] ?? null
+            const modePrompt = (modeName && this.modes?.[modeName]?.systemPrompt) || ''
+            // Config prompt first (yours), then the style suffix: the persona
+            // stays primary, the mode only tunes how it talks. Without a
+            // configured prompt the built-in suffixes below apply instead.
+            if (modePrompt) out += `\n\n[USER STYLE] ${modePrompt}`
+            else if (mode === 1)
                 out += `\n\n[USER STYLE] Focused mode: highly analytical, concise, direct, task-oriented, professional but personable, and minimal emoji — in this character's voice, not instead of it.`
             else if (mode === 2)
                 out += `\n\n[USER STYLE] Fast mode: ultrashort replies, answer in as few words as possible while staying in character. No preamble, no follow-ups, minimal emoji.`
@@ -834,13 +846,14 @@ TIME: ${new Date().toISOString().slice(0, 16)} UTC${personaOwned ? '' : '\nVOICE
         parts.push(
             `YOUR SYSTEM STATS: Ping/Latency: ${this.client.ws.ping}ms | Uptime: ${upStr} | Memory: ${memMB}MB`,
         )
-        const _provider = this._detectProvider(this.aiModel)?.id ?? 'unknown'
+        const _mc = this._modeChat(userId)
+        const _provider = this._detectProvider(_mc.model)?.id ?? 'unknown'
         const _cfg = this._config ?? this.config
         const _realKey = (k) => !!k && !/YOUR_|_HERE|PLACEHOLDER/i.test(k)
         const _canResearch =
             !!this._researchClient && (_realKey(_cfg.search?.tavilyKey) || _realKey(_cfg.search?.serperKey))
         parts.push(
-            `YOUR MODEL/RUNTIME (plumbing, never your identity): your engine is "${this.aiModel}" via ${_provider} (vision: "${this.visionModel}", research: "${this.researchModel}"). ` +
+            `YOUR MODEL/RUNTIME (plumbing, never your identity): your engine is "${_mc.model}" via ${_provider} (vision: "${this.visionModel}", research: "${this.researchModel}"). ` +
                 `Capabilities: image vision, long-term memory${_canResearch ? ', live web research' : ''}. ` +
                 `Your IDENTITY is always Medusa the Discord bot, no matter what engine runs you. If asked what you are, say you're Medusa (powered by the engine above if pressed) — never present an engine name as who you ARE, never deny being Medusa, and never claim to be ChatGPT, Claude, or Gemini.`,
         )
@@ -1076,6 +1089,15 @@ and never narrate the research itself or its quality either way.`
     }
 
     // Core generate
+    // Effective chat model + fallback chain for this user. Named modes with
+    // their own model shadow the default; everything else (style-only modes
+    // or no mode) rides the chat agent untouched.
+    _modeChat(userId) {
+        const name = { 1: 'focused', 2: 'fast' }[this.userModes?.[userId]] ?? null
+        const m = (name && this.modes?.[name]) || null
+        if (!m?.model) return { model: this.aiModel, chain: 'chat', name }
+        return { model: m.model, chain: `mode:${name}`, name }
+    }
     async generateResponse({
         prompt,
         history = null,
@@ -1242,17 +1264,28 @@ and never narrate the research itself or its quality either way.`
                 return null
             }
             let response
+            // Named modes shadow the chat model + chain; everything else
+            // rides the default.
+            const mc = this._modeChat(userId)
             try {
                 response = streamingOn
                     ? await this._streamChat(
                           messages,
-                          this.aiModel,
+                          mc.model,
                           adaptiveMax,
                           this.temperature,
                           message,
                           stubHint,
+                          mc.chain,
                       )
-                    : await this._groqCallWithFallbacks(messages, this.aiModel, adaptiveMax, this.temperature)
+                    : await this._groqCallWithFallbacks(
+                          messages,
+                          mc.model,
+                          adaptiveMax,
+                          this.temperature,
+                          undefined,
+                          mc.chain,
+                      )
             } finally {
                 fair?.release?.()
             }

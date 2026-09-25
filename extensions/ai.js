@@ -820,7 +820,7 @@ export async function registerAI(client, db, config) {
                 ai.userModes[uid2] = 1
                 ai._scheduleUsersSave()
                 return interaction.reply({
-                    content: '✅ Switched to **focused mode** - task-oriented responses',
+                    content: `✅ Switched to **focused mode** - task-oriented responses (${ai._modeChat(uid2).model})`,
                     flags: MessageFlags.Ephemeral,
                 })
             }
@@ -828,7 +828,7 @@ export async function registerAI(client, db, config) {
                 ai.userModes[uid2] = 2
                 ai._scheduleUsersSave()
                 return interaction.reply({
-                    content: '✅ Switched to **fast mode** - ultrashort replies',
+                    content: `✅ Switched to **fast mode** - ultrashort replies (${ai._modeChat(uid2).model})`,
                     flags: MessageFlags.Ephemeral,
                 })
             }
@@ -1241,10 +1241,11 @@ export async function registerAI(client, db, config) {
         else if (['normal', '0'].includes(input)) newMode = 0
         else return msg.reply('❌ Invalid mode. Use `focused`/`1`, `normal`/`0`, or `fast`/`2`')
 
-        ai.userModes[uid] = newMode
+        if (newMode === 0) delete ai.userModes[uid]
+        else ai.userModes[uid] = newMode
         ai._scheduleUsersSave()
         const modeName = ['normal', 'focused', 'fast'][newMode]
-        return msg.reply(`✅ Switched to **${modeName} mode**`)
+        return msg.reply(`✅ Switched to **${modeName} mode** (${ai._modeChat(uid).model})`)
     })
     client.commands.set('stream', async (msg, args) => {
         const input = args[0]?.toLowerCase()
