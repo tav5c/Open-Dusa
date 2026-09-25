@@ -273,6 +273,22 @@ export function normalizeConfig(raw) {
     classifier.resolved = clfResolved
     classifier.fallbacks = resolveFallbacks(fallbackRaw(a.classifier), clfResolved, providers)
 
+    // Named chat modes (/mode focused, /mode fast): each optionally pins its
+    // own provider/model/fallback chain plus a style prompt. Absent model =
+    // style-only mode on the chat model. Research/vision/classifier and the
+    // quick agent stay on their own agents regardless of mode.
+    const modes = {}
+    for (const [name, m] of Object.entries(raw.modes ?? {})) {
+        if (!m || typeof m !== 'object') continue
+        const resolved = resolveAgentProvider(providers, m.provider)
+        modes[String(name)] = {
+            provider: m.provider ?? null,
+            model: typeof m.model === 'string' && m.model.trim() ? m.model.trim() : null,
+            systemPrompt: asPrompt(m.systemPrompt),
+            resolved,
+            fallbacks: resolveFallbacks(fallbackRaw(m), resolved, providers),
+        }
+    }
     const qa = a.quickAgent ?? raw.quickAgent ?? {}
     const quickAgent = {
         model: typeof qa.model === 'string' && qa.model.trim() ? qa.model : chat.model,
@@ -315,6 +331,7 @@ export function normalizeConfig(raw) {
         ownerName: raw.ownerName ?? raw.owner_name ?? 'My Developer',
         providers,
         agents: { chat, research, vision, classifier, quickAgent },
+        modes,
         fallbackModels: asArray(raw.fallbackModels ?? raw.fallback_models),
         search: {
             // Master switch: false disables every web-research path

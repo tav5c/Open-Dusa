@@ -481,7 +481,6 @@ export class ProviderCore {
                 this.currentKeyIdx = next
                 this._initGroq()
                 if (this._groq) {
-                    this.keyFailures[old] = 0
                     console.log(`[AI] Key rotated: ${old + 1} -> ${next + 1}`)
                     return true
                 }
@@ -716,13 +715,11 @@ export class ProviderCore {
         payload.stream = false
         try {
             const r = await client.chat.completions.create(payload)
-            this.keyFailures[this.currentKeyIdx] = 0
             return r.choices[0].message.content
         } catch (e) {
             const err = String(e)
             if (this._isCapacityError(e)) return { capacityError: true }
             if (this._isRequestError(e)) return null
-            this.keyFailures[this.currentKeyIdx] = (this.keyFailures[this.currentKeyIdx] ?? 0) + 1
 
             if (this._isKeyError(e)) {
                 // Check if we have multiple keys to rotate through. If only 1 key, we must respect retry-after.
@@ -762,14 +759,14 @@ export class ProviderCore {
             .replace(/<{2,3}\s*(?:RUN_CMD|ACTIONS_INTENDED)\s*:[^<>]*>?\s*$/g, '')
             .replace(/<<[^<>]*$/g, '')
     }
-    async _streamChat(messages, model, maxTokens, temp, message, stubHint = null) {
+    async _streamChat(messages, model, maxTokens, temp, message, stubHint = null, agent = 'chat') {
         if (!this._groq) return null
         // Route the open through the provider pool when it covers this base:
         // a breaker-open or dead-keyed provider must be skipped instantly,
         // not waited on for 30s. Falls back to the legacy client otherwise.
         const routerP = (this._providers ?? []).find((p) => p.baseUrl === this.llmBaseUrl)
         if (routerP && Date.now() < routerP.state.openUntil)
-            return this._groqCallWithFallbacks(messages, model, maxTokens, temp)
+            return this._groqCallWithFallbacks(messages, model, maxTokens, temp, undefined, agent)
         const streamClient = routerP?.client ?? this._groq
         const payload = { ...this._buildPayload(model, messages, maxTokens, temp), stream: true }
         let placeholder = null
@@ -867,7 +864,7 @@ export class ProviderCore {
                 until: Date.now() + 15_000,
                 dead: new Set(this._isKeyError(e) || this._isRequestError(e) ? [] : [this.llmBaseUrl]),
             }
-            return this._groqCallWithFallbacks(messages, model, maxTokens, temp, undefined, 'chat', budget)
+            return this._groqCallWithFallbacks(messages, model, maxTokens, temp, undefined, agent, budget)
         }
     }
 
