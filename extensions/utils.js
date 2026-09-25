@@ -1,5 +1,41 @@
+import { MessageFlags } from 'discord.js'
+
 export const MAX_SECONDS = 2419200
 export const TIME_UNITS = { s: 1, m: 60, h: 3600, d: 86400 }
+
+// Servers where bot output stays silent: paused via /ai-pause, or outside
+// the configured guild scope. Null = fine. Reads the AI cog live so both
+// listeners share one definition.
+export function guildBlockedReason(client, guild) {
+    if (!guild) return null
+    const cog = client?.aiCog
+    if (cog?.pausedGuilds?.has(guild.id)) return 'paused'
+    if (cog?.allowedGuilds?.size && !cog.allowedGuilds.has(guild.id)) return 'inactive'
+    return null
+}
+
+// Force reply-style responses on this interaction ephemeral (reply/edit/
+// followUp/defer), merging with existing flags. For blocked servers:
+// nothing the bot says there is publicly visible. Idempotent per
+// interaction. `update` is excluded (button updates reject unknown fields).
+export function forceEphemeral(interaction) {
+    if (!interaction || interaction._forceEph) return
+    interaction._forceEph = true
+    for (const m of ['reply', 'editReply', 'followUp', 'deferReply']) {
+        const orig = interaction[m]?.bind(interaction)
+        if (!orig) continue
+        interaction[m] = (opts, ...rest) => {
+            if (typeof opts === 'string') opts = { content: opts }
+            if (opts && typeof opts === 'object') {
+                if (Array.isArray(opts.flags)) {
+                    if (!opts.flags.includes(MessageFlags.Ephemeral))
+                        opts.flags = [...opts.flags, MessageFlags.Ephemeral]
+                } else opts.flags = (opts.flags ?? 0) | MessageFlags.Ephemeral
+            }
+            return orig(opts, ...rest)
+        }
+    }
+}
 export async function resolveTarget(ctx, args, fetchUser = false, allowSelfFallback = true) {
     const isMsg = ctx.content !== undefined
     if (!isMsg) return ctx.options?.getMember?.('user') || ctx.member

@@ -18,6 +18,7 @@ import { readConfigRaw, saveRuntime, setConfigGuild, writeConfigRaw } from './co
 import { AIChatManager } from './ai/chat.js'
 import { AIMemoryManager } from './ai/memory.js'
 import { deleteUserTimezone, getSavedTimezone, setTzStoreEnabled } from './timezones.js'
+import { forceEphemeral, guildBlockedReason } from './utils.js'
 import { containsDisallowedHate, safetyRefusal } from './ai/safety.js'
 import { logAction } from './moderation.js'
 
@@ -182,6 +183,14 @@ export async function registerAI(client, db, config) {
     const ai = new AIChatManager(client, db, config)
     client.aiCog = ai
     ai._passiveBuf = _passiveBuf // wire buffer so getUserContext() can inject live channel activity
+    // Blocked servers (paused/out-of-scope): generation-gated commands
+    // refuse, and every other reply on the interaction goes ephemeral —
+    // nothing the bot says there is publicly visible. Privacy commands
+    // (/memory, /forgetme, /recall) and moderation stay available.
+    const aiBlockedReply = (blocked) =>
+        blocked === 'paused'
+            ? '💤 AI is paused in this server — an admin can resume it with `/ai-pause`.'
+            : "🔇 AI isn't active in this server."
     // Host amnesia covers the AI side of timezones (no model reads, no
     // auto-learn writes). Manual /tz commands keep working on purpose.
     setTzStoreEnabled(config.memory !== false)
@@ -218,6 +227,7 @@ export async function registerAI(client, db, config) {
         if (!everyonePerms?.has('ViewChannel')) return
 
         if (ai.allowedGuilds.size && !ai.allowedGuilds.has(msg.guild.id)) return
+        if (ai.pausedGuilds.has(msg.guild.id)) return // paused: no room context accrues either
 
         const entry = {
             userId: msg.author.id,
@@ -252,6 +262,7 @@ export async function registerAI(client, db, config) {
             if (buf.length < 5) continue
             const ch = client.channels.cache.get(channelId)
             if (!ch?.guild) continue
+            if (ai.pausedGuilds.has(ch.guild.id)) continue
             const last = _loreExtractedAt.get(ch.guild.id) ?? 0
             if (now - last < minGap) continue
             _loreExtractedAt.set(ch.guild.id, now)
@@ -262,6 +273,9 @@ export async function registerAI(client, db, config) {
     }, 30 * 60_000).unref()
     // interaction listeners (AI-owned slash commands)
     client.on('interactionCreate', async (interaction) => {
+        // Blocked servers hear nothing public: force every reply on this
+        // interaction ephemeral before any handler runs.
+        if (guildBlockedReason(client, interaction.guild)) forceEphemeral(interaction)
         // Modal submit for the confirm-reason button (customId mcfm-rsn:<cmd>:<target>).
         // Refreshes the pending args and the confirm embed in place.
         if (interaction.isModalSubmit?.() && interaction.customId?.startsWith('mcfm-rsn:')) {
@@ -367,6 +381,14 @@ export async function registerAI(client, db, config) {
                     flags: MessageFlags.Ephemeral,
                 })
             }
+            {
+                const blocked = guildBlockedReason(client, interaction.guild)
+                if (blocked)
+                    return interaction.reply({
+                        content: aiBlockedReply(blocked),
+                        flags: MessageFlags.Ephemeral,
+                    })
+            }
             const prompt = interaction.options.getString('prompt')
             const researchArg = interaction.options.getString('research') ?? 'auto'
             const isPrivate = (interaction.options.getString('privacy') ?? 'off') === 'on'
@@ -445,6 +467,14 @@ export async function registerAI(client, db, config) {
         // /summarize
 
         if (commandName === 'summarize') {
+            {
+                const blocked = interaction.guild ? guildBlockedReason(client, interaction.guild) : null
+                if (blocked)
+                    return interaction.reply({
+                        content: aiBlockedReply(blocked),
+                        flags: MessageFlags.Ephemeral,
+                    })
+            }
             const BETWEEN = 15 * 60_000,
                 WINDOW = 12 * 3_600_000,
                 MAX = 3

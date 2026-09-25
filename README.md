@@ -348,7 +348,7 @@ npm run start:max      # 6 GB heap, 24 UV threads - 8 GB+ hosts
 | `/recall`                      | Look up what she remembers about a member. Fully private (only you see it). Self + mods. | Everyone (self) / Mods (others) |
 | `/kick`                        | Kick a user                                                      | Mods (Kick Members)       |
 | `/ban`, `/mute`, `/warn`, etc. | Standard moderation suite (`/warnings` and `/modlog` reply privately) | Mods                    |
-| `/ai-pause pause/resume`       | Pause or resume the AI in this server (saved to config.json)     | Admins                  |
+| `/ai-pause pause/resume`       | Pause or resume the AI in this server (saved to config.json). While paused, generation commands refuse and everything else replies privately | Admins                  |
 | `/isolation true/false`        | Give a server its own AI memory (resumable)                      | Owner                   |
 | `/configclean`                 | Sweep dead server/channel ids out of config.json                 | Owner                   |
 | `/debug`                        | Toggle debug mode: owner-only replies, scratch DB, verbose logs (hot-swaps, no reboot) | Owner                   |

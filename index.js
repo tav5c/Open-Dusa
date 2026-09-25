@@ -24,14 +24,13 @@ import { _undiciAgent, buildAISlashCommands } from './extensions/ai.js'
 import { loadConfig } from './extensions/config.js'
 import { attachHeart } from './extensions/heart.js'
 import { loadPerformance } from './extensions/performance.js'
-import { resolveTarget } from './extensions/utils.js'
+import { forceEphemeral, guildBlockedReason, resolveTarget } from './extensions/utils.js'
 import { loadSqlite, openDb } from './extensions/db.js'
 
 const PERF = loadPerformance()
 
 setGlobalDispatcher(_undiciAgent)
 process.setMaxListeners(30)
-global.backendErrors = 0
 
 // Logger
 const clr = {
@@ -1039,6 +1038,9 @@ client.once('clientReady', async () => {
 
 // interactionCreate
 client.on('interactionCreate', async (interaction) => {
+    // Blocked servers hear nothing public (covers core, moderation, and
+    // dynamic-extension commands alike).
+    if (guildBlockedReason(client, interaction.guild)) forceEphemeral(interaction)
     // Let dynamic extensions handle buttons / commands they own
     for (const ext of client.extensions.values()) {
         if (ext.handleInteraction) {
