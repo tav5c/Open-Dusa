@@ -97,14 +97,12 @@
         "focused": {
             "provider": "groq",
             "model": "openai/gpt-oss-120b",
-            "fallbacks": [{ "provider": "groq", "models": ["groq/compound"] }],
-            "systemPrompt": "Reason carefully and show your work when the question is hard; easy questions still get short answers."
+            "fallbacks": [{ "provider": "groq", "models": ["groq/compound"] }]
         },
         "fast": {
             "provider": "groq",
             "model": "openai/gpt-oss-20b",
-            "fallbacks": [],
-            "systemPrompt": ""
+            "fallbacks": []
         }
     },
     "search": {
