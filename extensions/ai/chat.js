@@ -1802,8 +1802,12 @@ and never narrate the research itself or its quality either way.`
             const bareQ =
                 content.replace(new RegExp(`^<@!?${this.client.user.id}>\\s*`), '').trim() || content
             // Normalized copy for time asks: "rn" is "right now" in chat
-            // shorthand, and none of the anchored time patterns match it raw.
-            const timeQ = bareQ.replace(/\brn\b/gi, 'right now')
+            // shorthand, and fat-finger typos (waht/tiem) break the anchored
+            // patterns below. Time tests read timeQ, never bareQ.
+            const timeQ = bareQ
+                .replace(/\brn\b/gi, 'right now')
+                .replace(/\bwaht\b/gi, 'what')
+                .replace(/\btiem\b/gi, 'time')
             // Token-saver: trivial intents get fixed replies with zero LLM
             // calls (config tokenSaver, default off = full generative).
             // Greetings roll 25% to full generation anyway so she doesn't go
