@@ -1894,7 +1894,9 @@ export function getLocalTimeLine(entry) {
     if (!entry?.timezone) return null
     const td = getTimeForTimezone(entry.timezone)
     if (!td) return null
-    return `${td.time} (${formatLabel(entry.alias || entry.timezone, entry.timezone)})`
+    // Time in code ticks, date left out: chat answers voice the time only
+    // (the date rides along only when someone asks for it).
+    return `\`${td.time}\` (${formatLabel(entry.alias || entry.timezone, entry.timezone)})`
 }
 
 // ─────────────────────────────────────────────────────────────────────────────

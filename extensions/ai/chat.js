@@ -968,7 +968,8 @@ TIME: ${new Date().toISOString().slice(0, 16)} UTC${personaOwned ? '' : '\nVOICE
         if (userId && timeAsk && (selfRef || !placeRef)) {
             try {
                 const line = getLocalTimeLine(getSavedTimezone(userId))
-                if (line) finalPrompt += `\n\n[TIME DATA, state as fact: it is ${line} for the asker.]`
+                if (line)
+                    finalPrompt += `\n\n[TIME DATA, state as fact: it is ${line} for the asker. Voice only the time in \`code\`, no date unless they ask.]`
             } catch {}
         }
 
@@ -1871,7 +1872,7 @@ and never narrate the research itself or its quality either way.`
                         await this.secureReply(message, timed)
                         return
                     }
-                    content += `\n\n[TIME DATA, state as fact: it is ${line} for the asker.]`
+                    content += `\n\n[TIME DATA, state as fact: it is ${line} for the asker. Voice only the time in \`code\`, no date unless they ask.]`
                 }
             }
             // Mention-qualified time ask: "what time is it for @A @B" — resolve
@@ -1911,7 +1912,23 @@ and never narrate the research itself or its quality either way.`
                         await this.secureReply(message, timed)
                         return
                     }
-                    content += `\n\n[TIME DATA, state each as fact:\n${lines.map((l) => `- ${l.replace(/\*\*/g, '')}`).join('\n')}]`
+                    content += `\n\n[TIME DATA, state each as fact:\n${lines.map((l) => `- ${l.replace(/\*\*/g, '')}`).join('\n')}]\nVoice only times in \`code\`, no dates unless asked.`
+                }
+            }
+            // Embedded personal time ask ("tell him what time it is for
+            // me"): the anchored fast-paths above only fire when the whole
+            // message IS the ask, so a self time-ask buried mid-message
+            // fell back to raw UTC. Resolve the asker's saved zone instead.
+            {
+                if (
+                    !containsDisallowedHate(content) &&
+                    /\bwhat (?:time is it|time it is|(?:'s|is) (?:the )?time)\b.*\bfor me\b|\bmy (?:current|local|exact) time\b|\bwhat(?:'s| is) my time\b/i.test(
+                        bareQ,
+                    )
+                ) {
+                    const line = getLocalTimeLine(getSavedTimezone(userId))
+                    if (line)
+                        content += `\n\n[TIME DATA, state as fact: it is ${line} for the asker. Voice only the time in \`code\`, no date unless they ask.]`
                 }
             }
             // Place-qualified time ask: "what time is it in india" — resolve
@@ -1942,7 +1959,7 @@ and never narrate the research itself or its quality either way.`
                                 await this.secureReply(message, timed)
                                 return
                             }
-                            content += `\n\n[TIME DATA, state as fact: it is ${line}.]`
+                            content += `\n\n[TIME DATA, state as fact: it is ${line}. Voice only the time in \`code\`, no date unless they ask.]`
                         }
                     }
                     // Ambiguous (multi-zone) or unknown: fall through so she can
