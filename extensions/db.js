@@ -54,10 +54,6 @@ export function sqliteUsable() {
     return globalThis._sqliteUsable !== false && !!_Database
 }
 
-export function encryptionEnabled() {
-    return _isCipher && !!(process.env.DB_ENCRYPTION_KEY || '')
-}
-
 function _quote(s) {
     return String(s).replace(/'/g, "''")
 }

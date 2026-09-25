@@ -163,7 +163,6 @@ export class VisionCore extends ResearchCore {
                 top_p: this.topP,
             })
             raw = r.choices[0].message.content
-            this.keyFailures[this.currentKeyIdx] = 0
         } catch (e) {
             const err = String(e).toLowerCase()
             if (err.includes('404') && (err.includes('retrieve media') || err.includes('failed to retrieve')))
@@ -172,7 +171,6 @@ export class VisionCore extends ResearchCore {
                 errType = 'format'
             else if (this._isCapacityError(e) || this._isRequestError(e)) return { raw: null, errType: null }
             else if (allowRotate) {
-                this.keyFailures[this.currentKeyIdx] = (this.keyFailures[this.currentKeyIdx] ?? 0) + 1
                 if (this._isKeyError(e)) {
                     if (await this.rotateKey(err)) {
                         try {

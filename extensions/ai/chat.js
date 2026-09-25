@@ -191,10 +191,8 @@ export class AIChatManager extends OutputCore {
         }
         this.currentKeyIdx = 0
         this.deadKeys = new Set()
-        this.keyFailures = {}
         this.researchKeys = agents.research.resolved?.keys ?? []
         this.currentResearchKeyIdx = 0
-        this.maxFailures = 2
         this._pendingConfirms = new Map()
         this._approvedConfirms = new Set()
         this._loadDeadKeys()
@@ -230,7 +228,6 @@ export class AIChatManager extends OutputCore {
         this.spamProtect = new Map()
         this.userMsgCounts = new Map()
         this.userCooldowns = new Map()
-        this.msgQueues = new Map()
         this.spamThreshold = 5
         this.spamWindow = 10_000
         this.cooldownDuration = 60_000
@@ -2910,7 +2907,6 @@ ${cleaned}`
             }
         }
         if (this.responseTimes.length > 100) this.responseTimes = this.responseTimes.slice(-50)
-        for (const [k, q] of this.msgQueues) if (!q.length) this.msgQueues.delete(k)
         // Prune spamProtect
         for (const [uid, ts] of this.spamProtect) {
             const fresh = ts.filter((t) => now - t < 30_000)

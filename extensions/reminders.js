@@ -350,14 +350,19 @@ export async function init(client, db) {
             try {
                 if (i.user.id !== msg.author.id) {
                     await i
-                        .reply({ content: 'Not yours — check your own reminders.', flags: 64 })
+                        .reply({
+                            content: 'Not yours — check your own reminders.',
+                            flags: MessageFlags.Ephemeral,
+                        })
                         .catch(() => {})
                     return
                 }
                 const id = Number(String(i.customId ?? '').split(':')[1])
                 const target = Number.isFinite(id) ? q.byId.get(id) : null
                 if (!target || (target.user_id !== msg.author.id && msg.author.id !== ownerId)) {
-                    await i.reply({ content: "⏰ That one's already gone.", flags: 64 }).catch(() => {})
+                    await i
+                        .reply({ content: "⏰ That one's already gone.", flags: MessageFlags.Ephemeral })
+                        .catch(() => {})
                     return
                 }
                 q.del.run(target.id)

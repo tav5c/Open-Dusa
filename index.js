@@ -375,7 +375,7 @@ async function cmdStats(ctx) {
         .setTitle('📊 | Medusa System Telemetry')
         .setColor(stability >= 70 ? 0x1d9e75 : stability >= 50 ? 0xef9f27 : 0xe24b4a)
         .setDescription(
-            `**Host Information & Performance Benchmark**${aiStats}\n🚪 **Backend:** Process Errors: \`${global.backendErrors}\``,
+            `**Host Information & Performance Benchmark**${aiStats}\n🚪 **Backend:** Process Errors: \`${heart._stats.errors}\``,
         )
         .addFields(
             {
@@ -848,7 +848,7 @@ addCmd('addemoji', async (msg, args) => {
     }
 })
 addCmd('lockchannel', async (msg, args) => {
-    if (!msg.member.permissions.has(PermissionFlagsBits.ManageRoles)) return
+    if (!msg.member.permissions.has(PermissionFlagsBits.ManageChannels)) return
     const ch = msg.mentions.channels.first() || msg.channel
     const roleId =
         args.find((a) => a.startsWith('<@&'))?.replace(/[<@&>]/g, '') || msg.guild.roles.everyone.id
@@ -860,7 +860,7 @@ addCmd('lockchannel', async (msg, args) => {
     }
 })
 addCmd('unlockchannel', async (msg, args) => {
-    if (!msg.member.permissions.has(PermissionFlagsBits.ManageRoles)) return
+    if (!msg.member.permissions.has(PermissionFlagsBits.ManageChannels)) return
     const ch = msg.mentions.channels.first() || msg.channel
     const roleId =
         args.find((a) => a.startsWith('<@&'))?.replace(/[<@&>]/g, '') || msg.guild.roles.everyone.id

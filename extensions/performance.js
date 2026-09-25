@@ -111,7 +111,3 @@ export function loadPerformance() {
         return _cached
     }
 }
-
-export function getPerf() {
-    return _cached ?? loadPerformance()
-}

@@ -95,7 +95,7 @@ export function registerAfk(client, db = null) {
             const isReply = message.reference?.resolved?.author.id === afkId
             if (!mentioned && !isReply) continue
             const cdExp = cd.get(userId) ?? 0
-            if (now < cdExp) break
+            if (now < cdExp) continue
             const count = (mc.get(userId) ?? 0) + 1
             mc.set(userId, count)
             if (count > 3) {

@@ -1,20 +1,17 @@
-// Model capability registry + live probe for OpenAI-compatible providers.
+// Model capability registry for OpenAI-compatible providers.
 //
 // Why this exists: GET /v1/models on Groq / NVIDIA NIM / private aggregators
 // returns identity only (id, owned_by) — no vision/tools/streaming flags.
 // OpenRouter is the only provider with a real capability API
 // (architecture.input_modalities + supported_parameters). So: static registry
-// seeded from provider docs, refreshed by id-set diff, plus a fail-closed
-// live probe (max_tokens:1, never user data) for unknown ids. Results cache
-// per provider|model.
+// seeded from provider docs (exact ids + conservative family patterns).
+// Unknown ids assume vision false, tools true (cheap to attempt, classified
+// on 400).
 //
 // Docs pinned 2026-09: Groq vision https://console.groq.com/docs/vision,
 // tool use https://console.groq.com/docs/tool-use/overview,
 // structured https://console.groq.com/docs/structured-outputs,
 // NIM function calling https://docs.nvidia.com/nim/large-language-models/latest/function-calling.html.
-
-const CACHE_TTL_MS = 6 * 60 * 60 * 1000
-const _cache = new Map() // "<baseUrl>|<model>" -> { caps, at }
 
 // Exact-id seeds: { vision, tools, parallelTools, jsonObject, jsonSchemaStrict, maxImages, builtInTools }
 const KNOWN = {
@@ -153,100 +150,4 @@ export function staticCaps(model = '') {
     }
     caps.source = 'registry:default'
     return caps
-}
-
-const _key = (model, baseUrl) => `${baseUrl ?? ''}|${model}`
-
-/**
- * Fail-closed probe: three max_tokens:1 calls (image_url, dummy tools,
- * json_object). Any 2xx => supported; 400-shape => unsupported; anything
- * else (429/5xx/network) => null (unknown, keep static value).
- */
-export async function probeCaps(client, model, { timeoutMs = 10_000 } = {}) {
-    const out = {}
-    const tryCall = async (body) => {
-        const ctrl = new AbortController()
-        const t = setTimeout(() => ctrl.abort(), timeoutMs)
-        try {
-            await client.chat.completions.create(
-                { model, max_tokens: 1, stream: false, ...body },
-                { signal: ctrl.signal },
-            )
-            return true
-        } catch (e) {
-            const s = `${e?.status ?? ''} ${e?.message ?? e}`.toLowerCase()
-            if (/(model.*(image|vision)|image.*(support|model)|unsupported.*image|invalid.*image)/.test(s))
-                return false
-            if (
-                /(tool|function|json_schema|response_format|parallel)/.test(s) &&
-                /400|422|unsupported|invalid|not supported/.test(s)
-            )
-                return false
-            if (/\b(400|404|422)\b/.test(s)) return false
-            return null // rate-limit / server / network: unknown, don't learn
-        } finally {
-            clearTimeout(t)
-        }
-    }
-    const PIXEL =
-        'data:image/png;base64,iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAYAAAAfFcSJAAAADUlEQVR42mP8z8BQDwAEhQGAhKmMIQAAAABJRU5ErkJggg=='
-    out.vision = await tryCall({
-        messages: [
-            {
-                role: 'user',
-                content: [
-                    { type: 'text', text: 'hi' },
-                    { type: 'image_url', image_url: { url: PIXEL } },
-                ],
-            },
-        ],
-    })
-    out.tools = await tryCall({
-        messages: [{ role: 'user', content: 'hi' }],
-        tools: [
-            {
-                type: 'function',
-                function: {
-                    name: '__cap_probe',
-                    description: 'capability probe',
-                    parameters: { type: 'object', properties: {} },
-                },
-            },
-        ],
-        tool_choice: 'auto',
-    })
-    out.jsonObject = await tryCall({
-        messages: [{ role: 'user', content: 'hi' }],
-        response_format: { type: 'json_object' },
-    })
-    return out
-}
-
-/**
- * Merged answer: static registry wins unless the probe positively proves
- * otherwise (probe false => downgrade; probe null => keep static).
- * Pass a client to probe unknown ids; without one it's registry-only.
- */
-export async function getModelCaps(model, { baseUrl = '', client = null, allowProbe = true } = {}) {
-    const ck = _key(model, baseUrl)
-    const hit = _cache.get(ck)
-    if (hit && Date.now() - hit.at < CACHE_TTL_MS) return hit.caps
-    const caps = staticCaps(model)
-    if (client && allowProbe && (caps.source !== 'registry:exact' || caps.vision)) {
-        try {
-            const p = await probeCaps(client, model)
-            for (const k of ['vision', 'tools', 'jsonObject']) {
-                if (p[k] === false) caps[k] = false
-                else if (p[k] === true && caps.source !== 'registry:exact') caps[k] = true
-            }
-            caps.source += '+probe'
-        } catch {}
-    }
-    if (String(model).includes('compound') || String(model).includes('gpt-oss')) caps.codeExec = true
-    _cache.set(ck, { caps, at: Date.now() })
-    return caps
-}
-
-export function clearCapsCache() {
-    _cache.clear()
 }

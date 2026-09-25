@@ -54,16 +54,6 @@ export function modEmbed(action, member, reason, guild, duration = null) {
     return embed
 }
 
-export async function safeDelete(msg, delay = 800) {
-    try {
-        await msg.delete()
-        await new Promise((r) => setTimeout(r, delay))
-        return true
-    } catch {
-        return false
-    }
-}
-
 export async function retryOnce(fn) {
     try {
         return await fn()
