@@ -1801,6 +1801,9 @@ and never narrate the research itself or its quality either way.`
             // [TIME DATA] for the model to voice when token-saver is off.
             const bareQ =
                 content.replace(new RegExp(`^<@!?${this.client.user.id}>\\s*`), '').trim() || content
+            // Normalized copy for time asks: "rn" is "right now" in chat
+            // shorthand, and none of the anchored time patterns match it raw.
+            const timeQ = bareQ.replace(/\brn\b/gi, 'right now')
             // Token-saver: trivial intents get fixed replies with zero LLM
             // calls (config tokenSaver, default off = full generative).
             // Greetings roll 25% to full generation anyway so she doesn't go
@@ -1848,8 +1851,8 @@ and never narrate the research itself or its quality either way.`
             // Token-saver ON: fixed template reply, zero LLM calls. OFF: the
             // resolved facts ride along for her to voice with persona.
             if (
-                /^(what'?s (the |my )?time|what time is it( for me)?|current time( for me)?|time check|what time|time pls|time please|time now|tell me my time|my time)[?!.\s]*$/i.test(
-                    bareQ.trim(),
+                /^(?:what'?s (?:the |my )?time|what time is it(?: for me)?|current time(?: for me)?|time check|what time|time pls|time please|time now|tell me my time|my time|what time is it right now)(?: right now| now)?[?!.\s]*$/i.test(
+                    timeQ.trim(),
                 ) &&
                 !containsDisallowedHate(content)
             ) {
@@ -1884,8 +1887,8 @@ and never narrate the research itself or its quality either way.`
                     (id) => id !== this.client.user.id && id !== userId,
                 )
                 const looksTimey =
-                    /^(what'?s (the |my )?time|what time is it( for me)?|current time( for me)?|time check|what time|time pls|time please|time now|tell me my time|my time)\b/i.test(
-                        bareQ.trim(),
+                    /^(?:what'?s (?:the |my )?time|what time is it(?: for me)?|current time(?: for me)?|time check|what time|time pls|time please|time now|tell me my time|my time|what time is it right now)(?: right now| now)?\b/i.test(
+                        timeQ.trim(),
                     ) && !containsDisallowedHate(content)
                 if (others.length && looksTimey) {
                     const lines = others.slice(0, 5).map((id) => {
@@ -1912,7 +1915,7 @@ and never narrate the research itself or its quality either way.`
                         await this.secureReply(message, timed)
                         return
                     }
-                    content += `\n\n[TIME DATA, state each as fact:\n${lines.map((l) => `- ${l.replace(/\*\*/g, '')}`).join('\n')}]\nVoice only times in \`code\`, no dates unless asked.`
+                    content += `\n\n[TIME DATA, state each as fact:\n${lines.map((l) => `- ${l.replace(/\*\*/g, '')}`).join('\n')}]\nAddress each person by name in flowing prose — never paste these lines verbatim, no code blocks. Voice only times in \`code\`, no dates unless asked.`
                 }
             }
             // Embedded personal time ask ("tell him what time it is for
@@ -1922,8 +1925,8 @@ and never narrate the research itself or its quality either way.`
             {
                 if (
                     !containsDisallowedHate(content) &&
-                    /\bwhat (?:time is it|time it is|(?:'s|is) (?:the )?time)\b.*\bfor me\b|\bmy (?:current|local|exact) time\b|\bwhat(?:'s| is) my time\b/i.test(
-                        bareQ,
+                    /\bwhat (?:time is it|time it is|(?:'s|is) (?:the )?time)\b.*\bfor me\b|\bmy (?:current|local|exact) time\b|\bwhat(?:'s| is) my time\b|\bwhat time is it (?:right now|now)\b/i.test(
+                        timeQ,
                     )
                 ) {
                     const line = getLocalTimeLine(getSavedTimezone(userId))
