@@ -799,6 +799,7 @@ export class ProviderCore {
         let stubP = null
         let full = ''
         let lastEdit = 0
+        let lastShown = ''
         const t0 = Date.now()
         // Edit pace: 1/s. Discord rate-limits message edits aggressively, and
         // sub-second edits 429 silently (swallowed .catch) leaving the stream
@@ -849,8 +850,21 @@ export class ProviderCore {
                 full += delta
                 const now = Date.now()
                 if (placeholder && now - lastEdit >= editGap() && full.length <= MAX_LEN) {
-                    lastEdit = now
-                    placeholder.edit(this._stripPartialTags(full) + ' ▌').catch(() => {})
+                    const shown = this._stripPartialTags(full)
+                    // Snap edits to word boundaries so text never lands
+                    // mid-word, and skip edits with nothing new visible
+                    // (stripped tag fragments). Long unbroken runs still
+                    // flush every ~200 chars so code/URLs don't stall.
+                    if (
+                        shown !== lastShown &&
+                        (lastEdit === 0 ||
+                            /[\s.,!?;:)\]}…"”]$/.test(shown) ||
+                            shown.length - lastShown.length > 200)
+                    ) {
+                        lastShown = shown
+                        lastEdit = now
+                        placeholder.edit(shown + ' ▌').catch(() => {})
+                    }
                 }
                 // No early break past MAX_LEN: edits stop (gate above) but the
                 // stream keeps draining, so the caller gets the COMPLETE reply
