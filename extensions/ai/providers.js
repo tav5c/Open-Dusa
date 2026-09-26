@@ -386,7 +386,14 @@ export class ProviderCore {
                     for (let hop = 1; hop < ring; hop++) {
                         const retryMs = this._parseRetryMs(lastErr)
                         const status = this._errorStatus(lastErr)
-                        if (!this._rotateProviderKey(p, retryMs, status ? `HTTP ${status}` : 'key error', lastErr))
+                        if (
+                            !this._rotateProviderKey(
+                                p,
+                                retryMs,
+                                status ? `HTTP ${status}` : 'key error',
+                                lastErr,
+                            )
+                        )
                             break
                         try {
                             const r2 = await p.client.chat.completions.create(payload)
