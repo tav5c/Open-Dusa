@@ -46,6 +46,10 @@ export class ResearchCore extends ProviderCore {
         // Fair-share: research calls are the heaviest per unit (retrieved
         // context + tool rounds). Null fairCtx = ungated (background paths).
         // Factory mode: concurrent identical research shares one flight.
+        // Clean once here so every search path (direct, tool loop, fallback
+        // hops) queries the topic, not the command wrapping ("tell me",
+        // "(look it up)"). Callers keep the raw prompt for synthesis.
+        prompt = this._extractSearchQuery(prompt)
         const run = async () => {
             // Tavily once per turn, not once per fallback hop: the query is
             // identical for primary + fallbacks, so re-searching burns up to
@@ -456,7 +460,7 @@ export class ResearchCore extends ProviderCore {
                 'i',
             ),
             new RegExp(
-                `^(?:can ${you}\\s+|could ${you}\\s+)?(?:please\\s+)?search(?:\\s+up|\\s+for)?\\s+`,
+                `^(?:can ${you}\\s+|could ${you}\\s+)?(?:please\\s+)?search\\s+(?:(?:up|for|it|this|that|me)\\b\\s*)+`,
                 'i',
             ),
             new RegExp(`^(?:can ${you}\\s+|could ${you}\\s+)?(?:please\\s+)?look\\s+up\\s+`, 'i'),
@@ -468,12 +472,14 @@ export class ResearchCore extends ProviderCore {
             new RegExp(`^(?:can ${you}\\s+|could ${you}\\s+)?(?:please\\s+)?list\\s+`, 'i'),
             new RegExp(`^(?:can ${you}\\s+|could ${you}\\s+)?(?:please\\s+)?what(?:'s| is)\\s+`, 'i'),
             new RegExp(`^(?:can ${you}\\s+|could ${you}\\s+)?(?:please\\s+)?who(?:'s| is)\\s+`, 'i'),
-            new RegExp(`^(?:can ${you}\\s+|could ${you}\\s+)?(?:please\\s+)?google\\s+`, 'i'),
+            new RegExp(
+                `^(?:can ${you}\\s+|could ${you}\\s+)?(?:please\\s+)?google\\s+(?:(?:it|this|that|for\\s+me)\\b\\s*)+`,
+                'i',
+            ),
             new RegExp(`^(?:can ${you}\\s+|could ${you}\\s+)?(?:please\\s+)?show me\\s+`, 'i'),
-            /^research\s+/i,
+            /^research\s+(?:it\s+up|this\s+up|that\s+up|for\s+me|about|on\b)\s*/i,
         ]
         for (const p of prefixes) q = q.replace(p, '').trim()
-        q = q.replace(/\s+for me\.?$|\s+please\.?$/i, '').trim()
         q = q.replace(/\s+for me\.?$|\s+please\.?$/i, '').trim()
         // Parenthetical asides to the bot ("(look it up)", "(search this)")
         // are instructions, not search terms — drop them from the query.
