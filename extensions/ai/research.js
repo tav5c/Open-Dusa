@@ -432,6 +432,12 @@ export class ResearchCore extends ProviderCore {
         let q = prompt.trim()
         // Strip leading greetings and filler words
         q = q.replace(/^(?:hi+|hey+|yo+|sup|hello|oi|ok|okay)[,!\s]+/i, '').trim()
+        // Trailing instruction verbs ("fake info do web research"): the
+        // ask is the topic, the verb phrase is not. Runs before the plain
+        // tail-word strip below so "do web research" goes whole, not piecemeal.
+        q = q
+            .replace(/(?:^|\s+)(?:do|perform|run|make)(?: a)?\s+(?:web\s+)?(?:research|search)\s*\.?$/i, '')
+            .trim()
         // Strip trailing "…and research" / "…research for me" so the query stays clean
         q = q
             .replace(/\s+(?:and\s+)?research(?:\s+for\s+me|\s+it\s+up|\s+this\s+up|\s+that\s+up)?\.?$/i, '')
@@ -464,6 +470,7 @@ export class ResearchCore extends ProviderCore {
             /^research\s+/i,
         ]
         for (const p of prefixes) q = q.replace(p, '').trim()
+        q = q.replace(/\s+for me\.?$|\s+please\.?$/i, '').trim()
         q = q.replace(/\s+for me\.?$|\s+please\.?$/i, '').trim()
         // Parenthetical asides to the bot ("(look it up)", "(search this)")
         // are instructions, not search terms — drop them from the query.
