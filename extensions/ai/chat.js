@@ -1430,12 +1430,16 @@ and never narrate the research itself or its quality either way.`
             .replace(new RegExp(`^<@!?${this.client.user.id}>\\s*`), '')
             .trim()
         const searchLabel = this._extractSearchQuery(cleanMessage || prompt)
+            // Strip markdown-significant chars: inside backticks they can
+            // still trip client rendering (underscores showing literally).
+            .replace(/[`*_~|]/g, '')
+            .trim()
         let researchMsg = null
 
         try {
             researchMsg = await this.secureReply(
                 message,
-                `${SEARCH_EMOJIS[Math.floor(Math.random() * SEARCH_EMOJIS.length)]} Doing a web research about \`${searchLabel.slice(0, 70)}\`...`,
+                `${SEARCH_EMOJIS[Math.floor(Math.random() * SEARCH_EMOJIS.length)]} Doing a web research about "${searchLabel.slice(0, 70)}"...`,
                 { allowedMentions: { parse: [] } },
             )
         } catch {}
@@ -1444,6 +1448,14 @@ and never narrate the research itself or its quality either way.`
             guildId: message?.guild?.id,
             priority: String(message?.author?.id) === String(this.ownerId) || !message?.guild,
         })
+
+        // Research payload is in: retire the notice now so the long
+        // synthesis + streamed rewrite below play out on the stream stub
+        // alone instead of stacking a second placeholder.
+        if (researchMsg) {
+            researchMsg.delete().catch(() => {})
+            researchMsg = null
+        }
 
         let responsePayload = null
         // Provenance for the second-thought pass: what was checked and against what.
