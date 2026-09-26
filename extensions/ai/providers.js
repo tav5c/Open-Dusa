@@ -228,16 +228,27 @@ export class ProviderCore {
     }
 
     // Advance a router provider to its next usable key and rebuild its client.
-    // Returns false when every key is still cooling down.
-    _rotateProviderKey(p, retryMs, reason = 'key error') {
+    // Returns false when every key is still cooling down. Keys that come back
+    // dead (restricted org, revoked key) are parked permanently instead of
+    // cooling down and getting retried on the next cycle.
+    _rotateProviderKey(p, retryMs, reason = 'key error', err = null) {
         const n = p.keys?.length ?? 0
         if (n < 2) return false
         p.state.keyIdx ??= 0
         p.state.keyCooldowns ??= new Map()
-        p.state.keyCooldowns.set(p.state.keyIdx, Date.now() + Math.max(retryMs, 5_000))
+        p.state.deadKeys ??= new Set()
+        if (err && this._isDeadKeyError(err)) {
+            p.state.deadKeys.add(p.state.keyIdx)
+            console.warn(
+                `[AI] Provider '${p.name}' key ${p.state.keyIdx + 1} parked (dead: ${String(err?.message ?? err).slice(0, 80)})`,
+            )
+        } else {
+            p.state.keyCooldowns.set(p.state.keyIdx, Date.now() + Math.max(retryMs, 5_000))
+        }
         const now = Date.now()
         for (let step = 1; step <= n; step++) {
             const next = (p.state.keyIdx + step) % n
+            if (p.state.deadKeys.has(next)) continue
             if ((p.state.keyCooldowns.get(next) ?? 0) > now) continue
             try {
                 p.client = new OpenAI({
@@ -263,14 +274,14 @@ export class ProviderCore {
      * honored verbatim, providers already configured for it go first so chat doesn't burn
      * a doomed call (e.g. asking groq for xkiro's qwen model) on every single message.
      */
-    async _routedCall(messages, model, maxTokens, temp, topP, budget = null) {
+    async _routedCall(messages, model, maxTokens, temp, topP, budget = null, preferredBase = null) {
         if (!this._providers) this._initProviders()
         const now = Date.now()
         // Stable sort: the agent's pinned provider first (it owns this model family —
         // avoids a doomed cross-provider call when the slug is aggregator-specific,
         // e.g. OpenRouter-style `:free` suffixes that 404 elsewhere), then exact
         // model matches, otherwise priority order.
-        const preferredBase = this.llmBaseUrl
+        preferredBase ??= this.llmBaseUrl
         const ordered = [...this._providers].sort((a, b) => {
             const pref = (b.baseUrl === preferredBase ? 1 : 0) - (a.baseUrl === preferredBase ? 1 : 0)
             if (pref !== 0) return pref
@@ -300,6 +311,14 @@ export class ProviderCore {
                 continue // breaker open
             }
             attempts++
+            // Same base + same model already attempted this reply (router hop
+            // then legacy/fallback re-fire): skip the duplicate outright.
+            const triedKey = `${p.baseUrl}|${model ?? this.aiModel}`
+            if (budget?.tried?.has(triedKey)) {
+                noteFailure(p, 'already tried this reply')
+                continue
+            }
+            budget?.tried?.add(triedKey)
             const payload = {
                 ...this._buildPayload(model ?? this.aiModel, messages, maxTokens, temp, topP, p.baseUrl),
                 stream: false,
@@ -367,7 +386,7 @@ export class ProviderCore {
                     for (let hop = 1; hop < ring; hop++) {
                         const retryMs = this._parseRetryMs(lastErr)
                         const status = this._errorStatus(lastErr)
-                        if (!this._rotateProviderKey(p, retryMs, status ? `HTTP ${status}` : 'key error'))
+                        if (!this._rotateProviderKey(p, retryMs, status ? `HTTP ${status}` : 'key error', lastErr))
                             break
                         try {
                             const r2 = await p.client.chat.completions.create(payload)
@@ -845,7 +864,7 @@ export class ProviderCore {
             // (request errors like 400/404 are the caller's fault, not the key's).
             if (routerP) {
                 if (this._isKeyError(e))
-                    this._rotateProviderKey(routerP, this._parseRetryMs(e), 'stream open')
+                    this._rotateProviderKey(routerP, this._parseRetryMs(e), 'stream open', e)
                 else if (!this._isRequestError(e)) this._tripBreaker(routerP, e)
             }
             try {
@@ -902,6 +921,8 @@ export class ProviderCore {
         if (!entry?.baseUrl || !entry?.keys?.length || !entry?.model) return null
         if (budget && Date.now() > budget.until) return null
         if (budget?.dead.has(entry.baseUrl)) return null
+        if (budget?.tried?.has(`${entry.baseUrl}|${entry.model}`)) return null
+        budget?.tried?.add(`${entry.baseUrl}|${entry.model}`)
         const routerP = (this._providers ?? []).find((p) => p.baseUrl === entry.baseUrl)
         if (routerP && Date.now() < (routerP.state.openUntil ?? 0)) return null
         const client = routerP?.client ?? this._fallbackClient(entry)
@@ -950,10 +971,24 @@ export class ProviderCore {
         const budget = budgetIn ?? {
             until: Date.now() + (this._replyBudgetMs ?? 30_000),
             dead: new Set(),
+            tried: new Set(),
         }
+        budget.tried ??= new Set()
+        // Route toward the requesting agent's own provider when it has one
+        // (quickAgent on xkiro must not open on groq just because chat lives
+        // there); otherwise the chat base stays preferred.
+        const agentBase = this._config?.agents?.[agent]?.resolved?.baseUrl ?? this.llmBaseUrl
         if (this._providers?.length > 1) {
-            const routed = await this._routedCall(messages, model, maxTokens, temp, topP, budget)
+            const routed = await this._routedCall(messages, model, maxTokens, temp, topP, budget, agentBase)
             if (routed) return routed
+            // The legacy client lives on the chat base: only worth one hop
+            // when this agent shares it, otherwise it re-fires a pair the
+            // router (or the agent chain below) already covers.
+            if (agentBase === this.llmBaseUrl && !budget.tried.has(`${this.llmBaseUrl}|${model}`)) {
+                budget.tried.add(`${this.llmBaseUrl}|${model}`)
+                const legacy = await this._groqCall(messages, model, maxTokens, temp, topP)
+                if (legacy && !legacy.capacityError) return legacy
+            }
         } else {
             const result = await this._groqCall(messages, model, maxTokens, temp, topP)
             if (result && !result.capacityError) return result

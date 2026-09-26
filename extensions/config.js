@@ -301,6 +301,10 @@ export function normalizeConfig(raw) {
         // explicit provider still resolve.
         fallbacks: resolveFallbacks(fallbackRaw(qa), null, providers),
     }
+    // Optional pin: without it the quick agent rides the chat provider.
+    // The router uses this as its preferred base so xkiro slugs are never
+    // opened on groq first.
+    quickAgent.resolved = resolveAgentProvider(providers, qa.provider) ?? chat.resolved
 
     // Legacy top-level fallbackModels: historically tried on the chat provider
     // only. Merged into the chat chain (deduped) so there is exactly one
