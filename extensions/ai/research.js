@@ -433,14 +433,17 @@ export class ResearchCore extends ProviderCore {
         // Strip leading greetings and filler words
         q = q.replace(/^(?:hi+|hey+|yo+|sup|hello|oi|ok|okay)[,!\s]+/i, '').trim()
         // Trailing instruction verbs ("fake info do web research"): the
-        // ask is the topic, the verb phrase is not. Runs before the plain
-        // tail-word strip below so "do web research" goes whole, not piecemeal.
+        // ask is the topic, the verb phrase is not. Requires "web" so
+        // activity-form asks ("where do I do research") survive intact.
         q = q
-            .replace(/(?:^|\s+)(?:do|perform|run|make)(?: a)?\s+(?:web\s+)?(?:research|search)\s*\.?$/i, '')
+            .replace(/(?:^|\s+)(?:do|perform|run|make)(?: a)?\s+web\s+(?:research|search)\s*\.?$/i, '')
             .trim()
-        // Strip trailing "…and research" / "…research for me" so the query stays clean
+        // Strip trailing "…and research" / "…research for me" so the query stays clean.
+        // Bare trailing "research" alone is left intact ("I do research" is
+        // a topic, not an instruction) — the verb-phrase rule above owns those.
         q = q
-            .replace(/\s+(?:and\s+)?research(?:\s+for\s+me|\s+it\s+up|\s+this\s+up|\s+that\s+up)?\.?$/i, '')
+            .replace(/\s+and\s+research(?:\s+for\s+me|\s+it\s+up|\s+this\s+up|\s+that\s+up)?\.?$/i, '')
+            .replace(/\s+research\s+(?:for\s+me|it\s+up|this\s+up|that\s+up)\.?$/i, '')
             .trim()
         const you = '(?:you|u|ya)'
         const prefixes = [
