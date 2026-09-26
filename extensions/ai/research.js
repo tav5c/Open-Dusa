@@ -454,6 +454,9 @@ export class ResearchCore extends ProviderCore {
             new RegExp(`^(?:can ${you}\\s+|could ${you}\\s+)?(?:please\\s+)?lookup\\s+`, 'i'),
             new RegExp(`^(?:can ${you}\\s+|could ${you}\\s+)?(?:please\\s+)?find(?:\\s+me)?\\s+`, 'i'),
             new RegExp(`^(?:can ${you}\\s+|could ${you}\\s+)?(?:please\\s+)?tell me about\\s+`, 'i'),
+            new RegExp(`^(?:can ${you}\\s+|could ${you}\\s+)?(?:please\\s+)?tell me\\s+`, 'i'),
+            new RegExp(`^(?:can ${you}\\s+|could ${you}\\s+)?(?:please\\s+)?give me\\s+`, 'i'),
+            new RegExp(`^(?:can ${you}\\s+|could ${you}\\s+)?(?:please\\s+)?list\\s+`, 'i'),
             new RegExp(`^(?:can ${you}\\s+|could ${you}\\s+)?(?:please\\s+)?what(?:'s| is)\\s+`, 'i'),
             new RegExp(`^(?:can ${you}\\s+|could ${you}\\s+)?(?:please\\s+)?who(?:'s| is)\\s+`, 'i'),
             new RegExp(`^(?:can ${you}\\s+|could ${you}\\s+)?(?:please\\s+)?google\\s+`, 'i'),
@@ -462,6 +465,15 @@ export class ResearchCore extends ProviderCore {
         ]
         for (const p of prefixes) q = q.replace(p, '').trim()
         q = q.replace(/\s+for me\.?$|\s+please\.?$/i, '').trim()
+        // Parenthetical asides to the bot ("(look it up)", "(search this)")
+        // are instructions, not search terms — drop them from the query.
+        q = q
+            .replace(
+                /\(\s*(?:look(?: it)? up|search(?: it)?(?: up)?|research(?: this)?|google(?: it)?|find(?: it)?(?: that)?(?: out)?)\s*\)/gi,
+                '',
+            )
+            .replace(/\s{2,}/g, ' ')
+            .trim()
         return q.length > 3 ? q : prompt.trim()
     }
     // Classifier with its own fallback chain: primary pinned client first,

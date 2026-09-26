@@ -1439,7 +1439,7 @@ and never narrate the research itself or its quality either way.`
         try {
             researchMsg = await this.secureReply(
                 message,
-                `${SEARCH_EMOJIS[Math.floor(Math.random() * SEARCH_EMOJIS.length)]} Doing a web research about "${searchLabel.slice(0, 70)}"...`,
+                `${SEARCH_EMOJIS[Math.floor(Math.random() * SEARCH_EMOJIS.length)]} Doing a web research about \`${searchLabel.slice(0, 70)}\`...`,
                 { allowedMentions: { parse: [] } },
             )
         } catch {}
