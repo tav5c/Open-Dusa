@@ -1148,7 +1148,10 @@ and never narrate the research itself or its quality either way.`
             /^(why|how|explain|analyse|analyze|compare|should|what if|whatif)\b/i.test(text.trim()) ||
             // Strong technical verbs anywhere: a mid-sentence "compare" or
             // "explain" is never banter ("can you compare the rx 9070…").
+            // "X vs Y" is the same shape without the verb — gated past
+            // 4 words so bare "you vs me fr" stays cheap.
             /\b(explain|analyse|analyze|compare)\b/i.test(text) ||
+            (words > 4 && /\b(vs|versus)\b/i.test(text)) ||
             // Weak question words only with a trailing ?: bare "how" shows
             // up in greetings ("hey how are you doing today my friend…").
             (/\b(why|how|should)\b/i.test(text) && /\?\s*$/.test(text.trim())) ||
