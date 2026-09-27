@@ -1114,8 +1114,11 @@ and never narrate the research itself or its quality either way.`
     }
     // Raw mode with the default folded in: absent entry = auto (3).
     // Explicit normal stores 0, so "never chose" and "chose normal"
-    // stay distinguishable.
+    // stay distinguishable. Null userId (background/system calls:
+    // verdicts, summaries, roasts) stays 0 — deterministic default
+    // chain, never auto-routed or style-suffixed.
     _rawMode(userId) {
+        if (userId == null) return 0
         return this.userModes?.[userId] ?? 3
     }
     // Effective chat model + fallback chain for this user. Named modes with

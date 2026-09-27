@@ -47,19 +47,22 @@
             "fallback": "groq/compound,groq/compound-mini",
             "temperature": 0.6,
             "topP": 1,
-            "maxTokens": 1256
+            "maxTokens": 1256,
+            "reasoningEffort": "medium"
         },
         "vision": {
             "provider": "nvidia",
             "model": "nvidia/nemotron-nano-12b-v2-vl",
             "temperature": 0.4,
             "topP": 1,
-            "maxTokens": 1256
+            "maxTokens": 1256,
+            "reasoningEffort": "low"
         },
         "classifier": {
             "provider": "nvidia",
             "model": "meta/llama-3.1-8b-instruct",
             "temperature": 0,
+            "reasoningEffort": "off",
             "maxTokens": 64
         },
         "quickAgent": {
@@ -67,6 +70,7 @@
             "temperature": 0.75,
             "topP": 1,
             "maxTokens": 1256,
+            "reasoningEffort": "low",
             "allowResearch": true,
             "systemPrompt": [
                 "You are Medusa's Quick-Agent, a fast, stateless slash-command assistant. You're still Medusa: smart, warm, genuinely helpful, minus the chat persona theatrics.",
