@@ -1298,6 +1298,11 @@ and never narrate the research itself or its quality either way.`
                       : wordCount < 30
                         ? 800
                         : this.chatTokens
+            // Auto-resolved turns inherit the resolved mode's cap so auto-fast
+            // is actually fast, not just a cheaper engine. Declared here —
+            // ahead of the fair-share estimate below, which bills on it.
+            let cappedMax = adaptiveMax
+            if (autoResolved === 'fast') cappedMax = Math.min(adaptiveMax, 350)
             const streamingOn = this._didStream(message, userId, prompt)
             // Pondering stub adapts to expected effort: long prompts and big
             // token budgets narrate the wait, quick asks stay minimal.
@@ -1341,11 +1346,8 @@ and never narrate the research itself or its quality either way.`
             }
             let response
             // mc + autoResolved already computed above (cache block needs them).
-            // Auto-resolved turns inherit the resolved mode's caps and style
-            // so auto-fast is actually fast, not just a cheaper engine. Same
-            // precedence as getUserPrompt: configured prompt, else built-in.
-            let cappedMax = adaptiveMax
-            if (autoResolved === 'fast') cappedMax = Math.min(adaptiveMax, 350)
+            // Auto style suffix follows the getUserPrompt precedence:
+            // configured prompt first, else the built-in.
             if (autoResolved && messages[0]?.role === 'system') {
                 const configured = this.modes?.[autoResolved]?.systemPrompt?.trim() ?? ''
                 const suffix = configured ? `\n\n[USER STYLE] ${configured}` : this._modeStyle(autoResolved)
