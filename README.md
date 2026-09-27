@@ -91,7 +91,7 @@ open-dusa/
 ### 2. Install
 
 ```bash
-git clone https://github.com/your-username/Open-Dusa
+git clone https://github.com/tav5c/Open-Dusa
 cd Open-Dusa
 npm install
 ```
