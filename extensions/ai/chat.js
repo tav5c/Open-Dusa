@@ -170,6 +170,10 @@ export class AIChatManager extends OutputCore {
         this._triggerRegexes = this.triggerWords.map(
             (w) => new RegExp(`\\b${w.replace(/[.*+?^${}()|[\]\\]/g, '\\$&')}\\b`),
         )
+        // Own-mention regexes, same treatment: six call sites used to build
+        // these fresh on every message. Lazily keyed on our id (stable).
+        this._botRxId = null
+        this._botRx = null
 
         // Credentials, the chat agent's resolved provider is the primary client;
         // rotateKey() walks these keys on 429/401.
@@ -1450,7 +1454,7 @@ and never narrate the research itself or its quality either way.`
 
         const bareQuestion =
             prompt.match(/\nUser's message:\s*([\s\S]+)$/)?.[1]?.trim() ??
-            message.content.replace(new RegExp(`^<@!?${this.client.user.id}>\\s*`), '').trim()
+            (message?.content ?? '').replace(this._botRxes().strip, '').trim()
         let routing = await this.needsResearch(bareQuestion)
 
         // Censor toggle: with nsfw:true the canned refusals below are skipped and
@@ -1517,9 +1521,7 @@ and never narrate the research itself or its quality either way.`
 
         // Research path
         const t0 = Date.now()
-        const cleanMessage = message.content
-            .replace(new RegExp(`^<@!?${this.client.user.id}>\\s*`), '')
-            .trim()
+        const cleanMessage = (message?.content ?? '').replace(this._botRxes().strip, '').trim()
         const searchLabel = this._extractSearchQuery(cleanMessage || prompt)
             // Strip markdown-significant chars: inside backticks they can
             // still trip client rendering (underscores showing literally).
@@ -1716,6 +1718,22 @@ and never narrate the research itself or its quality either way.`
     }
 
     // Message handling
+    // Compiled own-mention regexes (strip / start-ping / anywhere),
+    // cached by bot id instead of rebuilt per message.
+    _botRxes() {
+        const id = this.client.user.id
+        if (this._botRxId !== id) {
+            this._botRxId = id
+            this._botRx = {
+                strip: new RegExp(`^<@!?${id}>\\s*`),
+                // (?:\s|$) so a bare mention at end-of-string (mention-only
+                // summons with an image, no text) still counts.
+                startPing: new RegExp(`^<@!?${id}>(?:\\s|$)`),
+                anywhere: new RegExp(`<@!?${id}>`),
+            }
+        }
+        return this._botRx
+    }
     shouldIgnore(message) {
         if (message.author.bot || message.author.id === this.client.user.id) return true
         if (message.guild && this.allowedGuilds.size && !this.allowedGuilds.has(message.guild.id)) return true
@@ -1735,13 +1753,15 @@ and never narrate the research itself or its quality either way.`
         // Mention-only messages ("@Medusa" + image, no text): the trailing
         // \s+ used to miss a bare mention at end-of-string, so image-only
         // summons never triggered in regular channels. (?:\s|$) fixes it.
-        const botMentionRx = new RegExp(`^<@!?${this.client.user.id}>(?:\\s|$)`)
+        const botMentionRx = this._botRxes().startPing
         // True = user typed @Medusa as the first token of the message, intentionally summoning her.
         // This holds even when the message is ALSO a reply: Discord does NOT inject the reply
         // auto-ping into message.content, so a typed @ping at the start is always a real summon
         // (a bare reply with no typed mention won't match and stays silent in non-active channels).
         // Empty text is fine: attachments (images/files) are the content —
         // vision/text-ingest paths default their prompts when words are absent.
+        // startsWithExplicitPing is the @-at-start summon; mentionedAnywhere
+        // below is the typed-@-anywhere fallback (parsed mentions, raw match).
         const startsWithExplicitPing = botMentionRx.test(content)
         // A typed @Medusa ANYWHERE in the message is an intentional summon (Discord
         // only puts it in content/mentions when the user actually picked her — a
@@ -1749,9 +1769,7 @@ and never narrate the research itself or its quality either way.`
         // primary signal, raw-content match is the fallback.
         const botId = this.client.user.id
         const mentionedAnywhere =
-            message.mentions?.users?.has(botId) === true || new RegExp(`<@!?${botId}>`).test(content)
-        // Mid-sentence mentions count as a summon in always-active channels/DMs.
-        const mentioned = startsWithExplicitPing
+            message.mentions?.users?.has(botId) === true || this._botRxes().anywhere.test(content)
 
         const isDM = message.channel.type === 1 && this.allowDM
         const inAlways = this.alwaysActiveCh.has(message.channel.id)
@@ -1777,9 +1795,9 @@ and never narrate the research itself or its quality either way.`
         // "yeah @Medusa what do you think?" is unambiguously summoning her.
         // Regular channels: ONLY an explicit @Medusa at the start of the message.
         // (No keyword match, no reply, no conv-continuation in regular channels.)
-        if (isDM) trigger = hasTrig || mentioned || mentionedAnywhere || repliedToBot || inConv
+        if (isDM) trigger = hasTrig || startsWithExplicitPing || mentionedAnywhere || repliedToBot || inConv
         else if (inAlways && (!repliedToOther || mentionedAnywhere))
-            trigger = hasTrig || mentioned || mentionedAnywhere || repliedToBot || inConv
+            trigger = hasTrig || startsWithExplicitPing || mentionedAnywhere || repliedToBot || inConv
         else if (startsWithExplicitPing) trigger = true
 
         if (trigger) {
@@ -1788,7 +1806,7 @@ and never narrate the research itself or its quality either way.`
             return {
                 kind: 'trigger',
                 reason:
-                    mentioned || mentionedAnywhere
+                    startsWithExplicitPing || mentionedAnywhere
                         ? 'mention'
                         : hasTrig
                           ? 'keyword'
@@ -1899,11 +1917,10 @@ and never narrate the research itself or its quality either way.`
             const memOff = this.isMemOff(userId)
             const username = message.author.username
             const displayName = message.member?.displayName ?? username
-            let content = customPrompt || message.content
+            let content = customPrompt || message.content || ''
             // NOTE (reassigned below): time fast-paths may append resolved
             // [TIME DATA] for the model to voice when token-saver is off.
-            const bareQ =
-                content.replace(new RegExp(`^<@!?${this.client.user.id}>\\s*`), '').trim() || content
+            const bareQ = content.replace(this._botRxes().strip, '').trim() || content
             // Normalized copy for time asks: "rn" is "right now" in chat
             // shorthand, and fat-finger typos (waht/tiem) break the anchored
             // patterns below. Time tests read timeQ, never bareQ.
@@ -2828,23 +2845,20 @@ and never narrate the research itself or its quality either way.`
 
         const isReplyToMe = repliedTo?.id === this.client.user.id
 
-        const _botMentionRx = new RegExp(`^<@!?${this.client.user.id}>\\s+`)
         // A typed @ping at the start counts as a summon even if the message is also a reply to her.
         // (Discord doesn't put the reply auto-ping into raw content, so a bare reply still won't match.)
-        const startsWithExplicitPing = _botMentionRx.test(raw)
+        const startsWithExplicitPing = this._botRxes().startPing.test(raw)
         const hasTrig = this._triggerRegexes.some((rx) => rx.test(lower))
-        const isMention = startsWithExplicitPing
         // Anywhere-mention: a typed @Medusa mid-sentence summons her in
         // always-active channels (parsed mentions first, raw-content fallback).
         const mentionedAnywhere =
-            message.mentions?.users?.has(this.client.user.id) === true ||
-            new RegExp(`<@!?${this.client.user.id}>`).test(raw)
+            message.mentions?.users?.has(this.client.user.id) === true || this._botRxes().anywhere.test(raw)
         const isAlways = this.alwaysActiveCh.has(message.channel.id)
 
         let trigger = false
         let prompt = raw
 
-        if (isAlways && (isMention || mentionedAnywhere || isReplyToMe || hasTrig)) {
+        if (isAlways && (startsWithExplicitPing || mentionedAnywhere || isReplyToMe || hasTrig)) {
             trigger = true
             if (replyCtx)
                 prompt = `${replyCtx}

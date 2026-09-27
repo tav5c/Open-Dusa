@@ -66,6 +66,11 @@ async function buildRecallText(ai, guild, authorId, isMod, query, { ephemeralHin
 
 const PERF = loadPerformance()
 
+// User chat modes, single-sourced: 0 normal (default, no stored entry),
+// 1 focused, 2 fast, 3 auto (resolved per message in _autoMode).
+const MODE_NAMES = ['normal', 'focused', 'fast', 'auto']
+const modeLabel = (n) => MODE_NAMES[n] ?? 'normal'
+
 // Register function (called from index.js)
 let OWNER_ID = null
 const ownerOnly = (fn) => async (msg, args) => {
@@ -817,7 +822,6 @@ export async function registerAI(client, db, config) {
         if (commandName === 'mode') {
             const input = interaction.options.getString('mode')
             const uid2 = interaction.user.id
-            const modeLabel = (n) => ['normal', 'focused', 'fast', 'auto'][n] ?? 'normal'
             if (!input) {
                 const cur = ai.userModes[uid2] ?? 0
                 return interaction.reply({
@@ -1250,7 +1254,7 @@ export async function registerAI(client, db, config) {
         if (!input) {
             const cur = ai.userModes[uid] ?? 0
             return msg.reply(
-                `Your current mode: **${['normal', 'focused', 'fast', 'auto'][cur] ?? 'normal'}** (${cur}). Use \`${config.prefix}mode focused\`, \`${config.prefix}mode normal\`, \`${config.prefix}mode fast\`, or \`${config.prefix}mode auto\`.`,
+                `Your current mode: **${modeLabel(cur)}** (${cur}). Use \`${config.prefix}mode focused\`, \`${config.prefix}mode normal\`, \`${config.prefix}mode fast\`, or \`${config.prefix}mode auto\`.`,
             )
         }
         let newMode = null
@@ -1263,7 +1267,7 @@ export async function registerAI(client, db, config) {
         if (newMode === 0) delete ai.userModes[uid]
         else ai.userModes[uid] = newMode
         ai._scheduleUsersSave()
-        const modeName = ['normal', 'focused', 'fast', 'auto'][newMode] ?? 'normal'
+        const modeName = modeLabel(newMode)
         // Auto varies per message — naming one engine would be wrong, so
         // don't resolve it here.
         if (newMode === 3) return msg.reply(`✅ Switched to **auto mode** (fast/normal/focused per message)`)

@@ -53,7 +53,7 @@ export function registerVoice(client, ownerId) {
             })
             await reply({ content: `🔊 Joined **${vc.name}**.` })
         } catch (e) {
-            await reply({ content: `❌ Couldn't join: ${e.message}` })
+            await reply({ content: `❌ Couldn't join: ${String(e?.message ?? e).slice(0, 120)}` })
         }
     }
 
@@ -69,7 +69,7 @@ export function registerVoice(client, ownerId) {
             conn.destroy()
             await reply({ content: '👋 Left voice.' })
         } catch (e) {
-            await reply({ content: `❌ Couldn't leave: ${e.message}` })
+            await reply({ content: `❌ Couldn't leave: ${String(e?.message ?? e).slice(0, 120)}` })
         }
     }
 
