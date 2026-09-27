@@ -2874,7 +2874,7 @@ ${raw || 'what do you see'}`
                 : raw || 'what do you see'
         } else if (startsWithExplicitPing) {
             // Regular channel: ONLY an explicit @Medusa at the start (not a reply-auto-ping)
-            const cleaned = raw.replace(_botMentionRx, '').trim()
+            const cleaned = raw.replace(this._botRxes().strip, '').trim()
             if (cleaned) {
                 trigger = true
                 prompt = replyCtx
