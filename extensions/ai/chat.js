@@ -24,7 +24,7 @@ import { join } from 'path'
 import { performance } from 'perf_hooks'
 import { loadPerformance } from '../performance.js'
 import {
-    ALWAYS_LIVE,
+    ALWAYS_LIVE_RE,
     CAPABILITIES_NOTE,
     DESTRUCTIVE_CMDS,
     NEVER_RESEARCH_PREFIXES,
@@ -565,7 +565,7 @@ export class AIChatManager extends OutputCore {
                 if (server && !containsDisallowedHate(server, { persona: true }))
                     out = `You are Medusa. This server runs its own persona, adopt it fully here:\n\n[SERVER PERSONA] ${server}${identity}\n\n${SAFETY_POLICY}`
             }
-            const mode = this.userModes[userId] ?? 0
+            const mode = this._rawMode(userId)
             const modeName = { 0: 'normal', 1: 'focused', 2: 'fast' }[mode] ?? null
             const modePrompt = (modeName && this.modes?.[modeName]?.systemPrompt) || ''
             // Config prompt first (yours), then the style suffix: the persona
@@ -846,7 +846,7 @@ TIME: ${new Date().toISOString().slice(0, 16)} UTC${personaOwned ? '' : '\nVOICE
         )
         // Auto users get no engine name here: this note is built (and cached)
         // before the turn resolves, and per-turn resolution may differ.
-        const _autoRaw = (this.userModes?.[userId] ?? 0) === 3
+        const _autoRaw = this._rawMode(userId) === 3
         const _mc = _autoRaw ? null : this._modeChat(userId, message?.content, message)
         const _engine = _autoRaw
             ? 'auto (fast/normal/focused per message)'
@@ -1112,18 +1112,25 @@ and never narrate the research itself or its quality either way.`
             return `\n\n[USER STYLE] Fast mode: ultrashort replies, answer in as few words as possible while staying in character. No preamble, no follow-ups, minimal emoji.`
         return ''
     }
+    // Raw mode with the default folded in: absent entry = auto (3).
+    // Explicit normal stores 0, so "never chose" and "chose normal"
+    // stay distinguishable.
+    _rawMode(userId) {
+        return this.userModes?.[userId] ?? 3
+    }
     // Effective chat model + fallback chain for this user. Named modes with
     // their own model shadow the default; anything without one (including
     // an unconfigured normal) rides the chat agent untouched. Mode 3
     // (auto) resolves per turn in _autoMode below.
     _modeChat(userId, prompt = null, message = null, history = null) {
-        const rawMode = this.userModes?.[userId] ?? 0
+        const rawMode = this._rawMode(userId)
         let name = { 0: 'normal', 1: 'focused', 2: 'fast', 3: 'auto' }[rawMode] ?? null
         if (name === 'auto') {
             name = this._autoMode(prompt, message, history)
-            // One short line per auto turn: the only way to see what the
-            // router actually chose once this leaves the harness.
-            console.log(`[AI] Auto mode -> ${name ?? 'default'} (${userId})`)
+            // Auto is the default for everyone now: per-turn logging would
+            // bury real warnings. Debug flag only; errors still log loudly.
+            if (this._config?.debug === true)
+                console.log(`[AI] Auto mode -> ${name ?? 'default'} (${userId})`)
         }
         const m = (name && this.modes?.[name]) || null
         if (!m?.model) return { model: this.aiModel, chain: 'chat', name }
@@ -1199,7 +1206,7 @@ and never narrate the research itself or its quality either way.`
             // include it (a fast-model reply must never serve a focused
             // turn), and auto turns need caps + style applied post-hoc.
             const mc = this._modeChat(userId, message?.content ?? prompt, message, history)
-            const autoResolved = (this.userModes?.[userId] ?? 0) === 3 ? mc.name : null
+            const autoResolved = this._rawMode(userId) === 3 ? mc.name : null
             let cacheKey = null
             if (userId && prompt.length < 200) {
                 // Also strip the per-message volatile lines (second-resolution
@@ -1382,6 +1389,32 @@ and never narrate the research itself or its quality either way.`
             } finally {
                 fair?.release?.()
             }
+            // Auto safety net: a resolved mode chain that answers nothing
+            // (pinned provider down, chain exhausted) retries once on the
+            // default chat chain instead of serving silence. Non-streaming
+            // and budget-capped to what's left of this turn — the first
+            // attempt already spent most of the user's patience. Manual
+            // modes keep strict behavior: that engine was asked for.
+            if (!response && autoResolved && mc.chain !== 'chat') {
+                const elapsed = performance.now() - t0
+                const remaining = (this._replyBudgetMs ?? 30_000) - elapsed
+                if (remaining > 8_000) {
+                    console.log(`[AI] Auto ${autoResolved} chain dry, falling back to chat (${userId})`)
+                    response = await this._groqCallWithFallbacks(
+                        messages,
+                        this.aiModel,
+                        cappedMax,
+                        this.temperature,
+                        undefined,
+                        'chat',
+                        {
+                            until: Date.now() + Math.min(remaining, 15_000),
+                            dead: new Set(),
+                            tried: new Set(),
+                        },
+                    )
+                }
+            }
 
             if (!response) return null
             // Usage receipt for the billing footer (handleAIResponse reads and
@@ -1401,6 +1434,7 @@ and never narrate the research itself or its quality either way.`
                     inTok: Math.ceil(inChars / 4),
                     outTok: Math.ceil(response.length / 4),
                     secs: (performance.now() - t0) / 1000,
+                    effort: this._effortIntent(mc.chain),
                 })
             }
             if (this._isDegenerate(response)) {
@@ -1674,14 +1708,7 @@ and never narrate the research itself or its quality either way.`
                 // ("is 6*7 still 42?") burned a Tavily credit + synthesis +
                 // verdict 6-14s later, usually to print nothing.
                 const bt = String(bareQuestion ?? '').toLowerCase()
-                const liveAsk =
-                    /\b(20[2-9]\d|v?\d+\.\d+[\d.]*)\b/.test(bt) ||
-                    [...ALWAYS_LIVE].some((s) => {
-                        const n = s.trim()
-                        return (
-                            n && new RegExp(`\\b${n.replace(/[.*+?^${}()|[\]\\]/g, '\\$&')}\\b`, 'i').test(bt)
-                        )
-                    })
+                const liveAsk = /\b(20[2-9]\d|v?\d+\.\d+[\d.]*)\b/.test(bt) || ALWAYS_LIVE_RE.test(bt)
                 if (!liveAsk || this._searchOff()) return
                 const raw = await this._callResearch(bareQuestion, {
                     guildId: message?.guild?.id,
@@ -1841,7 +1868,10 @@ and never narrate the research itself or its quality either way.`
                 ? `${secs.toFixed(1)}s`
                 : `${Math.floor(secs / 60)}m${String(Math.floor(secs % 60)).padStart(2, '0')}s`
         const rate = `${Math.round(total / secs)} t/s`
-        return `\n\n-# ${fmt(u.inTok)}/${fmt(u.outTok)} · ${fmt(total)} T · ${dur} · ${rate}`
+        // Reasoning level that served this turn (off/low/med): dot-joined
+        // to the speed so cost surprises are visible, not archaeology.
+        const effLabel = { off: 'off', low: 'low', medium: 'med' }[u.effort] ?? null
+        return `\n\n-# ${fmt(u.inTok)}/${fmt(u.outTok)} · ${fmt(total)} T · ${dur} · ${rate}${effLabel ? ` · ${effLabel}` : ''}`
     }
     // File return: the user explicitly asked for a file ("send it as a file",
     // "save as foo.py") and the reply holds a fenced code block. Returns
@@ -2555,6 +2585,7 @@ and never narrate the research itself or its quality either way.`
         const gate = this.client.heart?.rateLimiter?.check(userId, { isStaff, isOwner })
         if (gate && !gate.ok) {
             console.debug(`[AI] Gated ${userId} (${gate.reason ?? 'rate'})`)
+            this.client.heart?.noteRateLimited?.()
             return
         }
         const now = Date.now()
@@ -2789,7 +2820,7 @@ and never narrate the research itself or its quality either way.`
         ts.push(now)
         this.spamProtect.set(message.author.id, ts)
 
-        const raw = message.content.trim()
+        const raw = (message.content ?? '').trim()
         const lower = raw.toLowerCase()
         const mention = `<@${this.client.user.id}>`
         const mentionAlt = `<@!${this.client.user.id}>`

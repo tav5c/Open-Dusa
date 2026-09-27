@@ -66,7 +66,11 @@ for (const legacy of ['configs/timezones.json', 'timezones.json']) {
 
 function getCache() {
     if (_cache === null) {
-        _cache = fs.existsSync(DATA_FILE) ? JSON.parse(fs.readFileSync(DATA_FILE, 'utf8')) : {}
+        try {
+            _cache = fs.existsSync(DATA_FILE) ? JSON.parse(fs.readFileSync(DATA_FILE, 'utf8')) : {}
+        } catch {
+            _cache = {}
+        }
     }
     return _cache
 }

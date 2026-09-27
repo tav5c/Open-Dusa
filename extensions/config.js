@@ -210,12 +210,36 @@ export function normalizeConfig(raw) {
     const primary = providers[0] ?? { baseUrl: 'https://api.groq.com/openai/v1', keys: [] }
     const a = raw.agents ?? {}
 
+    // Reasoning effort per agent/mode: off | low | medium. high clamps to
+    // medium (nothing we route supports it well enough to offer), garbage
+    // falls back to the per-agent default — never silently to low.
+    // off means "send none where the model expresses it, else low" — GPT-OSS
+    // on groq-direct has no off position, so off degrades to low there.
+    const normEffort = (v, fallback = 'low') => {
+        const map = (s) => {
+            if (s === 'off' || s === 'none' || s === 'disabled') return 'off'
+            if (s === 'medium' || s === 'med' || s === 'high' || s === 'xhigh' || s === 'max') return 'medium'
+            if (s === 'low' || s === 'minimal') return 'low'
+            return null
+        }
+        return (
+            map(
+                String(v ?? '')
+                    .trim()
+                    .toLowerCase(),
+            ) ??
+            map(String(fallback).trim().toLowerCase()) ??
+            'low'
+        )
+    }
+
     const chat = {
         provider: a.chat?.provider,
         model: a.chat?.model ?? raw.aiModel ?? 'openai/gpt-oss-120b',
         temperature: a.chat?.temperature ?? raw.temperature ?? 0.9,
         topP: a.chat?.topP ?? raw.topP ?? 1,
         maxTokens: a.chat?.maxTokens ?? raw.chatTokens ?? 1024,
+        reasoningEffort: normEffort(a.chat?.reasoningEffort, 'low'),
         systemPrompt: asPrompt(a.chat?.systemPrompt ?? raw.systemPrompt),
         identity: asPrompt(a.chat?.identity ?? raw.identity),
     }
@@ -233,6 +257,7 @@ export function normalizeConfig(raw) {
         temperature: a.research?.temperature ?? raw.researchTemp ?? 0.6,
         topP: a.research?.topP ?? raw.topP ?? 1,
         maxTokens: a.research?.maxTokens ?? raw.searchTokens ?? 1500,
+        reasoningEffort: normEffort(a.research?.reasoningEffort, 'medium'),
     }
     research.resolved = resolveAgentProvider(
         providers,
@@ -248,6 +273,7 @@ export function normalizeConfig(raw) {
         temperature: a.vision?.temperature ?? raw.visionTemp ?? 0.3,
         topP: a.vision?.topP ?? raw.topP ?? 1,
         maxTokens: a.vision?.maxTokens ?? raw.visionTokens ?? 512,
+        reasoningEffort: normEffort(a.vision?.reasoningEffort, 'low'),
     }
     vision.resolved = resolveAgentProvider(providers, vision.provider)
     vision.fallbacks = resolveFallbacks(fallbackRaw(a.vision), vision.resolved, providers)
@@ -269,6 +295,7 @@ export function normalizeConfig(raw) {
             (clfResolved?.baseUrl?.includes('nvidia') ? 'meta/llama-3.1-8b-instruct' : 'openai/gpt-oss-20b'),
         temperature: a.classifier?.temperature ?? 0,
         maxTokens: a.classifier?.maxTokens ?? 64,
+        reasoningEffort: normEffort(a.classifier?.reasoningEffort, 'off'),
     }
     classifier.resolved = clfResolved
     classifier.fallbacks = resolveFallbacks(fallbackRaw(a.classifier), clfResolved, providers)
@@ -285,6 +312,7 @@ export function normalizeConfig(raw) {
             provider: m.provider ?? null,
             model: typeof m.model === 'string' && m.model.trim() ? m.model.trim() : null,
             systemPrompt: asPrompt(m.systemPrompt),
+            reasoningEffort: normEffort(m.reasoningEffort, String(name) === 'focused' ? 'medium' : 'low'),
             resolved,
             fallbacks: resolveFallbacks(fallbackRaw(m), resolved, providers),
         }
@@ -295,6 +323,7 @@ export function normalizeConfig(raw) {
         temperature: qa.temperature ?? 0.4,
         topP: qa.topP ?? 0.9,
         maxTokens: qa.maxTokens ?? 1400,
+        reasoningEffort: normEffort(qa.reasoningEffort, 'low'),
         allowResearch: qa.allowResearch !== false,
         systemPrompt: asPrompt(qa.systemPrompt),
         // No own provider: plain-string fallbacks are skipped, entries with an

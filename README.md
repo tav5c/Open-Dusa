@@ -168,6 +168,7 @@ npm run dev      # development (auto-restart on file changes)
             "temperature": 0.9, // Chat creativity (0.0–2.0)
             "topP": 1.0,
             "maxTokens": 1024,
+            "reasoningEffort": "low", // off | low | medium per agent (research defaults medium, classifier off)
             "systemPrompt": "You are ...", // Her entire personality - better left as is
             "identity": "", // Facts that survive any persona swap (creator, links) - personas change her tune, not who she is
         },
@@ -225,13 +226,16 @@ npm run dev      # development (auto-restart on file changes)
     //     "mistralai/mistral-small-4-119b-2603"
     //   ]
 
-    // ─── Named chat modes (/mode focused, /mode fast) ───────────────────────
+    // ─── Named chat modes (/mode focused, /mode fast, /mode auto) ─────────────
     // Each mode optionally pins its own provider/model/fallback chain plus a
     // style prompt. No model = style-only mode on the chat default. The
     // custom persona still applies first; the mode only tunes how it talks.
+    // `auto` (the default when a user never picked) routes fast/normal/
+    // focused per message. `reasoningEffort` (off/low/medium) caps thinking
+    // depth per agent/mode; off sends none where expressible, else low.
     // "modes": {
-    //     "focused": { "provider": "groq", "model": "openai/gpt-oss-120b" },
-    //     "fast": { "provider": "groq", "model": "openai/gpt-oss-20b" }
+    //     "focused": { "provider": "groq", "model": "openai/gpt-oss-120b", "reasoningEffort": "medium" },
+    //     "fast": { "provider": "groq", "model": "openai/gpt-oss-20b", "reasoningEffort": "low" }
     // },
 
     // ─── Optional Integrations ───────────────────────────────────────────────
@@ -281,7 +285,7 @@ npm run dev      # development (auto-restart on file changes)
 
 ## Performance Tuning
 
-Open-Dusa ships with safe defaults suitable for cheap shared hosts (256 MB RAM, shared CPU). If you're running on a VPS with more headroom, edit `configs/performance.json` to override any of these knobs. One exception: `memoryDepth` set in `config.json` wins over the perf file — delete it there to single-source history depth from `performance.json`. `fairShare` enables per-guild provider budgets + global in-flight cap so one spammy server can't starve the rest; `billingStats` appends a `-# in/out · total · time · t/s` usage footer to replies.
+Open-Dusa ships with safe defaults suitable for cheap shared hosts (256 MB RAM, shared CPU). If you're running on a VPS with more headroom, edit `configs/performance.json` to override any of these knobs. One exception: `memoryDepth` set in `config.json` wins over the perf file — delete it there to single-source history depth from `performance.json`. `fairShare` enables per-guild provider budgets + global in-flight cap so one spammy server can't starve the rest; `billingStats` appends a `-# in/out · total · time · t/s · effort` usage footer to replies (effort = reasoning level that served the turn: off/low/med).
 
 On first startup, if `configs/performance.json` doesn't exist, the bot auto-creates it with defaults. Edit and restart to apply.
 
@@ -345,7 +349,7 @@ npm run start:max      # 6 GB heap, 24 UV threads - 8 GB+ hosts
 | ------------------------------ | ---------------------------------------------------------------- | ----------------------- |
 | `/memory`                      | View what Open-Dusa remembers about you                          | Everyone                |
 | `/forgetme`                    | Permanently delete your stored data                              | Everyone                |
-| `/mode`                        | Switch between `focused` (analytical), `normal` (casual), `fast` (ultrashort), and `auto` (picked per message). Named modes can pin their own model + fallbacks via `modes{}` in config. Works in DMs and group chats too | Everyone                |
+| `/mode`                        | Switch between `focused` (analytical), `normal` (casual), `fast` (ultrashort), and `auto` (picked per message, the default for everyone). Named modes can pin their own model + fallbacks via `modes{}` in config. Works in DMs and group chats too | Everyone                |
 | `/prompt`                      | Set, view, or reset your custom persona (`system` text, `reset:true` wipes) | Everyone                |
 | `/server-prompt`                | Set, view, or reset this server's persona (same args) | Manage Server           |
 | `/streaming`                   | Pick instant replies (`off`, no typing indicator) or fancy streaming (`on`) — just for you | Everyone                |

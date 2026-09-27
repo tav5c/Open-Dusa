@@ -250,6 +250,19 @@ const client = new Client({
     allowedMentions: { parse: ['users'], repliedUser: false },
 })
 
+// Visibility into Discord-side backpressure: discord.js queues 429s
+// silently, so without this the first symptom of edit/stream pressure
+// is mysteriously slow replies. One line per event, throttled.
+let _lastRestWarn = 0
+client.rest.on('rateLimited', (info) => {
+    const now = Date.now()
+    if (now - _lastRestWarn < 30_000) return
+    _lastRestWarn = now
+    console.warn(
+        `[REST] 429 on ${info.route ?? info.path ?? '?'} — retry in ${info.retryAfter ?? '?'}ms (global=${info.global === true})`,
+    )
+})
+
 const heart = attachHeart(client)
 
 // Prefix command map, must exist before extensions load
@@ -378,7 +391,7 @@ async function cmdStats(ctx) {
         .setTitle('📊 | Medusa System Telemetry')
         .setColor(stability >= 70 ? 0x1d9e75 : stability >= 50 ? 0xef9f27 : 0xe24b4a)
         .setDescription(
-            `**Host Information & Performance Benchmark**${aiStats}\n🚪 **Backend:** Process Errors: \`${heart._stats.errors}\``,
+            `**Host Information & Performance Benchmark**${aiStats}\n🚪 **Backend:** Process Errors: \`${heart._stats.errors}\` | Commands: \`${heart._stats.commands}\``,
         )
         .addFields(
             {
@@ -403,7 +416,7 @@ async function cmdStats(ctx) {
             },
             {
                 name: '⚡ Active Processing',
-                value: `Tasks: \`${heart._tasks.size}\`\nFired: \`${heart._stats.firedTasks}\``,
+                value: `Tasks: \`${heart._tasks.size}\`\nFired: \`${heart._stats.firedTasks}\` | Gated: \`${heart._stats.rateLimited}\``,
                 inline: true,
             },
             {
@@ -1119,6 +1132,7 @@ client.on('messageCreate', async (message) => {
             console.log(
                 `[CMD] ${clr.pink}${message.author.tag}${clr.reset} executed: ${clr.light_green}${content}${clr.reset} in DM`,
             )
+            heart._stats.commands++
             try {
                 await mhandler(message, margs)
             } catch (e) {
@@ -1161,6 +1175,7 @@ client.on('messageCreate', async (message) => {
         console.log(
             `[CMD] ${clr.pink}${message.author.tag}${clr.reset} executed: ${clr.light_green}${content}${clr.reset} in #${message.channel.name}`,
         )
+        heart._stats.commands++
         try {
             await handler(message, args)
         } catch (e) {

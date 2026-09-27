@@ -118,6 +118,10 @@ export class MedusaHeart {
         return p
     }
 
+    noteRateLimited() {
+        this._stats.rateLimited++
+    }
+
     recordLatency(ms) {
         this._latency.push(ms)
         if (this._latency.length > 30) this._latency.shift()

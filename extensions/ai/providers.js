@@ -274,7 +274,16 @@ export class ProviderCore {
      * honored verbatim, providers already configured for it go first so chat doesn't burn
      * a doomed call (e.g. asking groq for xkiro's qwen model) on every single message.
      */
-    async _routedCall(messages, model, maxTokens, temp, topP, budget = null, preferredBase = null) {
+    async _routedCall(
+        messages,
+        model,
+        maxTokens,
+        temp,
+        topP,
+        budget = null,
+        preferredBase = null,
+        effort = 'low',
+    ) {
         if (!this._providers) this._initProviders()
         const now = Date.now()
         // Stable sort: the agent's pinned provider first (it owns this model family —
@@ -320,7 +329,15 @@ export class ProviderCore {
             }
             budget?.tried?.add(triedKey)
             const payload = {
-                ...this._buildPayload(model ?? this.aiModel, messages, maxTokens, temp, topP, p.baseUrl),
+                ...this._buildPayload(
+                    model ?? this.aiModel,
+                    messages,
+                    maxTokens,
+                    temp,
+                    topP,
+                    p.baseUrl,
+                    effort,
+                ),
                 stream: false,
             }
             try {
@@ -475,8 +492,12 @@ export class ProviderCore {
         this._rotatePromise = (async () => {
             // Billing blocks are wallet-level: rotating keys can't help, and must
             // not cool down healthy keys. Bail out and let the caller degrade.
-            if (this._isBillingError(errorMsg)) {
-                console.warn(`[AI] Billing-blocked, not rotating keys: ${String(errorMsg).slice(0, 160)}`)
+            // Same for tier denials (free plan vs paid/premium model): the
+            // entitlement, not the key, is the problem.
+            if (this._isBillingError(errorMsg) || this._isTierError(errorMsg)) {
+                console.warn(
+                    `[AI] Billing/tier-blocked, not rotating keys: ${String(errorMsg).slice(0, 160)}`,
+                )
                 return false
             }
             const n = this.aiTokens.length
@@ -589,6 +610,9 @@ export class ProviderCore {
     _isKeyError(e) {
         if (this._isRateError(e)) return true
         const status = this._errorStatus(e)
+        // Tier denials are never key errors (handled below): rotating the
+        // whole ring can't entitle an account to a paid/premium model.
+        if (status === 403 && this._isTierError(e)) return false
         if (status === 401 || status === 403) return true
         const s = String(e).toLowerCase()
         return [
@@ -605,7 +629,16 @@ export class ProviderCore {
         ].some((x) => s.includes(x))
     }
     _isRequestError(e) {
-        return [400, 404, 413, 422].includes(this._errorStatus(e))
+        return [400, 404, 413, 422].includes(this._errorStatus(e)) || this._isTierError(e)
+    }
+    // xKiro access-tier denials: 403 permission_denied when the account may
+    // not call the named model (free plan vs paid/premium). Docs: "Retrying
+    // will not help" — the request is valid, the entitlement isn't. Treated
+    // as a request error so the chain moves to the next fallback instead of
+    // burning the key ring and tripping the breaker over an unwinnable call.
+    _isTierError(e) {
+        if (this._errorStatus(e) !== 403) return false
+        return /permission.denied|free plan|upgrade your plan|top up|entitle/i.test(String(e?.message ?? e))
     }
     _isDeadKeyError(e) {
         const s = String(e).toLowerCase()
@@ -700,7 +733,7 @@ export class ProviderCore {
         return ProviderCore.PROVIDERS.find((p) => p.match(url, model))
     }
 
-    _buildPayload(model, messages, maxTokens, temp, topP, baseUrl = this.llmBaseUrl) {
+    _buildPayload(model, messages, maxTokens, temp, topP, baseUrl = this.llmBaseUrl, effort = 'low') {
         let payload = {
             model,
             messages,
@@ -710,13 +743,29 @@ export class ProviderCore {
         const provider = this._detectProvider(model, baseUrl)
         payload = provider.paramMap(payload, maxTokens ?? this.chatTokens)
 
-        // Reasoning models (OpenAI o1/o3, DeepSeek-R, gpt-oss)
-        if (/\bo[13]\b|deepseek-r|gpt-oss/i.test(model)) {
-            payload.reasoning_effort = 'low'
-            if (!/gpt-oss/i.test(model)) {
-                delete payload.temperature
-                delete payload.top_p
-            }
+        // Dynamic reasoning effort (intent off/low/medium resolved per agent
+        // upstream; high is clamped at normalization). Wire mapping is per
+        // model+base: groq-direct 400s on levels a model doesn't declare,
+        // while xKiro normalizes/drops safely — so unknown families send
+        // nothing anywhere except xKiro. off degrades to low where no off
+        // position exists (GPT-OSS).
+        const isXkiro = /api\.xkiro\.com/i.test(baseUrl ?? '')
+        const isGptOss = /gpt-oss/i.test(model ?? '')
+        const isQwen27 = /qwen3\.8-27b/i.test(model ?? '')
+        const legacyReasoning = /\bo[13]\b|deepseek-r/i.test(model ?? '') && !isGptOss
+        let wire = null
+        if (isXkiro) wire = effort === 'off' ? 'none' : effort
+        else if (isGptOss) wire = effort === 'medium' ? 'medium' : 'low'
+        else if (isQwen27) wire = effort === 'off' ? 'none' : effort
+        else if (legacyReasoning) wire = 'low'
+        if (wire) payload.reasoning_effort = wire
+
+        // Reasoning models reject sampling params (xKiro strips server-side,
+        // groq 400s): drop them exactly when reasoning is actually on, never
+        // for gpt-oss which tolerates them.
+        if (wire && wire !== 'none' && !isGptOss && (legacyReasoning || isQwen27)) {
+            delete payload.temperature
+            delete payload.top_p
         }
 
         if (this._config?.stopSequences?.length) payload.stop = this._config.stopSequences
@@ -728,12 +777,12 @@ export class ProviderCore {
         return payload
     }
 
-    async _groqCall(messages, model, maxTokens, temp, topP, client = null) {
+    async _groqCall(messages, model, maxTokens, temp, topP, client = null, effort = 'low') {
         const pinned = client
         client ??= this._groq
         if (!client) return null
 
-        const payload = this._buildPayload(model, messages, maxTokens, temp, topP)
+        const payload = this._buildPayload(model, messages, maxTokens, temp, topP, undefined, effort)
         // _groqCall is ALWAYS non-streaming (_streamChat owns streaming): force
         // it, because _buildPayload sets stream:true when global streaming is
         // on, and reading .choices[0] off a stream response throws -> null.
@@ -785,6 +834,21 @@ export class ProviderCore {
             .replace(/<{2,3}\s*(?:RUN_CMD|ACTIONS_INTENDED)\s*:[^<>]*>?\s*$/g, '')
             .replace(/<<[^<>]*$/g, '')
     }
+    // Configured reasoning intent for an agent chain ('chat', 'research',
+    // 'vision', 'classifier', 'quickAgent', 'mode:<name>'). Normalization
+    // already defaulted everything; the fallbacks here cover unnormalized
+    // shapes (tests, legacy callers).
+    _effortIntent(agent) {
+        const cfg = this._config ?? this.config
+        if (agent?.startsWith('mode:')) {
+            const name = agent.slice(5)
+            return cfg?.modes?.[name]?.reasoningEffort ?? (name === 'focused' ? 'medium' : 'low')
+        }
+        return (
+            cfg?.agents?.[agent]?.reasoningEffort ??
+            (agent === 'research' ? 'medium' : agent === 'classifier' ? 'off' : 'low')
+        )
+    }
     // The provider base an agent's traffic belongs on: its own resolved
     // provider when pinned (modes live in config.modes, the rest in
     // agents), else the chat base. Centralizes what used to be three
@@ -806,7 +870,18 @@ export class ProviderCore {
         if (routerP && Date.now() < routerP.state.openUntil)
             return this._groqCallWithFallbacks(messages, model, maxTokens, temp, undefined, agent)
         const streamClient = routerP?.client ?? this._groq
-        const payload = { ...this._buildPayload(model, messages, maxTokens, temp), stream: true }
+        const payload = {
+            ...this._buildPayload(
+                model,
+                messages,
+                maxTokens,
+                temp,
+                undefined,
+                agentBase,
+                this._effortIntent(agent),
+            ),
+            stream: true,
+        }
         let placeholder = null
         let stubP = null
         let full = ''
@@ -950,7 +1025,7 @@ export class ProviderCore {
     // One attempt at one fallback entry. Never throws, never rotates keys:
     // failure just means "next entry". Breaker-open router providers are
     // skipped fast without burning a call.
-    async _tryFallbackEntry(entry, messages, maxTokens, temp, topP, budget = null) {
+    async _tryFallbackEntry(entry, messages, maxTokens, temp, topP, budget = null, effort = 'low') {
         if (!entry?.baseUrl || !entry?.keys?.length || !entry?.model) return null
         if (budget && Date.now() > budget.until) return null
         if (budget?.dead.has(entry.baseUrl)) return null
@@ -961,7 +1036,15 @@ export class ProviderCore {
         const client = routerP?.client ?? this._fallbackClient(entry)
         if (!client) return null
         try {
-            const payload = this._buildPayload(entry.model, messages, maxTokens, temp, topP, entry.baseUrl)
+            const payload = this._buildPayload(
+                entry.model,
+                messages,
+                maxTokens,
+                temp,
+                topP,
+                entry.baseUrl,
+                effort,
+            )
             // Same hard-cap rule as _routedCall: an attempt that starts inside
             // the budget must not outlive it by the full 12s client default.
             const opts = budget
@@ -1011,24 +1094,36 @@ export class ProviderCore {
         // (quickAgent on xkiro must not open on groq just because chat lives
         // there); otherwise the chat base stays preferred.
         const agentBase = this._agentBase(agent)
+        // Reasoning intent once per turn: every hop below (router, legacy,
+        // fallbacks) builds from it instead of re-resolving.
+        const effort = this._effortIntent(agent)
         if (this._providers?.length > 1) {
-            const routed = await this._routedCall(messages, model, maxTokens, temp, topP, budget, agentBase)
+            const routed = await this._routedCall(
+                messages,
+                model,
+                maxTokens,
+                temp,
+                topP,
+                budget,
+                agentBase,
+                effort,
+            )
             if (routed) return routed
             // The legacy client lives on the chat base: only worth one hop
             // when this agent shares it, otherwise it re-fires a pair the
             // router (or the agent chain below) already covers.
             if (agentBase === this.llmBaseUrl && !budget.tried.has(`${this.llmBaseUrl}|${model}`)) {
                 budget.tried.add(`${this.llmBaseUrl}|${model}`)
-                const legacy = await this._groqCall(messages, model, maxTokens, temp, topP)
+                const legacy = await this._groqCall(messages, model, maxTokens, temp, topP, undefined, effort)
                 if (legacy && !legacy.capacityError) return legacy
             }
         } else {
-            const result = await this._groqCall(messages, model, maxTokens, temp, topP)
+            const result = await this._groqCall(messages, model, maxTokens, temp, topP, undefined, effort)
             if (result && !result.capacityError) return result
         }
         for (const fb of this.agentFallbacks?.[agent] ?? []) {
             if (Date.now() > budget.until) break
-            const out = await this._tryFallbackEntry(fb, messages, maxTokens, temp, topP, budget)
+            const out = await this._tryFallbackEntry(fb, messages, maxTokens, temp, topP, budget, effort)
             if (out) return out
         }
         return null

@@ -534,7 +534,7 @@ export async function registerAI(client, db, config) {
                 const fetched = await interaction.channel.messages.fetch({ limit: 100, after: startMsg.id })
                 const sorted = [...fetched.values()].sort((a, b) => a.createdTimestamp - b.createdTimestamp)
                 for (const m of sorted) {
-                    if (!m.author.bot && m.content.trim() && !ai.isMemOff(m.author.id)) {
+                    if (!m.author.bot && (m.content ?? '').trim() && !ai.isMemOff(m.author.id)) {
                         messages.push({
                             author: m.member?.displayName ?? m.author.username,
                             content: m.content,
@@ -543,7 +543,11 @@ export async function registerAI(client, db, config) {
                         if (messages.length >= 100) break
                     }
                 }
-                if (!startMsg.author.bot && startMsg.content.trim() && !ai.isMemOff(startMsg.author.id))
+                if (
+                    !startMsg.author.bot &&
+                    (startMsg.content ?? '').trim() &&
+                    !ai.isMemOff(startMsg.author.id)
+                )
                     messages.unshift({
                         author: startMsg.member?.displayName ?? startMsg.author.username,
                         content: startMsg.content,
@@ -559,7 +563,7 @@ export async function registerAI(client, db, config) {
                     if (!fetched.size) break
                     for (const [, m] of fetched) {
                         cursor = m.id
-                        if (!m.author.bot && m.content.trim() && !ai.isMemOff(m.author.id)) {
+                        if (!m.author.bot && (m.content ?? '').trim() && !ai.isMemOff(m.author.id)) {
                             messages.push({
                                 author: m.member?.displayName ?? m.author.username,
                                 content: m.content,
@@ -823,7 +827,7 @@ export async function registerAI(client, db, config) {
             const input = interaction.options.getString('mode')
             const uid2 = interaction.user.id
             if (!input) {
-                const cur = ai.userModes[uid2] ?? 0
+                const cur = ai.userModes[uid2] ?? 3
                 return interaction.reply({
                     content: `Your current mode: **${modeLabel(cur)}** (${cur}).\nUse \`/mode focused\`, \`/mode normal\`, \`/mode fast\`, or \`/mode auto\` to switch.`,
                     flags: MessageFlags.Ephemeral,
@@ -855,7 +859,7 @@ export async function registerAI(client, db, config) {
                 })
             }
             if (['normal', '0'].includes(input)) {
-                delete ai.userModes[uid2]
+                ai.userModes[uid2] = 0
                 ai._scheduleUsersSave()
                 return interaction.reply({
                     content: '✅ Switched to **normal mode** - Full personality and casual responses',
@@ -1195,7 +1199,9 @@ export async function registerAI(client, db, config) {
                 ? ` (focused mode stays on and styles it)`
                 : ai.userModes[uid] === 2
                   ? ` (fast mode stays on and keeps replies ultrashort)`
-                  : ''
+                  : (ai.userModes[uid] ?? 3) === 3
+                    ? ` (auto mode stays on and picks fast/normal/focused per message)`
+                    : ''
         await msg.reply(`✅ Custom prompt set for ${msg.author.displayName}${modeNote}`)
     })
     client.commands.set('prompt', client.commands.get('p'))
@@ -1252,7 +1258,7 @@ export async function registerAI(client, db, config) {
         const input = args[0]?.toLowerCase()
         const uid = String(msg.author.id)
         if (!input) {
-            const cur = ai.userModes[uid] ?? 0
+            const cur = ai.userModes[uid] ?? 3
             return msg.reply(
                 `Your current mode: **${modeLabel(cur)}** (${cur}). Use \`${config.prefix}mode focused\`, \`${config.prefix}mode normal\`, \`${config.prefix}mode fast\`, or \`${config.prefix}mode auto\`.`,
             )
@@ -1264,7 +1270,7 @@ export async function registerAI(client, db, config) {
         else if (['normal', '0'].includes(input)) newMode = 0
         else return msg.reply('❌ Invalid mode. Use `focused`/`1`, `normal`/`0`, `fast`/`2`, or `auto`/`3`')
 
-        if (newMode === 0) delete ai.userModes[uid]
+        if (newMode === 0) ai.userModes[uid] = 0
         else ai.userModes[uid] = newMode
         ai._scheduleUsersSave()
         const modeName = modeLabel(newMode)

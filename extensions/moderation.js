@@ -407,7 +407,7 @@ export async function cmdFpurge(
                 checked++
                 cursor = m.id
                 if (targetId && m.author.id !== targetId) continue
-                const content = m.content.toLowerCase()
+                const content = (m.content ?? '').toLowerCase()
                 if (exact ? content === searchText : content.includes(searchText)) toDelete.push(m)
             }
             if (toDelete.length) {
@@ -705,7 +705,7 @@ export function registerModeration(client, db, config) {
     async function handleMessage(message) {
         if (!isOwner(message.author.id)) return false
         if (!message.member?.permissions.has(PermissionFlagsBits.ModerateMembers)) return false
-        const content = message.content.trim()
+        const content = (message.content ?? '').trim()
         const lower = content.toLowerCase()
         const now = Date.now()
 

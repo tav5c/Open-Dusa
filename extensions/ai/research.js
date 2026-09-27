@@ -2,7 +2,7 @@
 // three-stage needsResearch router (signal lists -> cheap classifier).
 import { LRUCache } from 'lru-cache'
 import {
-    ALWAYS_LIVE,
+    ALWAYS_LIVE_RE,
     DANGEROUS_TERMS,
     NEVER_RESEARCH_EXACT,
     NEVER_RESEARCH_PREFIXES,
@@ -506,6 +506,7 @@ export class ResearchCore extends ProviderCore {
             0,
             undefined,
             this._classifierClient,
+            this._effortIntent('classifier'),
         ).catch(() => null)
         if (typeof r === 'string' && r) return r
         for (const fb of this.agentFallbacks?.classifier ?? []) {
@@ -517,7 +518,15 @@ export class ResearchCore extends ProviderCore {
             try {
                 const client = this._fallbackClient(fb)
                 if (!client) continue
-                const payload = this._buildPayload(fb.model, messages, toks, 0, undefined, fb.baseUrl)
+                const payload = this._buildPayload(
+                    fb.model,
+                    messages,
+                    toks,
+                    0,
+                    undefined,
+                    fb.baseUrl,
+                    this._effortIntent('classifier'),
+                )
                 const r2 = await client.chat.completions.create({ ...payload, stream: false })
                 const out = r2.choices?.[0]?.message?.content
                 if (typeof out === 'string' && out) return out
@@ -619,14 +628,9 @@ export class ResearchCore extends ProviderCore {
             for (const term of DANGEROUS_TERMS) if (lower.includes(term)) return 'dangerous'
         }
         // Word-boundaried: substring matching sent "costume-shopped" to
-        // research via "cost". Trailing-space entries ("search ", "google ")
-        // keep their boundary by trimming first.
-        for (const s of ALWAYS_LIVE) {
-            const needle = s.trim()
-            if (!needle) continue
-            const esc = needle.replace(/[.*+?^${}()|[\]\\]/g, '\\$&')
-            if (new RegExp(`\\b${esc}\\b`, 'i').test(prompt)) return 'research'
-        }
+        // research via "cost". Pre-compiled in constants (was ~50 fresh
+        // RegExps per turn).
+        if (ALWAYS_LIVE_RE.test(prompt)) return 'research'
 
         // Greeting-led messages with no question mark and no live signal are social,
         // not research. Decided here so archaic/casual hellos ("ho, nice to meeteth

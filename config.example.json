@@ -25,6 +25,9 @@
             "temperature": 1.1,
             "topP": 1,
             "maxTokens": 1256,
+            // Reasoning effort: off | low | medium (high clamps to medium).
+            // off sends none where the model expresses it, else low.
+            "reasoningEffort": "low",
             "fallbacks": [
                 {
                     "provider": "groq",
@@ -97,11 +100,13 @@
         "focused": {
             "provider": "groq",
             "model": "openai/gpt-oss-120b",
+            "reasoningEffort": "medium",
             "fallbacks": [{ "provider": "groq", "models": ["groq/compound"] }]
         },
         "fast": {
             "provider": "groq",
             "model": "openai/gpt-oss-20b",
+            "reasoningEffort": "low",
             "fallbacks": []
         }
     },

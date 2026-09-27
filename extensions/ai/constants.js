@@ -400,9 +400,20 @@ function makeIdSet(max, ttl = 30 * 60_000) {
     }
 }
 
+// Pre-compiled once: the per-turn loops used to build one RegExp per term
+// (~50 constructions) on every AI turn, in two places.
+const ALWAYS_LIVE_RE = new RegExp(
+    `\\b(?:${[...ALWAYS_LIVE]
+        .map((s) => s.trim().replace(/[.*+?^${}()|[\]\\]/g, '\\$&'))
+        .filter(Boolean)
+        .join('|')})\\b`,
+    'i',
+)
+
 export {
     DEAD_KEYS_FILE,
     ALWAYS_LIVE,
+    ALWAYS_LIVE_RE,
     NEVER_RESEARCH_PREFIXES,
     NEVER_RESEARCH_EXACT,
     NO_SEARCH_SIGNALS,
