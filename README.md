@@ -111,8 +111,9 @@ In the [Discord Developer Portal](https://discord.com/developers/applications), 
 - Token > copy > paste in config.json,
   go to **Installation** tab ->
 - Select **Guild** method then setup the install link with administrator permission then add to your server via the generated link.
-    > [!IMPORTANT]
-    > Enable Message Content Intent and Server Members Intent in the Discord Developer Portal before running the bot.
+
+> [!IMPORTANT]
+> Enable Message Content Intent and Server Members Intent in the Discord Developer Portal before running the bot.
 
 ### 5. Run
 
