@@ -785,12 +785,24 @@ export class ProviderCore {
             .replace(/<{2,3}\s*(?:RUN_CMD|ACTIONS_INTENDED)\s*:[^<>]*>?\s*$/g, '')
             .replace(/<<[^<>]*$/g, '')
     }
+    // The provider base an agent's traffic belongs on: its own resolved
+    // provider when pinned (modes live in config.modes, the rest in
+    // agents), else the chat base. Centralizes what used to be three
+    // ad-hoc llmBaseUrl fallbacks that disagreed with each other.
+    _agentBase(agent) {
+        return (
+            (agent?.startsWith('mode:')
+                ? this._config?.modes?.[agent.slice(5)]?.resolved?.baseUrl
+                : this._config?.agents?.[agent]?.resolved?.baseUrl) ?? this.llmBaseUrl
+        )
+    }
     async _streamChat(messages, model, maxTokens, temp, message, stubHint = null, agent = 'chat') {
         if (!this._groq) return null
-        // Route the open through the provider pool when it covers this base:
-        // a breaker-open or dead-keyed provider must be skipped instantly,
+        // Route the open through the provider pool when it covers this agent's
+        // base: a breaker-open or dead-keyed provider must be skipped instantly,
         // not waited on for 30s. Falls back to the legacy client otherwise.
-        const routerP = (this._providers ?? []).find((p) => p.baseUrl === this.llmBaseUrl)
+        const agentBase = this._agentBase(agent)
+        const routerP = (this._providers ?? []).find((p) => p.baseUrl === agentBase)
         if (routerP && Date.now() < routerP.state.openUntil)
             return this._groqCallWithFallbacks(messages, model, maxTokens, temp, undefined, agent)
         const streamClient = routerP?.client ?? this._groq
@@ -902,7 +914,7 @@ export class ProviderCore {
             // re-hitting the corpse for another 25s inside a fresh 30s budget.
             const budget = {
                 until: Date.now() + 15_000,
-                dead: new Set(this._isKeyError(e) || this._isRequestError(e) ? [] : [this.llmBaseUrl]),
+                dead: new Set(this._isKeyError(e) || this._isRequestError(e) ? [] : [this._agentBase(agent)]),
             }
             return this._groqCallWithFallbacks(messages, model, maxTokens, temp, undefined, agent, budget)
         }
@@ -998,7 +1010,7 @@ export class ProviderCore {
         // Route toward the requesting agent's own provider when it has one
         // (quickAgent on xkiro must not open on groq just because chat lives
         // there); otherwise the chat base stays preferred.
-        const agentBase = this._config?.agents?.[agent]?.resolved?.baseUrl ?? this.llmBaseUrl
+        const agentBase = this._agentBase(agent)
         if (this._providers?.length > 1) {
             const routed = await this._routedCall(messages, model, maxTokens, temp, topP, budget, agentBase)
             if (routed) return routed

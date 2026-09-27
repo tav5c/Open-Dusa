@@ -344,16 +344,16 @@ npm run start:max      # 6 GB heap, 24 UV threads - 8 GB+ hosts
 | ------------------------------ | ---------------------------------------------------------------- | ----------------------- |
 | `/memory`                      | View what Open-Dusa remembers about you                          | Everyone                |
 | `/forgetme`                    | Permanently delete your stored data                              | Everyone                |
-| `/mode`                        | Switch between `focused` (analytical), `normal` (casual), and `fast` (ultrashort) mode. Named modes can pin their own model + fallbacks via `modes{}` in config | Everyone                |
+| `/mode`                        | Switch between `focused` (analytical), `normal` (casual), `fast` (ultrashort), and `auto` (picked per message). Named modes can pin their own model + fallbacks via `modes{}` in config. Works in DMs and group chats too | Everyone                |
 | `/prompt`                      | Set, view, or reset your custom persona (`system` text, `reset:true` wipes) | Everyone                |
 | `/server-prompt`                | Set, view, or reset this server's persona (same args) | Manage Server           |
 | `/streaming`                   | Pick instant replies (`off`, no typing indicator) or fancy streaming (`on`) — just for you | Everyone                |
 | `/billing`                     | Show token usage footer on replies (`mode`: On/Off) — just for you | Everyone                |
 | `/memory`                      | View what she remembers — or set `mode: On/Off` to opt out of storing + fetching (ghost-mode by default). Disabled entirely when `memory: false` in config | Everyone                |
-| `/ask`                         | Quick precise answer, light memory, instant (server only). `research`: Auto/On/Off, `privacy`: On/Off | Everyone                |
+| `/ask`                         | Quick precise answer, light memory, instant (server only). `research`: Auto/On/Off, `mode`: one-time focused/fast/normal, `privacy`: On/Off | Everyone                |
 | `/avatar`, `/banner`, `/mbanner` | Server avatar, server banner, main profile banner (`av`/`bn`/`mbn` still work) | Everyone                |
 | `/summarize`                   | Summarize recent channel conversation                            | Everyone (rate-limited) |
-| `/medusa`                      | Quick one-shot AI answer. No memory. DMs and group chats only.   | Everyone                |
+| `/medusa`                      | Quick one-shot AI answer. No memory. DMs and group chats only. `mode`: one-time focused/fast/normal | Everyone                |
 | `/recall`                      | Look up what she remembers about a member. Fully private (only you see it). Self + mods. | Everyone (self) / Mods (others) |
 | `/kick`                        | Kick a user                                                      | Mods (Kick Members)       |
 | `/ban`, `/mute`, `/warn`, etc. | Standard moderation suite (`/warnings` and `/modlog` reply privately) | Mods                    |
@@ -373,7 +373,7 @@ med,p <prompt> - Set a custom AI persona just for you
 med,pr - Reset to default persona
 med,serverp <prompt> - Set a server-wide persona (needs Manage Server)
 med,serverpr - Reset the server persona
-med,mode focused/normal/fast
+med,mode focused/normal/fast/auto
 med,stream on/off - Instant replies (off, no typing) or fancy streaming (on), just for you
 med,billing on/off - Token usage footer on replies, just for you
 med,afk [reason] - Go AFK with a timestamped reason

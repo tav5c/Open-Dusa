@@ -100,6 +100,9 @@ const BOT_OWNER_ID = config.ownerId ? BigInt(config.ownerId) : 0n
 const PREFIX = config.prefix
 const PREFIXES = config.prefixes
 const ALLOWED_GUILDS = new Set(config.guildIds.map(BigInt))
+// Standalone personal-pref commands that run in DMs/GCs too (no guild
+// needed, keyed by user id). Everything else still requires a server.
+const DM_SAFE_PREFIX = new Set(['mode', 'stream', 'billing'])
 
 // Database
 let db
@@ -1102,10 +1105,28 @@ client.on('interactionCreate', async (interaction) => {
 // Message Creation
 client.on('messageCreate', async (message) => {
     try {
-        if (message.author.bot || !message.guild) return
+        if (message.author.bot) return
+        const content = (message.content ?? '').trim()
+        // DMs/GCs have no guild: only DM-safe pref commands run here, straight
+        // to dispatch. Guild-only handlers (afk, moderation, extensions) stay
+        // server-side below.
+        if (!message.guild) {
+            const mp = PREFIXES.find((prefix) => content.toLowerCase().startsWith(prefix.toLowerCase()))
+            const mcmd = mp ? content.slice(mp.length).trim().split(/\s+/)[0]?.toLowerCase() : null
+            const mhandler = mcmd ? client.commands.get(mcmd) : null
+            if (!mcmd || !DM_SAFE_PREFIX.has(mcmd) || !mhandler) return
+            const margs = content.slice(mp.length).trim().split(/\s+/).slice(1)
+            console.log(
+                `[CMD] ${clr.pink}${message.author.tag}${clr.reset} executed: ${clr.light_green}${content}${clr.reset} in DM`,
+            )
+            try {
+                await mhandler(message, margs)
+            } catch (e) {
+                console.error(`[CMD] ${mcmd} error:`, e)
+            }
+            return
+        }
         if (ALLOWED_GUILDS.size && !ALLOWED_GUILDS.has(BigInt(message.guild.id))) return
-
-        const content = message.content.trim()
 
         // Core extension message handlers (afk auto-unafk + mention notices; moderation keyword triggers)
         try {

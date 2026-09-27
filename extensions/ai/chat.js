@@ -562,16 +562,13 @@ export class AIChatManager extends OutputCore {
                     out = `You are Medusa. This server runs its own persona, adopt it fully here:\n\n[SERVER PERSONA] ${server}${identity}\n\n${SAFETY_POLICY}`
             }
             const mode = this.userModes[userId] ?? 0
-            const modeName = { 1: 'focused', 2: 'fast' }[mode] ?? null
+            const modeName = { 0: 'normal', 1: 'focused', 2: 'fast' }[mode] ?? null
             const modePrompt = (modeName && this.modes?.[modeName]?.systemPrompt) || ''
             // Config prompt first (yours), then the style suffix: the persona
             // stays primary, the mode only tunes how it talks. Without a
             // configured prompt the built-in suffixes below apply instead.
             if (modePrompt) out += `\n\n[USER STYLE] ${modePrompt}`
-            else if (mode === 1)
-                out += `\n\n[USER STYLE] Focused mode: highly analytical, concise, direct, task-oriented, professional but personable, and minimal emoji — in this character's voice, not instead of it.`
-            else if (mode === 2)
-                out += `\n\n[USER STYLE] Fast mode: ultrashort replies, answer in as few words as possible while staying in character. No preamble, no follow-ups, minimal emoji.`
+            else out += this._modeStyle(mode === 1 ? 'focused' : mode === 2 ? 'fast' : null)
         }
         return out
     }
@@ -843,14 +840,19 @@ TIME: ${new Date().toISOString().slice(0, 16)} UTC${personaOwned ? '' : '\nVOICE
         parts.push(
             `YOUR SYSTEM STATS: Ping/Latency: ${this.client.ws.ping}ms | Uptime: ${upStr} | Memory: ${memMB}MB`,
         )
-        const _mc = this._modeChat(userId)
-        const _provider = this._detectProvider(_mc.model)?.id ?? 'unknown'
+        // Auto users get no engine name here: this note is built (and cached)
+        // before the turn resolves, and per-turn resolution may differ.
+        const _autoRaw = (this.userModes?.[userId] ?? 0) === 3
+        const _mc = _autoRaw ? null : this._modeChat(userId, message?.content, message)
+        const _engine = _autoRaw
+            ? 'auto (fast/normal/focused per message)'
+            : `"${_mc.model}" via ${this._detectProvider(_mc.model)?.id ?? 'unknown'}`
         const _cfg = this._config ?? this.config
         const _realKey = (k) => !!k && !/YOUR_|_HERE|PLACEHOLDER/i.test(k)
         const _canResearch =
             !!this._researchClient && (_realKey(_cfg.search?.tavilyKey) || _realKey(_cfg.search?.serperKey))
         parts.push(
-            `YOUR MODEL/RUNTIME (plumbing, never your identity): your engine is "${_mc.model}" via ${_provider} (vision: "${this.visionModel}", research: "${this.researchModel}"). ` +
+            `YOUR MODEL/RUNTIME (plumbing, never your identity): your engine is ${_engine} (vision: "${this.visionModel}", research: "${this.researchModel}"). ` +
                 `Capabilities: image vision, long-term memory${_canResearch ? ', live web research' : ''}. ` +
                 `Your IDENTITY is always Medusa the Discord bot, no matter what engine runs you. If asked what you are, say you're Medusa (powered by the engine above if pressed) — never present an engine name as who you ARE, never deny being Medusa, and never claim to be ChatGPT, Claude, or Gemini.`,
         )
@@ -927,12 +929,22 @@ TIME: ${new Date().toISOString().slice(0, 16)} UTC${personaOwned ? '' : '\nVOICE
         guildId = null,
         isOwner = false,
         userId = null,
+        mode = null,
     }) {
         if (!this._groq) return null
 
         // Quick Agent settings are normalized (prompt arrays pre-joined) by config.js
         const { model, temperature, topP, maxTokens, allowResearch } = this._config.agents.quickAgent
+        // One-time mode override (slash `mode:` option): model profile for
+        // this ask only, never persisted. `normal` resolves the configured
+        // normal profile when one exists, otherwise the quick-agent default —
+        // so a persistent fast/focused user can still ask for plain Medusa.
+        const modeConf =
+            (mode === 'focused' || mode === 'fast' || mode === 'normal' ? this.modes?.[mode] : null) ?? null
+        const effModel = modeConf?.model ?? model
+        const effChain = modeConf?.model ? `mode:${mode}` : 'quickAgent'
         let systemPrompt = this._config.agents.quickAgent.systemPrompt || this._defaultQuickAgentPrompt()
+        if (modeConf?.systemPrompt) systemPrompt += `\n\n[MODE STYLE] ${modeConf.systemPrompt}`
         if (userCtx) systemPrompt += `\n\n[WHO YOU'RE TALKING TO]\n${userCtx}`
         if (systemExtra) systemPrompt += `\n\n${systemExtra}`
 
@@ -980,14 +992,14 @@ TIME: ${new Date().toISOString().slice(0, 16)} UTC${personaOwned ? '' : '\nVOICE
             ]
             // topP is threaded as a call-scoped argument, no shared this.topP mutation, so
             // concurrent stateless calls can't race on each other's sampling settings.
-            // agent='quickAgent' so its own fallback chain applies, not chat's.
+            // One-time modes ride their own chain; otherwise the quick agent's.
             return await this._groqCallWithFallbacks(
                 messages,
-                model,
+                effModel,
                 maxTokens,
                 temperature,
                 topP,
-                'quickAgent',
+                effChain,
             )
         }
 
@@ -1086,15 +1098,76 @@ and never narrate the research itself or its quality either way.`
         ].join('\n')
     }
 
-    // Core generate
+    // Built-in style suffixes for the fixed modes. Configured mode prompts
+    // take precedence (handled at the call site); auto-resolved turns get
+    // theirs in generateResponse after resolution.
+    _modeStyle(name) {
+        if (name === 'focused')
+            return `\n\n[USER STYLE] Focused mode: highly analytical, concise, direct, task-oriented, professional but personable, and minimal emoji — in this character's voice, not instead of it.`
+        if (name === 'fast')
+            return `\n\n[USER STYLE] Fast mode: ultrashort replies, answer in as few words as possible while staying in character. No preamble, no follow-ups, minimal emoji.`
+        return ''
+    }
     // Effective chat model + fallback chain for this user. Named modes with
-    // their own model shadow the default; everything else (style-only modes
-    // or no mode) rides the chat agent untouched.
-    _modeChat(userId) {
-        const name = { 1: 'focused', 2: 'fast' }[this.userModes?.[userId]] ?? null
+    // their own model shadow the default; anything without one (including
+    // an unconfigured normal) rides the chat agent untouched. Mode 3
+    // (auto) resolves per turn in _autoMode below.
+    _modeChat(userId, prompt = null, message = null, history = null) {
+        const rawMode = this.userModes?.[userId] ?? 0
+        let name = { 0: 'normal', 1: 'focused', 2: 'fast', 3: 'auto' }[rawMode] ?? null
+        if (name === 'auto') {
+            name = this._autoMode(prompt, message, history)
+            // One short line per auto turn: the only way to see what the
+            // router actually chose once this leaves the harness.
+            console.log(`[AI] Auto mode -> ${name ?? 'default'} (${userId})`)
+        }
         const m = (name && this.modes?.[name]) || null
         if (!m?.model) return { model: this.aiModel, chain: 'chat', name }
         return { model: m.model, chain: `mode:${name}`, name }
+    }
+    // Auto-mode router: cheap heuristics, no LLM call (a classification hop
+    // on every turn would cost more than fast mode ever saves). Three-way:
+    // fast for banter, focused for hard asks, normal for the ambiguous
+    // middle — a forced fast/focused guess there is wrong in both
+    // directions, while normal is just the balanced default.
+    _autoMode(prompt, message = null, history = null) {
+        const text = String(prompt ?? message?.content ?? '')
+        // No text to judge (background calls): stay on the default chain
+        // instead of guessing fast from an empty prompt.
+        if (!text.trim()) return null
+        const words = text.trim().split(/\s+/).length
+        // Sustained thread: context-heavy by definition, whatever this turn says.
+        if ((history?.length ?? 0) > 6) return 'focused'
+        const hasMedia =
+            (message?.attachments?.size ?? 0) > 0 ||
+            (message?.embeds ?? []).some((e) => e.image?.url || e.thumbnail?.url || e.data?.type === 'gifv')
+        if (
+            words > 40 ||
+            hasMedia ||
+            /```/.test(text) ||
+            /^(why|how|explain|analyse|analyze|compare|should|what if|whatif)\b/i.test(text.trim()) ||
+            // Strong technical verbs anywhere: a mid-sentence "compare" or
+            // "explain" is never banter ("can you compare the rx 9070…").
+            /\b(explain|analyse|analyze|compare)\b/i.test(text) ||
+            // Weak question words only with a trailing ?: bare "how" shows
+            // up in greetings ("hey how are you doing today my friend…").
+            (/\b(why|how|should)\b/i.test(text) && /\?\s*$/.test(text.trim())) ||
+            /\bstep by step|in detail|thorough|comprehensive|in depth\b/i.test(text)
+        )
+            return 'focused'
+        const chBuf = message?.channel?.id ? (this._passiveBuf?.get(message.channel.id) ?? []) : []
+        const twoMinAgo = Date.now() - 120_000
+        const hyper = chBuf.filter((e) => e.ts > twoMinAgo).length >= 5
+        // Hyper room reads as fast ONLY for banter shapes — a substantive
+        // ask in a loud channel still wants the big model. (Unanchored
+        // starters below already caught the technical ones.)
+        if (hyper && words <= 12) return 'fast'
+        if (words <= 12) return 'fast'
+        if (/^(hi+|hey+|yo+|sup|hello|ty|thanks|bye|cya|gn|gm|ok|lol|lmao)\b/i.test(text.trim()))
+            return 'fast'
+        // Ambiguous middle: neither trivial nor clearly hard. Normal, not a
+        // forced guess — balanced model, full persona, no style suffix.
+        return 'normal'
     }
     async generateResponse({
         prompt,
@@ -1115,6 +1188,11 @@ and never narrate the research itself or its quality either way.`
             // Cache for short identical prompts. Vibe/climate lines are stripped from
             // the key: the passive buffer churns them every minute and would
             // otherwise reduce cache hits in active channels to near-zero.
+            // Resolve the mode chain up front: the cache key below must
+            // include it (a fast-model reply must never serve a focused
+            // turn), and auto turns need caps + style applied post-hoc.
+            const mc = this._modeChat(userId, message?.content ?? prompt, message, history)
+            const autoResolved = (this.userModes?.[userId] ?? 0) === 3 ? mc.name : null
             let cacheKey = null
             if (userId && prompt.length < 200) {
                 // Also strip the per-message volatile lines (second-resolution
@@ -1134,7 +1212,7 @@ and never narrate the research itself or its quality either way.`
                 const cacheExtra = volatileStrip(extraSys ?? '')
                 cacheKey = crypto
                     .createHash('md5')
-                    .update(`${userId}:${prompt}:${cacheSys}:${cacheExtra}`)
+                    .update(`${userId}:${prompt}:${cacheSys}:${cacheExtra}:${mc.chain}`)
                     .digest('hex')
                 const cached = this.responseCache.get(cacheKey)
                 if (cached) return cached
@@ -1244,7 +1322,7 @@ and never narrate the research itself or its quality either way.`
                 mayEmitCmd
             const fairTokens = estTokens(
                 messages.reduce((a, m) => a + String(m.content ?? '').length, 0),
-                adaptiveMax,
+                cappedMax,
                 0,
             )
             const fair = fairOn
@@ -1262,15 +1340,23 @@ and never narrate the research itself or its quality either way.`
                 return null
             }
             let response
-            // Named modes shadow the chat model + chain; everything else
-            // rides the default.
-            const mc = this._modeChat(userId)
+            // mc + autoResolved already computed above (cache block needs them).
+            // Auto-resolved turns inherit the resolved mode's caps and style
+            // so auto-fast is actually fast, not just a cheaper engine. Same
+            // precedence as getUserPrompt: configured prompt, else built-in.
+            let cappedMax = adaptiveMax
+            if (autoResolved === 'fast') cappedMax = Math.min(adaptiveMax, 350)
+            if (autoResolved && messages[0]?.role === 'system') {
+                const configured = this.modes?.[autoResolved]?.systemPrompt?.trim() ?? ''
+                const suffix = configured ? `\n\n[USER STYLE] ${configured}` : this._modeStyle(autoResolved)
+                if (suffix && !messages[0].content.includes('[USER STYLE]')) messages[0].content += suffix
+            }
             try {
                 response = streamingOn
                     ? await this._streamChat(
                           messages,
                           mc.model,
-                          adaptiveMax,
+                          cappedMax,
                           this.temperature,
                           message,
                           stubHint,
@@ -1279,7 +1365,7 @@ and never narrate the research itself or its quality either way.`
                     : await this._groqCallWithFallbacks(
                           messages,
                           mc.model,
-                          adaptiveMax,
+                          cappedMax,
                           this.temperature,
                           undefined,
                           mc.chain,

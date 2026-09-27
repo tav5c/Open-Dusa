@@ -324,6 +324,9 @@ export async function registerAI(client, db, config) {
             const searchArg = interaction.options.getString('search') ?? 'auto'
             const forceSearch = searchArg === 'on'
             const skipSearch = searchArg === 'off'
+            // One-time mode: model profile for this ask only, never persisted.
+            const _modeArg = interaction.options.getString('mode')
+            const oneTimeMode = ['focused', 'fast', 'normal'].includes(_modeArg) ? _modeArg : null
             const isPrivate = (interaction.options.getString('privacy') ?? 'off') === 'on'
             const flags = isPrivate ? MessageFlags.Ephemeral : undefined
 
@@ -351,6 +354,7 @@ export async function registerAI(client, db, config) {
                     guildId: interaction.guild?.id ?? null,
                     isOwner,
                     userId: interaction.user.id,
+                    mode: oneTimeMode,
                 })
                 if (!response)
                     return interaction.editReply({ content: '✗ All providers failed. Try again shortly.' })
@@ -393,6 +397,9 @@ export async function registerAI(client, db, config) {
             const researchArg = interaction.options.getString('research') ?? 'auto'
             const isPrivate = (interaction.options.getString('privacy') ?? 'off') === 'on'
             const flags = isPrivate ? MessageFlags.Ephemeral : undefined
+            // One-time mode: model profile for this ask only, never persisted.
+            const _modeArgAsk = interaction.options.getString('mode')
+            const oneTimeModeAsk = ['focused', 'fast', 'normal'].includes(_modeArgAsk) ? _modeArgAsk : null
             // Same master-switch notice as /medusa below.
             const searchOffNote =
                 researchArg === 'on' && ai._searchOff?.()
@@ -438,6 +445,7 @@ export async function registerAI(client, db, config) {
                     guildId: interaction.guild?.id ?? null,
                     isOwner,
                     userId: interaction.user.id,
+                    mode: oneTimeModeAsk,
                 })
                 if (!response)
                     return interaction.editReply({ content: '✗ All providers failed. Try again shortly.' })
@@ -809,10 +817,11 @@ export async function registerAI(client, db, config) {
         if (commandName === 'mode') {
             const input = interaction.options.getString('mode')
             const uid2 = interaction.user.id
+            const modeLabel = (n) => ['normal', 'focused', 'fast', 'auto'][n] ?? 'normal'
             if (!input) {
                 const cur = ai.userModes[uid2] ?? 0
                 return interaction.reply({
-                    content: `Your current mode: **${['normal', 'focused', 'fast'][cur] ?? 'normal'}** (${cur}).\nUse \`/mode focused\`, \`/mode normal\`, or \`/mode fast\` to switch.`,
+                    content: `Your current mode: **${modeLabel(cur)}** (${cur}).\nUse \`/mode focused\`, \`/mode normal\`, \`/mode fast\`, or \`/mode auto\` to switch.`,
                     flags: MessageFlags.Ephemeral,
                 })
             }
@@ -832,6 +841,15 @@ export async function registerAI(client, db, config) {
                     flags: MessageFlags.Ephemeral,
                 })
             }
+            if (['auto', '3'].includes(input)) {
+                ai.userModes[uid2] = 3
+                ai._scheduleUsersSave()
+                return interaction.reply({
+                    content:
+                        '✅ Switched to **auto mode** — fast, normal, or focused picked per message, persona untouched.',
+                    flags: MessageFlags.Ephemeral,
+                })
+            }
             if (['normal', '0'].includes(input)) {
                 delete ai.userModes[uid2]
                 ai._scheduleUsersSave()
@@ -841,7 +859,7 @@ export async function registerAI(client, db, config) {
                 })
             }
             return interaction.reply({
-                content: '❌ Invalid mode. Use `focused`/`1`, `normal`/`0`, or `fast`/`2`',
+                content: '❌ Invalid mode. Use `focused`/`1`, `normal`/`0`, `fast`/`2`, or `auto`/`3`',
                 flags: MessageFlags.Ephemeral,
             })
         }
@@ -1232,19 +1250,23 @@ export async function registerAI(client, db, config) {
         if (!input) {
             const cur = ai.userModes[uid] ?? 0
             return msg.reply(
-                `Your current mode: **${['normal', 'focused', 'fast'][cur] ?? 'normal'}** (${cur}). Use \`${config.prefix}mode focused\`, \`${config.prefix}mode normal\`, or \`${config.prefix}mode fast\`.`,
+                `Your current mode: **${['normal', 'focused', 'fast', 'auto'][cur] ?? 'normal'}** (${cur}). Use \`${config.prefix}mode focused\`, \`${config.prefix}mode normal\`, \`${config.prefix}mode fast\`, or \`${config.prefix}mode auto\`.`,
             )
         }
         let newMode = null
         if (['focused', '1'].includes(input)) newMode = 1
         else if (['fast', '2'].includes(input)) newMode = 2
+        else if (['auto', '3'].includes(input)) newMode = 3
         else if (['normal', '0'].includes(input)) newMode = 0
-        else return msg.reply('❌ Invalid mode. Use `focused`/`1`, `normal`/`0`, or `fast`/`2`')
+        else return msg.reply('❌ Invalid mode. Use `focused`/`1`, `normal`/`0`, `fast`/`2`, or `auto`/`3`')
 
         if (newMode === 0) delete ai.userModes[uid]
         else ai.userModes[uid] = newMode
         ai._scheduleUsersSave()
-        const modeName = ['normal', 'focused', 'fast'][newMode]
+        const modeName = ['normal', 'focused', 'fast', 'auto'][newMode] ?? 'normal'
+        // Auto varies per message — naming one engine would be wrong, so
+        // don't resolve it here.
+        if (newMode === 3) return msg.reply(`✅ Switched to **auto mode** (fast/normal/focused per message)`)
         return msg.reply(`✅ Switched to **${modeName} mode** (${ai._modeChat(uid).model})`)
     })
     client.commands.set('stream', async (msg, args) => {
@@ -1418,16 +1440,17 @@ export function buildAISlashCommands() {
             ),
         new SlashCommandBuilder()
             .setName('mode')
-            .setContexts(0)
-            .setDescription('Switch between focused/normal/fast AI mode')
+            .setContexts(0, 1, 2)
+            .setDescription('Switch between focused/normal/fast/auto AI mode')
             .addStringOption((o) =>
                 o
                     .setName('mode')
-                    .setDescription('focused, normal, or fast')
+                    .setDescription('focused, normal, fast, or auto')
                     .addChoices(
                         { name: 'focused', value: 'focused' },
                         { name: 'normal', value: 'normal' },
                         { name: 'fast', value: 'fast' },
+                        { name: 'auto', value: 'auto' },
                     ),
             ),
         new SlashCommandBuilder()
@@ -1528,6 +1551,16 @@ export function buildAISlashCommands() {
             )
             .addStringOption((o) =>
                 o
+                    .setName('mode')
+                    .setDescription('One-time model profile for this ask only (does not change /mode)')
+                    .addChoices(
+                        { name: 'focused', value: 'focused' },
+                        { name: 'normal', value: 'normal' },
+                        { name: 'fast', value: 'fast' },
+                    ),
+            )
+            .addStringOption((o) =>
+                o
                     .setName('privacy')
                     .setDescription('On = only you see it (default Off)')
                     .addChoices({ name: 'On', value: 'on' }, { name: 'Off', value: 'off' }),
@@ -1551,6 +1584,16 @@ export function buildAISlashCommands() {
                         { name: 'Auto', value: 'auto' },
                         { name: 'On', value: 'on' },
                         { name: 'Off', value: 'off' },
+                    ),
+            )
+            .addStringOption((o) =>
+                o
+                    .setName('mode')
+                    .setDescription('One-time model profile for this ask only (does not change /mode)')
+                    .addChoices(
+                        { name: 'focused', value: 'focused' },
+                        { name: 'normal', value: 'normal' },
+                        { name: 'fast', value: 'fast' },
                     ),
             )
             .addStringOption((o) =>
