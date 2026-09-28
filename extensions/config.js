@@ -460,6 +460,44 @@ export function readConfigRaw() {
     return parseSnowflakeSafe(readFileSync(CONFIG_PATH, 'utf8'))
 }
 
+// Dead-key probe for /configclean: one cheap GET /models per provider key
+// (groq, xKiro and NIM all serve it). Only an HTTP 401 flags a key dead —
+// 403s can mean region/entitlement on a live key, timeouts and network
+// errors are inconclusive and never flagged. Report-only: returns masked
+// labels, never key material. fetchFn is injectable for tests.
+export async function probeDeadKeys(providers, fetchFn = fetch, timeoutMs = 8000) {
+    const dead = []
+    let probed = 0
+    const provs = (Array.isArray(providers) ? providers : []).filter((pv) => pv && typeof pv === 'object')
+    for (const pv of provs) {
+        const base = String(pv.baseUrl ?? '').replace(/\/+$/, '')
+        if (!base || !Array.isArray(pv.keys) || !pv.keys.length) continue
+        const label = pv.name ?? base
+        for (let i = 0; i < pv.keys.length; i++) {
+            const k = pv.keys[i]
+            probed++
+            try {
+                const ctl = new AbortController()
+                const t = setTimeout(() => ctl.abort(), timeoutMs)
+                let status = 0
+                try {
+                    const r = await fetchFn(`${base}/models`, {
+                        headers: { Authorization: `Bearer ${k}` },
+                        signal: ctl.signal,
+                    })
+                    status = r?.status ?? 0
+                } finally {
+                    clearTimeout(t)
+                }
+                if (status === 401) dead.push(`\`${label}\` key #${i + 1} (\`…${String(k).slice(-4)}\`)`)
+            } catch {
+                // unreachable/timeout: inconclusive, never flagged
+            }
+        }
+    }
+    return { dead, probed }
+}
+
 export function writeConfigRaw(raw) {
     writeFileSync(CONFIG_PATH, JSON.stringify(raw, null, 2) + '\n', 'utf8')
 }

@@ -14,7 +14,7 @@ import {
 import { existsSync, readdirSync, statSync } from 'fs'
 import { join } from 'path'
 import { loadPerformance } from './performance.js'
-import { readConfigRaw, saveRuntime, setConfigGuild, writeConfigRaw } from './config.js'
+import { readConfigRaw, saveRuntime, setConfigGuild, writeConfigRaw, probeDeadKeys } from './config.js'
 import { AIChatManager } from './ai/chat.js'
 import { AIMemoryManager } from './ai/memory.js'
 import { deleteUserTimezone, getSavedTimezone, setTzStoreEnabled } from './timezones.js'
@@ -1150,6 +1150,46 @@ export async function registerAI(client, db, config) {
                     }
                     raw[key] = keep
                 }
+                // Key hygiene: invalid entries + exact duplicates are fixed in
+                // the file (provably redundant); dead keys are REPORTED only,
+                // never deleted — a 401 today could be a rotated-tomorrow key,
+                // and the runtime already quarantines dead keys on contact.
+                // Key material never leaves this host: probes run here, the
+                // reply + logs only ever show …last4.
+                const maskKey = (k) => `…${String(k).slice(-4)}`
+                if (Array.isArray(raw.providers)) {
+                    for (const pv of raw.providers) {
+                        if (!pv || typeof pv !== 'object') continue
+                        const label = pv.name ?? pv.baseUrl ?? '?'
+                        if (!Array.isArray(pv.keys)) {
+                            if (pv.keys !== undefined)
+                                removed.push(`keys reset (not an array) @ \`${label}\``)
+                            pv.keys = []
+                        } else {
+                            const before = pv.keys.length
+                            pv.keys = pv.keys.filter((k) => typeof k === 'string' && k.trim().length > 0)
+                            if (pv.keys.length !== before)
+                                removed.push(
+                                    `keys pruned ${before - pv.keys.length} invalid entr${before - pv.keys.length === 1 ? 'y' : 'ies'} @ \`${label}\``,
+                                )
+                        }
+                    }
+                    const seenKey = new Map()
+                    for (const pv of raw.providers) {
+                        if (!pv || typeof pv !== 'object' || !Array.isArray(pv.keys)) continue
+                        const label = pv.name ?? pv.baseUrl ?? '?'
+                        pv.keys = pv.keys.filter((k) => {
+                            if (seenKey.has(k)) {
+                                removed.push(
+                                    `dupe key \`${maskKey(k)}\` removed from \`${label}\` (kept in \`${seenKey.get(k)}\`)`,
+                                )
+                                return false
+                            }
+                            seenKey.set(k, label)
+                            return true
+                        })
+                    }
+                }
                 if (removed.length) writeConfigRaw(raw)
             } catch (e) {
                 return interaction.editReply({ content: `Cleanup failed: ${e.message}` })
@@ -1163,11 +1203,29 @@ export async function registerAI(client, db, config) {
             if (staleIso.length) saveRuntime({ isolatedGuilds: [...ai.isolatedServers] })
             for (const id of [...ai.pausedGuilds])
                 if (!client.guilds.cache.has(id)) ai.pausedGuilds.delete(id)
-            if (!removed.length)
+            // Dead-key probe lives in config.js (pure, mock-tested): one
+            // cheap GET /models per key. Only a 401 flags dead.
+            let deadKeys = []
+            let probedKeys = 0
+            try {
+                const probed = await probeDeadKeys(raw.providers)
+                deadKeys = probed.dead
+                probedKeys = probed.probed
+            } catch {}
+            const keyLines =
+                probedKeys === 0
+                    ? []
+                    : deadKeys.length
+                      ? [
+                            `☠️ Dead keys (${deadKeys.length}/${probedKeys} probed):`,
+                            ...deadKeys.map((d) => `• ${d}`),
+                        ]
+                      : [`🔑 Keys alive: ${probedKeys}/${probedKeys} probed (401s would list here).`]
+            if (!removed.length && !deadKeys.length)
                 return interaction.editReply({ content: 'Config is clean, nothing stale in there.' })
             return interaction.editReply({
                 content:
-                    `🧽 Cleaned ${removed.length} stale entr${removed.length === 1 ? 'y' : 'ies'}:\n${removed.map((r) => `• ${r}`).join('\n')}`.slice(
+                    `🧽 Cleaned ${removed.length} stale entr${removed.length === 1 ? 'y' : 'ies'}:\n${removed.map((r) => `• ${r}`).join('\n')}${keyLines.length ? `\n${keyLines.join('\n')}` : ''}`.slice(
                         0,
                         1900,
                     ),
@@ -1519,7 +1577,7 @@ export function buildAISlashCommands() {
             ),
         new SlashCommandBuilder()
             .setName('configclean')
-            .setDescription('Sweep dead server/channel ids out of config.json (owner)')
+            .setDescription('Sweep dead servers/channels/keys out of config (owner)')
             .setContexts(0)
             .setDefaultMemberPermissions('0'),
         new SlashCommandBuilder()
