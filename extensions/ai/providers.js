@@ -258,7 +258,7 @@ export class ProviderCore {
                     maxRetries: 0,
                 })
                 console.log(
-                    `[AI] Provider '${p.name}' key rotated: ${p.state.keyIdx + 1} -> ${next + 1} (${reason}, cooldown ${Math.round(retryMs / 1000)}s)`,
+                    `[AI] \x1b[32mProvider '${p.name}' key rotated: ${p.state.keyIdx + 1} -> ${next + 1} (${reason}, cooldown ${Math.round(retryMs / 1000)}s)\x1b[0m`,
                 )
                 p.state.keyIdx = next
                 return true
@@ -528,7 +528,9 @@ export class ProviderCore {
                 this.currentKeyIdx = next
                 this._initGroq()
                 if (this._groq) {
-                    console.log(`[AI] Key rotated: ${old + 1} -> ${next + 1}`)
+                    const pname =
+                        (this._providers ?? []).find((q) => q.baseUrl === this.llmBaseUrl)?.name ?? 'chat'
+                    console.log(`[AI] \x1b[32mKey rotated: ${old + 1} -> ${next + 1} [${pname}]\x1b[0m`)
                     return true
                 }
             }
