@@ -752,11 +752,15 @@ export class ProviderCore {
         // nothing anywhere except xKiro. off degrades to low where no off
         // position exists (GPT-OSS).
         const isXkiro = /api\.xkiro\.com/i.test(baseUrl ?? '')
+        const isGemini = /generativelanguage\.googleapis\.com/i.test(baseUrl ?? '')
         const isGptOss = /gpt-oss/i.test(model ?? '')
         const isQwen27 = /qwen3\.8-27b/i.test(model ?? '')
         const legacyReasoning = /\bo[13]\b|deepseek-r/i.test(model ?? '') && !isGptOss
         let wire = null
         if (isXkiro) wire = effort === 'off' ? 'none' : effort
+        // Gemini 3-series has no off position (docs); off degrades to low.
+        // Temp tolerated, unlike groq reasoning models.
+        else if (isGemini) wire = effort === 'medium' ? 'medium' : 'low'
         else if (isGptOss) wire = effort === 'medium' ? 'medium' : 'low'
         else if (isQwen27) wire = effort === 'off' ? 'none' : effort
         else if (legacyReasoning) wire = 'low'
