@@ -994,17 +994,36 @@ TIME: ${new Date().toISOString().slice(0, 16)} UTC${personaOwned ? '' : '\nVOICE
                 { role: 'system', content: sys },
                 { role: 'user', content: String(finalPrompt).slice(0, 20000) },
             ]
-            // topP is threaded as a call-scoped argument, no shared this.topP mutation, so
-            // concurrent stateless calls can't race on each other's sampling settings.
-            // One-time modes ride their own chain; otherwise the quick agent's.
-            return await this._groqCallWithFallbacks(
-                messages,
-                effModel,
-                maxTokens,
-                temperature,
-                topP,
-                effChain,
-            )
+            // Fair-share like the chat path: /ask rides the stateless lane
+            // but must still count against the guild budget, or it becomes
+            // the hole everyone sheds through. Shed returns the breather as
+            // the reply (no message object to branch on here).
+            this._fair ??= new FairQueue()
+            const fair =
+                PERF.ai.fairShare === false
+                    ? null
+                    : await this._fair.acquire({
+                          guildId: guildId ?? 'dm',
+                          tokens: estTokens(String(finalPrompt).length + String(sys).length, maxTokens, 0),
+                          priority: isOwner || !guildId,
+                      })
+            if (fair && !fair.ok)
+                return 'whoa, breather — this server is running me hot, give it a few seconds and try again 💜'
+            try {
+                // topP is threaded as a call-scoped argument, no shared this.topP mutation, so
+                // concurrent stateless calls can't race on each other's sampling settings.
+                // One-time modes ride their own chain; otherwise the quick agent's.
+                return await this._groqCallWithFallbacks(
+                    messages,
+                    effModel,
+                    maxTokens,
+                    temperature,
+                    topP,
+                    effChain,
+                )
+            } finally {
+                fair?.release?.()
+            }
         }
 
         if (routing === 'research') {
