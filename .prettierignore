@@ -4,6 +4,14 @@ configs
 Ai Database
 runtime.json
 config.json
+config.censored.json
+config-gpt.json
 *.db
 *.db-wal
 *.db-shm
+data/
+timezones.json
+*.log
+.slash_hash
+.tmp-purge/
+.DS_Store
