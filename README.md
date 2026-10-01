@@ -357,7 +357,7 @@ npm run start:max      # 6 GB heap, 24 UV threads - 8 GB+ hosts
 | `/memory`                      | View what she remembers — or set `mode: On/Off` to opt out of storing + fetching (ghost-mode by default). Disabled entirely when `memory: false` in config | Everyone                |
 | `/ask`                         | Quick precise answer, light memory, instant (server only). `research`: Auto/On/Off, `mode`: one-time focused/fast/normal, `privacy`: On/Off | Everyone                |
 | `/avatar`, `/banner`, `/mbanner` | Server avatar, server banner, main profile banner (`av`/`bn`/`mbn` still work) | Everyone                |
-| `/summarize`                   | Summarize recent channel conversation                            | Everyone (rate-limited) |
+| `/summarize`                   | Summarize recent channel conversation (`mode`: style, `research`: claim checks, `privacy`: only-you) | Everyone (rate-limited) |
 | `/medusa`                      | Quick one-shot AI answer. No memory. DMs and group chats only. `mode`: one-time focused/fast/normal | Everyone                |
 | `/recall`                      | Look up what she remembers about a member. Fully private (only you see it). Self + mods. | Everyone (self) / Mods (others) |
 | `/kick`                        | Kick a user                                                      | Mods (Kick Members)       |

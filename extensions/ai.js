@@ -516,7 +516,8 @@ export async function registerAI(client, db, config) {
                 }
             }
 
-            await interaction.deferReply()
+            const isPrivate = (interaction.options.getString('privacy') ?? 'off') === 'on'
+            await interaction.deferReply(isPrivate ? { flags: MessageFlags.Ephemeral } : {})
             const startRaw = interaction.options.getString('start-from')
             const startFrom = startRaw ? (startRaw.match(/(\d{15,20})\s*$/)?.[1] ?? startRaw) : null
             let startMsg = null
@@ -585,10 +586,25 @@ export async function registerAI(client, db, config) {
                 .map((m) => `**${m.author}**: ${m.content}`)
                 .join('\n')
             const summaryPrompt = `Analyze this conversation and provide a clear, well-structured summary.\n**Participants:** '${participants.join("', '")}'\n**Formatting:** **bold** for key points, bullet points for key events.\n**Include:** main topics, key participants, decisions/outcomes, conflicts/resolutions, flow of discussion.\nEnd with "> **📋 TL;DR:**" (2-3 lines).\nConversation (${messages.length} messages):\n${convText}`
+            // One-time options (mirror /ask surface, adapted: summaries run
+            // the full chat path, so mode steers style via extraSys instead
+            // of swapping the engine, and research gates claim verification).
+            const sumMode = interaction.options.getString('mode')
+            const sumResearch = interaction.options.getString('research') ?? 'auto'
+            let sumExtraSys = ''
+            if (sumMode === 'fast')
+                sumExtraSys += `\n\n[USER STYLE] Fast mode: ultrashort summary, fewest words possible, no preamble.`
+            else if (sumMode === 'focused')
+                sumExtraSys += `\n\n[USER STYLE] Focused mode: analytical, thorough, structured, every decision and outcome captured.`
+            if (sumResearch === 'on')
+                sumExtraSys += `\n\nCross-check any dates, versions, prices, or office-holders mentioned against current knowledge before stating them.`
+            else if (sumResearch === 'off')
+                sumExtraSys += `\n\nAnswer strictly from the conversation above: no external facts, no present-tense world claims.`
             const summary = await ai.generateResponse({
                 prompt: summaryPrompt,
                 systemPrompt:
                     'You are Medusa, an expert conversation analyst. Provide concise, clear summaries. Use minimal blank lines, structured bullets, and avoid fluff.',
+                extraSys: sumExtraSys || undefined,
             })
             if (!summary)
                 return interaction.editReply({ content: '❌ Failed to generate summary. Please try again.' })
@@ -1592,6 +1608,32 @@ export function buildAISlashCommands() {
             .setContexts(0, 1, 2)
             .addStringOption((o) =>
                 o.setName('start-from').setDescription('Message ID or link to start from'),
+            )
+            .addStringOption((o) =>
+                o
+                    .setName('mode')
+                    .setDescription('One-time style for this summary only (does not change /mode)')
+                    .addChoices(
+                        { name: 'focused', value: 'focused' },
+                        { name: 'normal', value: 'normal' },
+                        { name: 'fast', value: 'fast' },
+                    ),
+            )
+            .addStringOption((o) =>
+                o
+                    .setName('research')
+                    .setDescription('Cross-check time-sensitive claims: Auto, On, or Off (default Auto)')
+                    .addChoices(
+                        { name: 'Auto', value: 'auto' },
+                        { name: 'On', value: 'on' },
+                        { name: 'Off', value: 'off' },
+                    ),
+            )
+            .addStringOption((o) =>
+                o
+                    .setName('privacy')
+                    .setDescription('On = only you see it (default Off)')
+                    .addChoices({ name: 'On', value: 'on' }, { name: 'Off', value: 'off' }),
             ),
         new SlashCommandBuilder()
             .setName('medusa')
