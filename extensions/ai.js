@@ -845,7 +845,7 @@ export async function registerAI(client, db, config) {
             if (!input) {
                 const cur = ai.userModes[uid2] ?? 3
                 return interaction.reply({
-                    content: `Your current mode: **${modeLabel(cur)}** (${cur}).\nUse \`/mode focused\`, \`/mode normal\`, \`/mode fast\`, or \`/mode auto\` to switch.`,
+                    content: `Your current mode: **${modeLabel(cur)}** (${cur}, default: auto).\nUse \`/mode focused\`, \`/mode normal\`, \`/mode fast\`, or \`/mode auto\` to switch.`,
                     flags: MessageFlags.Ephemeral,
                 })
             }
@@ -1344,8 +1344,7 @@ export async function registerAI(client, db, config) {
         else if (['normal', '0'].includes(input)) newMode = 0
         else return msg.reply('❌ Invalid mode. Use `focused`/`1`, `normal`/`0`, `fast`/`2`, or `auto`/`3`')
 
-        if (newMode === 0) ai.userModes[uid] = 0
-        else ai.userModes[uid] = newMode
+        ai.userModes[uid] = newMode
         ai._scheduleUsersSave()
         const modeName = modeLabel(newMode)
         // Auto varies per message — naming one engine would be wrong, so

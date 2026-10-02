@@ -409,6 +409,13 @@ const ALWAYS_LIVE_RE = new RegExp(
         .join('|')})\\b`,
     'i',
 )
+// Pre-compiled once: the nosearch path rebuilt one RegExp per signal
+// (~60) on every research turn. Plain phrases, so a single alternation
+// with the same gi semantics is equivalent.
+const NO_SEARCH_RE = new RegExp(
+    `(?:${NO_SEARCH_SIGNALS.map((s) => s.replace(/[.*+?^${}()|[\]\\]/g, '\\$&')).join('|')})`,
+    'gi',
+)
 
 export {
     DEAD_KEYS_FILE,
@@ -417,6 +424,7 @@ export {
     NEVER_RESEARCH_PREFIXES,
     NEVER_RESEARCH_EXACT,
     NO_SEARCH_SIGNALS,
+    NO_SEARCH_RE,
     NSFW_TERMS,
     NSFW_RE,
     DANGEROUS_TERMS,

@@ -28,7 +28,7 @@ import {
     CAPABILITIES_NOTE,
     DESTRUCTIVE_CMDS,
     NEVER_RESEARCH_PREFIXES,
-    NO_SEARCH_SIGNALS,
+    NO_SEARCH_RE,
     SEARCH_EMOJIS,
     makeIdSet,
 } from './constants.js'
@@ -106,7 +106,48 @@ export function mergeUsersData(prevU, prevS, maps, pruneAbsent = false) {
 // Built from the shared DESTRUCTIVE_CMDS set (+warn, whose instant embed would
 // also leak) so the streaming gate can never drift from the confirm flow.
 export const MAY_EMIT_CMD_RE = new RegExp(`\\b(?:${[...DESTRUCTIVE_CMDS, 'warn'].join('|')})\\b`, 'i')
-
+// Shared trigger-word compiler: private.js hot-swaps trigger words at
+// runtime and used to duplicate this inline (drift risk on divergence).
+export const compileTriggerWords = (words) =>
+    (words ?? []).map((w) => new RegExp(`\\b${String(w).replace(/[.*+?^${}()|[\]\\[]/g, '\\$&')}\\b`))
+// Second-thought gate: hedged phrasing that invites a verification pass.
+// Module scope — was rebuilt on every invocation.
+const HEDGE_RE =
+    /\b(i('m| am)? not (sure|certain)|not sure|might be|maybe|probably|i think|if i remember|afaik|i believe|not 100%)\b/i
+// Token-saver greeting pool and alias blocklist: static data, not per-call.
+const GREET_POOL = ['hey 💜', 'heyyy', 'hi hi 💜', 'hey hey', 'yo 💜']
+const ALIAS_BLACKLIST = new Set([
+    'just',
+    'not',
+    'also',
+    'here',
+    'back',
+    'okay',
+    'fine',
+    'done',
+    'sorry',
+    'actually',
+    'literally',
+    'basically',
+    'probably',
+])
+// File-extension map for the file-return path: static, not per-call.
+const FILE_EXT_MAP = {
+    js: 'js',
+    javascript: 'js',
+    ts: 'ts',
+    py: 'py',
+    python: 'py',
+    json: 'json',
+    html: 'html',
+    css: 'css',
+    md: 'md',
+    sh: 'sh',
+    sql: 'sql',
+    yaml: 'yaml',
+    yml: 'yml',
+    txt: 'txt',
+}
 export class AIChatManager extends OutputCore {
     constructor(client, db, config) {
         // Required: OutputCore -> AgentCommandCore -> VisionCore -> ResearchCore -> ProviderCore.
@@ -167,9 +208,7 @@ export class AIChatManager extends OutputCore {
         this.isolatedServers = new Set(config.isolatedGuildIds)
         this.triggerWords = config.triggers.length ? config.triggers : ['medusa']
         // Pre-compile trigger regexes once (avoids re-compilation on every message)
-        this._triggerRegexes = this.triggerWords.map(
-            (w) => new RegExp(`\\b${w.replace(/[.*+?^${}()|[\]\\]/g, '\\$&')}\\b`),
-        )
+        this._triggerRegexes = compileTriggerWords(this.triggerWords)
         // Own-mention regexes, same treatment: six call sites used to build
         // these fresh on every message. Lazily keyed on our id (stable).
         this._botRxId = null
@@ -834,8 +873,6 @@ TIME: ${new Date().toISOString().slice(0, 16)} UTC${personaOwned ? '' : '\nVOICE
 
         // Keep time at the END of the context block so the prefix stays stable between
         // messages (lets NIM's KV-cache hit on the static parts of the system prompt).
-        // Move this push to right before `parts.filter(Boolean).join('')` below.
-        // (Already near the bottom, just flag: don't move it higher.)
         parts.push(`TIME: ${new Date().toISOString().replace('T', ' ').slice(0, 19)} UTC`)
 
         const upMs = Date.now() - (this.client.heart?.startTime || Date.now())
@@ -1123,12 +1160,17 @@ and never narrate the research itself or its quality either way.`
 
     // Built-in style suffixes for the fixed modes. Configured mode prompts
     // take precedence (handled at the call site); auto-resolved turns get
-    // theirs in generateResponse after resolution.
-    _modeStyle(name) {
+    // theirs in generateResponse after resolution. Auto-fast is deliberately
+    // warmer than explicit fast: banter routed cheap should stay short, not
+    // go dry — explicit /mode fast keeps the full ultrashort contract.
+    _modeStyle(name, auto = false) {
         if (name === 'focused')
             return `\n\n[USER STYLE] Focused mode: highly analytical, concise, direct, task-oriented, professional but personable, and minimal emoji — in this character's voice, not instead of it.`
-        if (name === 'fast')
+        if (name === 'fast') {
+            if (auto)
+                return `\n\n[USER STYLE] Fast mode (auto): keep replies short and punchy, match the user's energy — brevity, never dryness. Stay warm, playful, and in character; no preamble, no follow-ups.`
             return `\n\n[USER STYLE] Fast mode: ultrashort replies, answer in as few words as possible while staying in character. No preamble, no follow-ups, minimal emoji.`
+        }
         return ''
     }
     // Raw mode with the default folded in: absent entry = auto (3).
@@ -1385,8 +1427,17 @@ and never narrate the research itself or its quality either way.`
             // Auto style suffix follows the getUserPrompt precedence:
             // configured prompt first, else the built-in.
             if (autoResolved && messages[0]?.role === 'system') {
-                const configured = this.modes?.[autoResolved]?.systemPrompt?.trim() ?? ''
-                const suffix = configured ? `\n\n[USER STYLE] ${configured}` : this._modeStyle(autoResolved)
+                // Configured prompt precedence: the resolved mode's own
+                // prompt wins, else the generic auto prompt (a configured
+                // modes.auto.systemPrompt would otherwise be dead config —
+                // the base prompt never sees the name 'auto'), else built-in.
+                const configured =
+                    this.modes?.[autoResolved]?.systemPrompt?.trim() ||
+                    this.modes?.auto?.systemPrompt?.trim() ||
+                    ''
+                const suffix = configured
+                    ? `\n\n[USER STYLE] ${configured}`
+                    : this._modeStyle(autoResolved, true)
                 if (suffix && !messages[0].content.includes('[USER STYLE]')) messages[0].content += suffix
             }
             try {
@@ -1531,8 +1582,7 @@ and never narrate the research itself or its quality either way.`
             }
 
         if (routing === 'nosearch') {
-            let clean = prompt
-            for (const sig of NO_SEARCH_SIGNALS) clean = clean.replace(new RegExp(sig, 'gi'), '').trim()
+            let clean = prompt.replace(NO_SEARCH_RE, '').trim()
             // Mirror generateResponse's internal streaming gate exactly (it streams
             // live only when a channel exists and no destructive verb may be emitted);
             // otherwise the caller re-posts the already-streamed text -> double reply.
@@ -1711,9 +1761,7 @@ and never narrate the research itself or its quality either way.`
         if (confirmPending) return
         if (!response || response.length < 15 || response.startsWith('⏳')) return
         if (/^nah i'm not going hunting|^hard pass on that one/.test(response)) return
-        const HEDGE =
-            /\b(i('m| am)? not (sure|certain)|not sure|might be|maybe|probably|i think|if i remember|afaik|i believe|not 100%)\b/i
-        if (!HEDGE.test(response) && !(researched && !hadSources)) return
+        if (!HEDGE_RE.test(response) && !(researched && !hadSources)) return
         const since = Date.now()
         // Breathing room so it reads as a second thought, not a double-post.
         await new Promise((r) => {
@@ -1867,7 +1915,8 @@ and never narrate the research itself or its quality either way.`
         return { kind: 'passive', reason: 'no_summon' }
     }
 
-    // Deprecated alias, kept so any external caller doesn't break
+    // Deprecated alias, kept so any external caller doesn't break.
+    // (No external callers remain; the one internal use below goes direct.)
     isTrigger(message) {
         return this.decideTrigger(message).kind === 'trigger'
     }
@@ -1908,23 +1957,7 @@ and never narrate the research itself or its quality either way.`
         const m = /```(\w*)\n([\s\S]{20,200000}?)\n?```/.exec(response ?? '')
         if (!m) return null
         const lang = (m[1] || 'txt').toLowerCase().slice(0, 10)
-        const extMap = {
-            js: 'js',
-            javascript: 'js',
-            ts: 'ts',
-            py: 'py',
-            python: 'py',
-            json: 'json',
-            html: 'html',
-            css: 'css',
-            md: 'md',
-            sh: 'sh',
-            sql: 'sql',
-            yaml: 'yaml',
-            yml: 'yml',
-            txt: 'txt',
-        }
-        const ext = extMap[lang] ?? 'txt'
+        const ext = FILE_EXT_MAP[lang] ?? 'txt'
         const nameAsk = /\b(?:save as|call it|name it|filename)\s+([A-Za-z0-9_][\w.-]{0,60}\.\w{1,8})/i.exec(
             userContent ?? '',
         )
@@ -1994,8 +2027,7 @@ and never narrate the research itself or its quality either way.`
                     /^(hi|hey|hello|yo|sup|ty|thanks|bye|cya|gn|gm|ok|lol|lmao|💜|💚|·)\b/i.test(bq) &&
                     Math.random() >= 0.25
                 ) {
-                    const GREET = ['hey 💜', 'heyyy', 'hi hi 💜', 'hey hey', 'yo 💜']
-                    fixed = GREET[Math.floor(Math.random() * GREET.length)]
+                    fixed = GREET_POOL[Math.floor(Math.random() * GREET_POOL.length)]
                 } else if (
                     /^(your|ur|medusa'?s?|bot'?s?|her)\s+(ram|memory|cpu|uptime|ping|latency|status|vitals|lag|health)\b/i.test(
                         bareQ.trim(),
@@ -2247,35 +2279,25 @@ and never narrate the research itself or its quality either way.`
             const aliasMatch = content
                 .toLowerCase()
                 .match(/(?:call me|my name is|refer to me as)\s+([a-z][a-z0-9_-]{2,19})\b/)
-            const ALIAS_BLACKLIST = new Set([
-                'just',
-                'not',
-                'also',
-                'here',
-                'back',
-                'okay',
-                'fine',
-                'done',
-                'sorry',
-                'actually',
-                'literally',
-                'basically',
-                'probably',
-            ])
             if (aliasMatch && !ALIAS_BLACKLIST.has(aliasMatch[1]) && !memOff)
                 mem.setAlias(userId, aliasMatch[1], userId)
 
             const key = `${userId}-${message.channel.id}`
             if (!memOff && !this.messageHistory.has(key)) this.messageHistory.set(key, [])
 
-            let { url: imageUrl, isGif, label: imgLabel, spoilerSkipped } = this._getImageFromMessage(message)
+            let {
+                url: imageUrl,
+                isGif,
+                label: imgLabel,
+                spoilerSkipped,
+                allImages,
+            } = this._getImageFromMessage(message)
             if (!imageUrl && message.reference?.messageId) {
                 const rr = await this._resolveReplyContext(message)
                 if (rr?.hasImage) ({ url: imageUrl, isGif, label: imgLabel } = rr.imgData)
             }
             if (imageUrl) {
                 const vSys = this.getUserPrompt(userId, message.guild?.id) || this.instructions || ''
-                const { allImages } = this._getImageFromMessage(message)
                 const vRes = await this._callVision(content, imageUrl, isGif, vSys, userId, allImages, {
                     guildId: message?.guild?.id,
                     priority: String(message?.author?.id) === String(this.ownerId) || !message?.guild,
@@ -2429,7 +2451,14 @@ and never narrate the research itself or its quality either way.`
                             if (entry) entry.uiMsg = m
                         }
                     }
-                } catch {}
+                } catch (e) {
+                    // A failed confirm-UI attach used to vanish silently and
+                    // read as "she doesn't send confirms". Log it loud.
+                    console.error(
+                        `[AI] Confirm UI attach failed for ${message?.id} in #${message?.channel?.id}:`,
+                        String(e?.message ?? e).slice(0, 160),
+                    )
+                }
                 const mem = this.getMem(message.guild)
                 if (!execResult.confirmPending)
                     if (!memOff) mem.addConversation(userId, message.channel.id, finalContent, finalText)

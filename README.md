@@ -349,7 +349,7 @@ npm run start:max      # 6 GB heap, 24 UV threads - 8 GB+ hosts
 | ------------------------------ | ---------------------------------------------------------------- | ----------------------- |
 | `/memory`                      | View what Open-Dusa remembers about you                          | Everyone                |
 | `/forgetme`                    | Permanently delete your stored data                              | Everyone                |
-| `/mode`                        | Switch between `focused` (analytical), `normal` (casual), `fast` (ultrashort), and `auto` (picked per message, the default for everyone). Named modes can pin their own model + fallbacks via `modes{}` in config. Works in DMs and group chats too | Everyone                |
+| `/mode`                        | Switch between `focused` (analytical), `normal` (casual), `fast` (ultrashort), and `auto` (picked per message, the default for everyone — auto-fast stays warm, explicit fast stays terse). Named modes can pin their own model + fallbacks via `modes{}` in config. Works in DMs and group chats too | Everyone                |
 | `/prompt`                      | Set, view, or reset your custom persona (`system` text, `reset:true` wipes) | Everyone                |
 | `/server-prompt`                | Set, view, or reset this server's persona (same args) | Manage Server           |
 | `/streaming`                   | Pick instant replies (`off`, no typing indicator) or fancy streaming (`on`) — just for you | Everyone                |

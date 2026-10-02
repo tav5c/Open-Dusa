@@ -796,7 +796,7 @@ export class ProviderCore {
         payload.stream = false
         try {
             const r = await client.chat.completions.create(payload)
-            return r.choices[0].message.content
+            return r.choices?.[0]?.message?.content ?? null
         } catch (e) {
             const err = String(e)
             if (this._isCapacityError(e)) return { capacityError: true }

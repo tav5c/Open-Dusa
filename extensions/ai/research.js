@@ -14,6 +14,39 @@ import { FairQueue, estTokens } from './fairqueue.js'
 import { staticCaps } from './capabilities.js'
 import { loadPerformance } from '../performance.js'
 
+// Query-strip patterns, built once: _extractSearchQuery rebuilt all 14 on
+// every research message. The (you|u|ya) alternation is inlined statically.
+const _YOU = '(?:you|u|ya)'
+const SEARCH_STRIP_RES = [
+    new RegExp(
+        `^(?:do|perform|conduct)\\s+(?:a\\s+)?(?:deep\\s+|thorough\\s+|full\\s+|quick\\s+|little\\s+)?research\\s+(?:about|on|for|into)?\\s*`,
+        'i',
+    ),
+    new RegExp(
+        `^(?:can ${_YOU}\\s+|could ${_YOU}\\s+)?(?:please\\s+)?(?:make a\\s+|do a\\s+|make\\s+|do\\s+)?research\\s+(?:about|on|for)\\s+`,
+        'i',
+    ),
+    new RegExp(
+        `^(?:can ${_YOU}\\s+|could ${_YOU}\\s+)?(?:please\\s+)?search\\s+(?:(?:up|for|it|this|that|me)\\b\\s*)+`,
+        'i',
+    ),
+    new RegExp(`^(?:can ${_YOU}\\s+|could ${_YOU}\\s+)?(?:please\\s+)?look\\s+up\\s+`, 'i'),
+    new RegExp(`^(?:can ${_YOU}\\s+|could ${_YOU}\\s+)?(?:please\\s+)?lookup\\s+`, 'i'),
+    new RegExp(`^(?:can ${_YOU}\\s+|could ${_YOU}\\s+)?(?:please\\s+)?find(?:\\s+me)?\\s+`, 'i'),
+    new RegExp(`^(?:can ${_YOU}\\s+|could ${_YOU}\\s+)?(?:please\\s+)?tell me about\\s+`, 'i'),
+    new RegExp(`^(?:can ${_YOU}\\s+|could ${_YOU}\\s+)?(?:please\\s+)?tell me\\s+`, 'i'),
+    new RegExp(`^(?:can ${_YOU}\\s+|could ${_YOU}\\s+)?(?:please\\s+)?give me\\s+`, 'i'),
+    new RegExp(`^(?:can ${_YOU}\\s+|could ${_YOU}\\s+)?(?:please\\s+)?list\\s+`, 'i'),
+    new RegExp(`^(?:can ${_YOU}\\s+|could ${_YOU}\\s+)?(?:please\\s+)?what(?:'s| is)\\s+`, 'i'),
+    new RegExp(`^(?:can ${_YOU}\\s+|could ${_YOU}\\s+)?(?:please\\s+)?who(?:'s| is)\\s+`, 'i'),
+    new RegExp(
+        `^(?:can ${_YOU}\\s+|could ${_YOU}\\s+)?(?:please\\s+)?google\\s+(?:(?:it|this|that|for\\s+me)\\b\\s*)+`,
+        'i',
+    ),
+    new RegExp(`^(?:can ${_YOU}\\s+|could ${_YOU}\\s+)?(?:please\\s+)?show me\\s+`, 'i'),
+    /^research\s+(?:it\s+up|this\s+up|that\s+up|for\s+me|about|on\b)\s*/i,
+]
+
 const PERF = loadPerformance()
 
 export class ResearchCore extends ProviderCore {
@@ -141,6 +174,13 @@ export class ResearchCore extends ProviderCore {
     async _callResearchWith(client, model, prompt, allowRotate, _retried = false, pre = undefined) {
         if (!client) return null
 
+        // Keys at method scope: the direct branch below used to declare
+        // serperKey inside its own block while the tool loop read it outside
+        // → ReferenceError on every Tavily-miss turn, silently killing the
+        // fallback the comments promise.
+        const serperKey = (this._config ?? this.config).search?.serperKey
+        const tavilyKey = (this._config ?? this.config).search?.tavilyKey
+
         // Tavily-primary: one direct search+answer call first, then a SINGLE
         // synthesis round — instead of up to 4 model rounds each possibly
         // fetching. Falls back to the model tool loop when Tavily is missing,
@@ -172,11 +212,9 @@ export class ResearchCore extends ProviderCore {
             // Synthesis failed: fall through to the tool loop below — unless
             // Tavily already ran this turn and Serper isn't configured, in
             // which case the loop would just re-run the same dead search.
-            const serperKey = (this._config ?? this.config).search?.serperKey
             if (pre !== undefined && !serperKey) return null
         }
 
-        const tavilyKey = (this._config ?? this.config).search?.tavilyKey
         const searchTool = {
             type: 'function',
             function: {
@@ -449,36 +487,7 @@ export class ResearchCore extends ProviderCore {
             .replace(/\s+and\s+research(?:\s+for\s+me|\s+it\s+up|\s+this\s+up|\s+that\s+up)?\.?$/i, '')
             .replace(/\s+research\s+(?:for\s+me|it\s+up|this\s+up|that\s+up)\.?$/i, '')
             .trim()
-        const you = '(?:you|u|ya)'
-        const prefixes = [
-            new RegExp(
-                `^(?:do|perform|conduct)\\s+(?:a\\s+)?(?:deep\\s+|thorough\\s+|full\\s+|quick\\s+|little\\s+)?research\\s+(?:about|on|for|into)?\\s*`,
-                'i',
-            ),
-            new RegExp(
-                `^(?:can ${you}\\s+|could ${you}\\s+)?(?:please\\s+)?(?:make a\\s+|do a\\s+|make\\s+|do\\s+)?research\\s+(?:about|on|for)\\s+`,
-                'i',
-            ),
-            new RegExp(
-                `^(?:can ${you}\\s+|could ${you}\\s+)?(?:please\\s+)?search\\s+(?:(?:up|for|it|this|that|me)\\b\\s*)+`,
-                'i',
-            ),
-            new RegExp(`^(?:can ${you}\\s+|could ${you}\\s+)?(?:please\\s+)?look\\s+up\\s+`, 'i'),
-            new RegExp(`^(?:can ${you}\\s+|could ${you}\\s+)?(?:please\\s+)?lookup\\s+`, 'i'),
-            new RegExp(`^(?:can ${you}\\s+|could ${you}\\s+)?(?:please\\s+)?find(?:\\s+me)?\\s+`, 'i'),
-            new RegExp(`^(?:can ${you}\\s+|could ${you}\\s+)?(?:please\\s+)?tell me about\\s+`, 'i'),
-            new RegExp(`^(?:can ${you}\\s+|could ${you}\\s+)?(?:please\\s+)?tell me\\s+`, 'i'),
-            new RegExp(`^(?:can ${you}\\s+|could ${you}\\s+)?(?:please\\s+)?give me\\s+`, 'i'),
-            new RegExp(`^(?:can ${you}\\s+|could ${you}\\s+)?(?:please\\s+)?list\\s+`, 'i'),
-            new RegExp(`^(?:can ${you}\\s+|could ${you}\\s+)?(?:please\\s+)?what(?:'s| is)\\s+`, 'i'),
-            new RegExp(`^(?:can ${you}\\s+|could ${you}\\s+)?(?:please\\s+)?who(?:'s| is)\\s+`, 'i'),
-            new RegExp(
-                `^(?:can ${you}\\s+|could ${you}\\s+)?(?:please\\s+)?google\\s+(?:(?:it|this|that|for\\s+me)\\b\\s*)+`,
-                'i',
-            ),
-            new RegExp(`^(?:can ${you}\\s+|could ${you}\\s+)?(?:please\\s+)?show me\\s+`, 'i'),
-            /^research\s+(?:it\s+up|this\s+up|that\s+up|for\s+me|about|on\b)\s*/i,
-        ]
+        const prefixes = SEARCH_STRIP_RES
         for (const p of prefixes) q = q.replace(p, '').trim()
         q = q.replace(/\s+for me\.?$|\s+please\.?$/i, '').trim()
         // Parenthetical asides to the bot ("(look it up)", "(search this)")
