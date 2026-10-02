@@ -1718,10 +1718,10 @@ and never narrate the research itself or its quality either way.`
                 const footer = footerParts.length
                     ? `-# 🔗 ${footerParts.join(' · ')} · ${elapsed}s`
                     : `-# 🔍 ${elapsed}s`
-                responsePayload =
-                    final.length + footer.length + 1 <= 2000
-                        ? final + '\n' + footer
-                        : final.slice(0, 2000 - footer.length - 1).trimEnd() + '\n' + footer
+                // Full text, never sliced: the callers chunk across messages
+                // (streamed edit + follow-ups, or the plain multi-send). Slicing
+                // here overwrote the live stream with a truncated stump.
+                responsePayload = `${final}\n${footer}`
             }
         }
 
@@ -2429,7 +2429,12 @@ and never narrate the research itself or its quality either way.`
                               }
                             : { content: body }
                         await ours.edit(editPayload).catch(() => {})
-                        for (const extra of chunks.slice(1, 4))
+                        // 6-chunk ceiling (~12k chars): past it the tail is cut
+                        // and labeled, never silently dropped mid-section.
+                        const posted = chunks.slice(0, 6)
+                        if (chunks.length > 6)
+                            posted[posted.length - 1] += '\n\n-# …cut here — say "continue" for the rest'
+                        for (const extra of posted.slice(1))
                             await this.secureReply(message, extra).catch(() => {})
                         if (ui) {
                             await this._watchConfirmUI(ours, ui.key, message)
@@ -2551,9 +2556,14 @@ and never narrate the research itself or its quality either way.`
                     if (m) sentMsgs.push(m)
                 }
             } else {
-                for (let i = 0; i < Math.min(chunks.length, 4); i++) {
-                    const isLast = i === Math.min(chunks.length, 4) - 1 || i === chunks.length - 1
-                    const m = await this.secureReply(message, chunks[i], {
+                // 6-chunk ceiling (~12k chars): past it the tail is cut and
+                // labeled, never silently dropped mid-section.
+                const visible = chunks.slice(0, 6)
+                if (chunks.length > 6)
+                    visible[visible.length - 1] += '\n\n-# …cut here — say "continue" for the rest'
+                for (let i = 0; i < visible.length; i++) {
+                    const isLast = i === visible.length - 1
+                    const m = await this.secureReply(message, visible[i], {
                         embeds: isLast ? [...extraEmbeds.slice(0, 10), ...uiEmbeds] : [],
                         ...(isLast && ui ? { components: uiRow } : {}),
                     })
