@@ -106,10 +106,6 @@ export function mergeUsersData(prevU, prevS, maps, pruneAbsent = false) {
 // Built from the shared DESTRUCTIVE_CMDS set (+warn, whose instant embed would
 // also leak) so the streaming gate can never drift from the confirm flow.
 export const MAY_EMIT_CMD_RE = new RegExp(`\\b(?:${[...DESTRUCTIVE_CMDS, 'warn'].join('|')})\\b`, 'i')
-// Shared trigger-word compiler: private.js hot-swaps trigger words at
-// runtime and used to duplicate this inline (drift risk on divergence).
-export const compileTriggerWords = (words) =>
-    (words ?? []).map((w) => new RegExp(`\\b${String(w).replace(/[.*+?^${}()|[\]\\[]/g, '\\$&')}\\b`))
 // Second-thought gate: hedged phrasing that invites a verification pass.
 // Module scope — was rebuilt on every invocation.
 const HEDGE_RE =
@@ -208,7 +204,9 @@ export class AIChatManager extends OutputCore {
         this.isolatedServers = new Set(config.isolatedGuildIds)
         this.triggerWords = config.triggers.length ? config.triggers : ['medusa']
         // Pre-compile trigger regexes once (avoids re-compilation on every message)
-        this._triggerRegexes = compileTriggerWords(this.triggerWords)
+        this._triggerRegexes = this.triggerWords.map(
+            (w) => new RegExp(`\\b${String(w).replace(/[.*+?^${}()|[\]\\[]/g, '\\$&')}\\b`),
+        )
         // Own-mention regexes, same treatment: six call sites used to build
         // these fresh on every message. Lazily keyed on our id (stable).
         this._botRxId = null
