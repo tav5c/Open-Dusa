@@ -6,50 +6,54 @@ import { loadPerformance } from '../performance.js'
 
 const PERF = loadPerformance()
 
+const TEXT_EXTS = new Set([
+    '.txt',
+    '.md',
+    '.js',
+    '.mjs',
+    '.cjs',
+    '.ts',
+    '.jsx',
+    '.tsx',
+    '.py',
+    '.json',
+    '.css',
+    '.html',
+    '.c',
+    '.cpp',
+    '.h',
+    '.java',
+    '.go',
+    '.rs',
+    '.rb',
+    '.sh',
+    '.yaml',
+    '.yml',
+    '.toml',
+    '.xml',
+    '.sql',
+    '.log',
+    '.env',
+    '.ini',
+    '.cfg',
+    '.vue',
+    '.svelte',
+    '.cs',
+    '.php',
+    '.lua',
+    '.dart',
+    '.kt',
+    '.swift',
+    '.ex',
+    '.exs',
+])
+
+const IMAGE_TYPES = new Set(['image/png', 'image/jpeg', 'image/jpg', 'image/webp', 'image/gif'])
+const IMAGE_EXT_RE = /\.(png|jpe?g|webp|gif)$/i
+
 export class VisionCore extends ResearchCore {
     // Vision pipeline
     async _processTextAttachments(message) {
-        const TEXT_EXTS = new Set([
-            '.txt',
-            '.md',
-            '.js',
-            '.mjs',
-            '.cjs',
-            '.ts',
-            '.jsx',
-            '.tsx',
-            '.py',
-            '.json',
-            '.css',
-            '.html',
-            '.c',
-            '.cpp',
-            '.h',
-            '.java',
-            '.go',
-            '.rs',
-            '.rb',
-            '.sh',
-            '.yaml',
-            '.yml',
-            '.toml',
-            '.xml',
-            '.sql',
-            '.log',
-            '.env',
-            '.ini',
-            '.cfg',
-            '.vue',
-            '.svelte',
-            '.cs',
-            '.php',
-            '.lua',
-            '.dart',
-            '.kt',
-            '.swift',
-            '.ex',
-            '.exs',
-        ])
         const allText = [...message.attachments.values()].filter((att) => {
             const ct = (att.contentType ?? '').toLowerCase()
             const ext = att.name?.split('.').pop()?.toLowerCase()
@@ -65,7 +69,7 @@ export class VisionCore extends ResearchCore {
         if (!textAtts.length) return spoilerNote
         const totalSize = textAtts.reduce((sum, att) => sum + att.size, 0)
         if (totalSize > 150_000)
-            return `\n\n[${textAtts.length} file(s) skipped, combined size ${(totalSize / 1024).toFixed(0)}KB exceeds limit]`
+            return `\n\n[${textAtts.length} file(s) skipped, combined size ${(totalSize / 1024).toFixed(0)}KB exceeds limit]${spoilerNote}`
         // Fetch all text attachments in parallel
         const results = await Promise.all(
             textAtts.map(async (att) => {
@@ -73,6 +77,7 @@ export class VisionCore extends ResearchCore {
                     return `\n\n[File: \`${att.name}\`, too large to read (${(att.size / 1024).toFixed(0)}KB)]`
                 try {
                     const res = await fetch(att.url, { signal: AbortSignal.timeout(10_000) })
+                    if (!res.ok) return ''
                     const text = await res.text()
                     return `\n\n[Attached File: ${att.name}]\n\`\`\`\n${text.slice(0, 10000)}\n\`\`\``
                 } catch (e) {
@@ -83,13 +88,13 @@ export class VisionCore extends ResearchCore {
         )
         return results.join('') + spoilerNote
     }
+
     _getImageFromMessage(message) {
-        const IMAGE_TYPES = new Set(['image/png', 'image/jpeg', 'image/jpg', 'image/webp', 'image/gif'])
         // Mobile/CDN uploads sometimes arrive without a content type — trust the extension then.
         const isImageAtt = (att) => {
             const ct = (att.contentType ?? '').split(';')[0].trim().toLowerCase()
             if (IMAGE_TYPES.has(ct)) return true
-            return /\.(png|jpe?g|webp|gif)$/i.test(att.name ?? '')
+            return IMAGE_EXT_RE.test(att.name ?? '')
         }
         // Collect ALL images, not just the first. Spoiler-tagged attachments
         // are counted but never fetched (see _processTextAttachments).
@@ -123,7 +128,13 @@ export class VisionCore extends ResearchCore {
             }
         }
 
-        const ref = message.reference?.resolved
+        // discord.js v14 does not populate message.reference.resolved; read from
+        // the channel message cache or pre-resolved reply context instead.
+        const refId = message.reference?.messageId
+        const ref =
+            (refId ? message.channel?.messages?.cache?.get(refId) : null) ??
+            message._medusaReplyCtx?.ref ??
+            null
         if (ref) {
             for (const att of ref.attachments.values()) {
                 if (att.spoiler) {
@@ -148,10 +159,19 @@ export class VisionCore extends ResearchCore {
         return { url: null, isGif: false, label: null, spoilerSkipped }
     }
 
+    // Async companion that fetches uncached reply references when needed.
+    async _getImageFromMessageAsync(message) {
+        const direct = this._getImageFromMessage(message)
+        if (direct.url || !message?.reference?.messageId) return direct
+        const ref = await message.fetchReference?.().catch(() => null)
+        if (!ref) return direct
+        return this._getImageFromMessage(ref)
+    }
+
     // Stage-1 describe against one specific client+model. Returns {raw, errType};
     // errType 'expired'/'format' are terminal answers, null raw + null errType
     // means "try the next fallback". Key rotation only for the primary.
-    async _describeWith(client, model, s1msgs, userText, imageUrl, allowRotate) {
+    async _describeWith(client, model, s1msgs, userText, imageUrls, allowRotate) {
         let raw = null
         let errType = null
         try {
@@ -162,12 +182,16 @@ export class VisionCore extends ResearchCore {
                 temperature: this.visionTemp,
                 top_p: this.topP,
             })
-            raw = r.choices[0].message.content
+            raw = r?.choices?.[0]?.message?.content ?? null
         } catch (e) {
             const err = String(e).toLowerCase()
-            if (err.includes('404') && (err.includes('retrieve media') || err.includes('failed to retrieve')))
+            const status = e?.status ?? e?.statusCode
+            if (
+                (status === 404 || err.includes('404')) &&
+                (err.includes('retrieve media') || err.includes('failed to retrieve'))
+            )
                 errType = 'expired'
-            else if (err.includes('400') || err.includes('invalid image') || err.includes('invalid url'))
+            else if (status === 400 || err.includes('invalid image') || err.includes('invalid url'))
                 errType = 'format'
             else if (this._isCapacityError(e) || this._isRequestError(e)) return { raw: null, errType: null }
             else if (allowRotate) {
@@ -184,24 +208,35 @@ export class VisionCore extends ResearchCore {
                                 temperature: this.visionTemp,
                                 top_p: this.topP,
                             })
-                            raw = r2.choices[0].message.content
+                            raw = r2?.choices?.[0]?.message?.content ?? null
                         } catch {}
                     }
                 }
             }
         }
 
-        // On format/400 error, try once more with the raw URL (no base64), some NVIDIA
-        // vision endpoints reject data URLs and need a direct link.
-        if (errType === 'format' && imageUrl) {
+        // On format/400 error, try once more with the raw URLs (no base64), some NVIDIA
+        // vision endpoints reject data URLs and need direct links. Preserve all images.
+        const retryUrls = Array.isArray(imageUrls)
+            ? imageUrls.filter(Boolean)
+            : imageUrls
+              ? [imageUrls]
+              : []
+        if (errType === 'format' && retryUrls.length > 0) {
             try {
                 const retryMsgs = [
                     { role: 'system', content: s1msgs[0]?.content ?? '' },
                     {
                         role: 'user',
                         content: [
-                            { type: 'image_url', image_url: { url: imageUrl } },
-                            { type: 'text', text: userText },
+                            ...retryUrls.map((u) => ({ type: 'image_url', image_url: { url: u } })),
+                            {
+                                type: 'text',
+                                text:
+                                    retryUrls.length > 1
+                                        ? `There are ${retryUrls.length} images above. ${userText}`
+                                        : userText,
+                            },
                         ],
                     },
                 ]
@@ -212,7 +247,7 @@ export class VisionCore extends ResearchCore {
                     temperature: this.visionTemp,
                     top_p: this.topP,
                 })
-                raw = r.choices[0].message.content
+                raw = r?.choices?.[0]?.message?.content ?? null
                 errType = null
             } catch (e) {
                 console.warn('[AI] Vision raw-URL retry also failed:', String(e).slice(0, 100))
@@ -232,8 +267,9 @@ export class VisionCore extends ResearchCore {
     ) {
         const vclient = this._visionClient ?? this._groq
         if (!vclient && !this.agentFallbacks?.vision?.length) return null
-        // Fair-share: one gate per image request (describe + its bounded
-        // fallback chain ride under it). Null fairCtx = ungated.
+        // Fair-share: one gate per Stage-1 vision describe call. Released BEFORE
+        // calling this.generateResponse(...) so Stage 2 cannot self-deadlock on
+        // the same FairQueue when all inflight slots are occupied.
         let fair = null
         if (fairCtx && PERF.ai.fairShare !== false) {
             this._fair ??= new FairQueue()
@@ -249,6 +285,14 @@ export class VisionCore extends ResearchCore {
             if (!fair.ok) return null
             if (fair.shared) return await fair.shared
         }
+        const releaseStage1 = () => {
+            if (fair) {
+                fair.release?.()
+                fair = null
+            }
+        }
+        let raw = null
+        let errType = null
         try {
             const gifNote = isGif
                 ? "\n\nNote: This is an animated GIF. You can only see the first frame. Describe what you see clearly and precisely, vibe, subject, colours, action. Be honest that it's one frame if movement is implied."
@@ -279,9 +323,6 @@ export class VisionCore extends ResearchCore {
             // inflates ~33%, so ~12MB raw is the safe ceiling), oversized falls back
             // to URL form instead of failing the whole call.
             const MAX_IMG_BYTES = 12 * 1024 * 1024
-            // Single-image only: the multi-image batch below re-downloads every
-            // URL including the first one, so an eager fetch here would download
-            // image #1 twice (sequentially) for zero benefit.
             const multi = (allImages?.length ?? 0) > 1
             let imageContent = null
             if (!multi) {
@@ -314,7 +355,6 @@ export class VisionCore extends ResearchCore {
                 allImages && allImages.length > 1
                     ? await Promise.all(
                           allImages.slice(0, 3).map(async (img) => {
-                              // Download each image to base64
                               try {
                                   const imgRes = await fetch(img.url, { signal: AbortSignal.timeout(10_000) })
                                   if (!imgRes.ok) throw new Error(`HTTP ${imgRes.status}`)
@@ -348,15 +388,17 @@ export class VisionCore extends ResearchCore {
                     ],
                 },
             ]
-            let raw = null
-            let errType = null
             // GIFs must be requested as a static frame everywhere, including the
             // raw-URL retry inside _describeWith: some vision endpoints 400 on
             // animated GIF URLs ("animated GIFs are not supported").
-            const staticUrl =
-                isGif && imageUrl && !/[?&]format=webp/.test(imageUrl)
-                    ? imageUrl + (imageUrl.includes('?') ? '&' : '?') + 'format=webp&width=960'
-                    : imageUrl
+            const toStaticUrl = (u, gif) =>
+                gif && u && !/[?&]format=webp/.test(u)
+                    ? u + (u.includes('?') ? '&' : '?') + 'format=webp&width=960'
+                    : u
+            const staticUrls =
+                allImages && allImages.length > 1
+                    ? allImages.slice(0, 3).map((img) => toStaticUrl(img.url, img.isGif))
+                    : [toStaticUrl(imageUrl, isGif)]
             const primary = this._visionClient ?? this._groq
             if (primary)
                 ({ raw, errType } = await this._describeWith(
@@ -364,7 +406,7 @@ export class VisionCore extends ResearchCore {
                     this.visionModel,
                     s1msgs,
                     userText,
-                    staticUrl,
+                    staticUrls,
                     // Only the chat-provider client may rotate the chat ring.
                     // A pinned vision client (own provider/key) rotating it
                     // cools down chat keys the vision call never uses.
@@ -382,7 +424,7 @@ export class VisionCore extends ResearchCore {
                             fb.model,
                             s1msgs,
                             userText,
-                            staticUrl,
+                            staticUrls,
                             false,
                         )
                         if (att.raw || att.errType) {
@@ -397,36 +439,36 @@ export class VisionCore extends ResearchCore {
                     } catch {}
                 }
             }
-
-            if (errType === 'expired')
-                return "that image link seems to have expired or isn't loading for me 😅"
-            if (errType === 'format') return "hmm i couldn't process that image format 🤔"
-            if (!raw) {
-                // Vision failed but we got a prompt, answer without the image
-                return await this.generateResponse({
-                    prompt: prompt?.trim() || 'Describe what you see.',
-                    userId,
-                })
-            }
-
-            // Stage 2, rewrite
-            const mediaLabel = isGif ? 'GIF (first frame)' : 'image'
-            const kSys =
-                (systemPrompt || this.instructions || '') +
-                '\n\nDISCORD FORMATTING, use purposefully:\n**bold** key things you notice · *italic* for vibe/tone · `code` for any text/numbers in the image · -# for small captions · lists only if genuinely listing multiple distinct things'
-            const kPrompt =
-                `You just saw a ${mediaLabel}. Here's what it contains:\n${'─'.repeat(36)}\n${raw}\n${'─'.repeat(36)}\n\n` +
-                (prompt?.trim() ? `The user asked: ${prompt.trim()}\n\n` : '') +
-                `Respond naturally as Medusa, react genuinely to what you see. If it's funny, be amused. If it's beautiful, say so. If it's weird, own that reaction. Use Discord markdown sparingly for key details. Never say 'according to the description' or 'the image shows', speak as if you're seeing it yourself, in first person.`
-            const final = await this.generateResponse({
-                prompt: kPrompt,
-                history: null,
-                userId,
-                systemPrompt: kSys,
-            })
-            return final ?? raw
         } finally {
-            fair?.release?.()
+            releaseStage1()
         }
+
+        if (errType === 'expired')
+            return "that image link seems to have expired or isn't loading for me 😅"
+        if (errType === 'format') return "hmm i couldn't process that image format 🤔"
+        if (!raw) {
+            // Vision failed but we got a prompt, answer without the image
+            return await this.generateResponse({
+                prompt: prompt?.trim() || 'Describe what you see.',
+                userId,
+            })
+        }
+
+        // Stage 2, rewrite (Stage 1 FairQueue slot already released above)
+        const mediaLabel = isGif ? 'GIF (first frame)' : 'image'
+        const kSys =
+            (systemPrompt || this.instructions || '') +
+            '\n\nDISCORD FORMATTING, use purposefully:\n**bold** key things you notice · *italic* for vibe/tone · `code` for any text/numbers in the image · -# for small captions · lists only if genuinely listing multiple distinct things'
+        const kPrompt =
+            `You just saw a ${mediaLabel}. Here's what it contains:\n${'─'.repeat(36)}\n${raw}\n${'─'.repeat(36)}\n\n` +
+            (prompt?.trim() ? `The user asked: ${prompt.trim()}\n\n` : '') +
+            `Respond naturally as Medusa, react genuinely to what you see. If it's funny, be amused. If it's beautiful, say so. If it's weird, own that reaction. Use Discord markdown sparingly for key details. Never say 'according to the description' or 'the image shows', speak as if you're seeing it yourself, in first person.`
+        const final = await this.generateResponse({
+            prompt: kPrompt,
+            history: null,
+            userId,
+            systemPrompt: kSys,
+        })
+        return final ?? raw
     }
 }

@@ -11,22 +11,63 @@ import { formatDuration, parseTime, resolveTarget } from './utils.js'
 
 export { formatDuration, parseTime }
 
+const stmtCache = new WeakMap()
+function getStmts(db) {
+    let s = stmtCache.get(db)
+    if (!s) {
+        s = {
+            insertLog: db.prepare(
+                'INSERT INTO mod_logs (guild_id, user_id, moderator_id, action, reason, duration) VALUES (?,?,?,?,?,?)',
+            ),
+            insertWarn: db.prepare(
+                'INSERT INTO warnings (guild_id, user_id, moderator_id, reason) VALUES (?,?,?,?)',
+            ),
+            activeWarns: db.prepare(
+                'SELECT id, moderator_id, reason, timestamp FROM warnings WHERE guild_id=? AND user_id=? AND active=TRUE ORDER BY timestamp DESC',
+            ),
+            modLogsByUser: db.prepare(
+                'SELECT user_id, moderator_id, action, reason, duration, timestamp FROM mod_logs WHERE guild_id=? AND (user_id=? OR moderator_id=?) ORDER BY timestamp DESC',
+            ),
+            modLogsAll: db.prepare(
+                'SELECT user_id, moderator_id, action, reason, duration, timestamp FROM mod_logs WHERE guild_id=? ORDER BY timestamp DESC',
+            ),
+            warnsByUser: db.prepare(
+                'SELECT user_id, moderator_id, reason, timestamp FROM warnings WHERE guild_id=? AND (user_id=? OR moderator_id=?) AND active=TRUE ORDER BY timestamp DESC',
+            ),
+            warnsAll: db.prepare(
+                'SELECT user_id, moderator_id, reason, timestamp FROM warnings WHERE guild_id=? AND active=TRUE ORDER BY timestamp DESC',
+            ),
+            clearWarns: db.prepare('UPDATE warnings SET active=FALSE WHERE guild_id=? AND user_id=?'),
+        }
+        stmtCache.set(db, s)
+    }
+    return s
+}
+
 export function logAction(db, guildId, userId, modId, action, reason, duration = null) {
     try {
-        db.prepare(
-            'INSERT INTO mod_logs (guild_id, user_id, moderator_id, action, reason, duration) VALUES (?,?,?,?,?,?)',
-        ).run(String(guildId), String(userId), String(modId), action, reason, duration ?? 'N/A')
+        getStmts(db).insertLog.run(
+            String(guildId),
+            String(userId),
+            String(modId),
+            action,
+            reason,
+            duration ?? 'N/A',
+        )
     } catch (e) {
         console.error('[logAction]', e)
     }
 }
 
 export function canModerate(author, target, guild) {
-    const authorPos = author.roles?.highest?.position ?? 0
-    const targetPos = target.roles?.highest?.position ?? 0
-    if (guild.ownerId === String(author.id ?? author.user?.id)) return true
+    const authorId = String(author.id ?? author.user?.id)
+    const targetId = String(target.id ?? target.user?.id)
+    if (guild.ownerId === targetId) return false
+    if (guild.ownerId === authorId) return true
     // Administrator permission bypasses role hierarchy (except server owner, handled above)
     if (author.permissions?.has(PermissionFlagsBits.Administrator)) return true
+    const authorPos = author.roles?.highest?.position ?? 0
+    const targetPos = target.roles?.highest?.position ?? 0
     return authorPos > targetPos
 }
 
@@ -77,8 +118,8 @@ export async function cmdBan(ctx, member, reason, { db, BOT_OWNER_ID }) {
         return ctx.reply({ content: `🚫 ${member} is already banned.` })
     } catch {}
     try {
-        await guild.members.ban(member, { reason })
         await sendDMNotif(member.user ?? member, 'Ban', guild, reason).catch(() => null)
+        await guild.members.ban(member, { reason })
         logAction(db, guild.id, member.id, author.id, 'Ban', reason)
         await ctx.reply({ embeds: [modEmbed('Ban', member.user ?? member, reason, guild, null)] })
     } catch (e) {
@@ -96,8 +137,8 @@ export async function cmdKick(ctx, member, reason, { db, BOT_OWNER_ID }) {
     if (member.kickable === false)
         return ctx.reply({ content: `🚫 I don't have enough permission hierarchy to kick ${member}!` })
     try {
-        await member.kick(reason)
         await sendDMNotif(member.user ?? member, 'Kick', guild, reason).catch(() => null)
+        await member.kick(reason)
         logAction(db, guild.id, member.id, author.id, 'Kick', reason)
         await ctx.reply({ embeds: [modEmbed('Kick', member.user ?? member, reason, guild, null)] })
     } catch (e) {
@@ -144,15 +185,23 @@ export async function cmdMute(ctx, member, durationStr, reason, { db, BOT_OWNER_
 export async function cmdUnmute(ctx, member, { db }) {
     const guild = ctx.guild
     const author = ctx.member ?? ctx.user
+    if (!canModerate(author, member, guild))
+        return ctx.reply({ content: '🚫 You cannot unmute someone with an equal or higher role.' })
+    if (member.moderatable === false)
+        return ctx.reply({ content: `🚫 I don't have enough permission hierarchy to unmute ${member}!` })
     if (
         !member.communicationDisabledUntilTimestamp ||
         member.communicationDisabledUntilTimestamp <= Date.now()
     )
         return ctx.reply({ content: `🚫 ${member} is not muted.` })
-    await sendDMNotif(member.user, 'Unmute', guild, 'Unmuted')
-    await member.timeout(null)
-    logAction(db, guild.id, member.id, author.id, 'Unmute', 'Unmuted')
-    await ctx.reply({ embeds: [modEmbed('Unmute', member.user, 'Unmuted', guild, null)] })
+    try {
+        await member.timeout(null)
+        await sendDMNotif(member.user, 'Unmute', guild, 'Unmuted').catch(() => null)
+        logAction(db, guild.id, member.id, author.id, 'Unmute', 'Unmuted')
+        await ctx.reply({ embeds: [modEmbed('Unmute', member.user, 'Unmuted', guild, null)] })
+    } catch (e) {
+        await ctx.reply({ content: `❌ Error trying to unmute: ${e.message}` })
+    }
 }
 
 export async function cmdWarn(ctx, member, reason, { db, BOT_OWNER_ID }) {
@@ -160,14 +209,9 @@ export async function cmdWarn(ctx, member, reason, { db, BOT_OWNER_ID }) {
     const author = ctx.member ?? ctx.user
     if (BigInt(member.id) === BOT_OWNER_ID)
         return ctx.reply({ content: '🚫 | You cannot warn the bot owner.' })
-    if (
-        (member.roles?.highest?.comparePositionTo(author.roles?.highest) ?? -1) >= 0 &&
-        BigInt(author.id) !== BOT_OWNER_ID
-    )
+    if (!canModerate(author, member, guild) && BigInt(author.id) !== BOT_OWNER_ID)
         return ctx.reply({ content: '🚫 You cannot warn someone with an equal or higher role.' })
-    const result = db
-        .prepare('INSERT INTO warnings (guild_id, user_id, moderator_id, reason) VALUES (?,?,?,?)')
-        .run(String(guild.id), String(member.id), String(author.id), reason)
+    const result = getStmts(db).insertWarn.run(String(guild.id), String(member.id), String(author.id), reason)
     await sendDMNotif(member.user, 'Warned', guild, reason)
     await ctx.reply({
         embeds: [
@@ -185,12 +229,9 @@ export async function cmdWarn(ctx, member, reason, { db, BOT_OWNER_ID }) {
 export async function cmdWarnings(ctx, member, { db }) {
     // Slash lookups go ephemeral (only the invoker sees them); prefix replies
     // can't be ephemeral, so they stay public.
-    const eph = ctx.isChatInputCommand?.() ? { flags: MessageFlags.Ephemeral } : {}
-    const rows = db
-        .prepare(
-            'SELECT id, moderator_id, reason, timestamp FROM warnings WHERE guild_id=? AND user_id=? AND active=TRUE ORDER BY timestamp DESC',
-        )
-        .all(String(ctx.guild.id), String(member.id))
+    const isSlash = Boolean(ctx.isChatInputCommand?.())
+    const eph = isSlash ? { flags: MessageFlags.Ephemeral } : {}
+    const rows = getStmts(db).activeWarns.all(String(ctx.guild.id), String(member.id))
     if (!rows.length) return ctx.reply({ content: `${member} has no active warnings.`, ...eph })
     const PER = 10
     const pages = Math.max(1, Math.ceil(rows.length / PER))
@@ -226,9 +267,9 @@ export async function cmdWarnings(ctx, member, { db }) {
                 .setDisabled(p >= pages - 1),
             new ButtonBuilder().setCustomId('w_del').setEmoji('❌').setStyle(ButtonStyle.Danger),
         )
-    await ctx.reply({ embeds: [mkEmbed(0)], components: [mkRow(0)], ...eph })
-    const send = await ctx.fetchReply().catch(() => null)
-    if (!send) return
+    const replied = await ctx.reply({ embeds: [mkEmbed(0)], components: [mkRow(0)], ...eph })
+    const send = isSlash ? await ctx.fetchReply().catch(() => null) : replied
+    if (!send?.createMessageComponentCollector) return
     const col = send.createMessageComponentCollector({ componentType: ComponentType.Button, time: 60_000 })
     col.on('collect', async (i) => {
         const auth = ctx.user ?? ctx.author
@@ -249,30 +290,13 @@ export async function cmdWarnings(ctx, member, { db }) {
 }
 
 export async function cmdModlog(ctx, user, { db }) {
+    const isSlash = Boolean(ctx.isChatInputCommand?.())
+    const eph = isSlash ? { flags: MessageFlags.Ephemeral } : {}
     const gId = String(ctx.guild.id)
     const uid = user ? String(user.id) : null
-    const modRows = uid
-        ? db
-              .prepare(
-                  'SELECT user_id, moderator_id, action, reason, duration, timestamp FROM mod_logs WHERE guild_id=? AND (user_id=? OR moderator_id=?) ORDER BY timestamp DESC',
-              )
-              .all(gId, uid, uid)
-        : db
-              .prepare(
-                  'SELECT user_id, moderator_id, action, reason, duration, timestamp FROM mod_logs WHERE guild_id=? ORDER BY timestamp DESC',
-              )
-              .all(gId)
-    const warnRows = uid
-        ? db
-              .prepare(
-                  'SELECT user_id, moderator_id, reason, timestamp FROM warnings WHERE guild_id=? AND (user_id=? OR moderator_id=?) AND active=TRUE ORDER BY timestamp DESC',
-              )
-              .all(gId, uid, uid)
-        : db
-              .prepare(
-                  'SELECT user_id, moderator_id, reason, timestamp FROM warnings WHERE guild_id=? AND active=TRUE ORDER BY timestamp DESC',
-              )
-              .all(gId)
+    const stmts = getStmts(db)
+    const modRows = uid ? stmts.modLogsByUser.all(gId, uid, uid) : stmts.modLogsAll.all(gId)
+    const warnRows = uid ? stmts.warnsByUser.all(gId, uid, uid) : stmts.warnsAll.all(gId)
     const logs = [
         ...modRows.map((r) => {
             const dur = r.duration && r.duration !== 'N/A' ? ` | **Duration:** ${r.duration}` : ''
@@ -286,15 +310,32 @@ export async function cmdModlog(ctx, user, { db }) {
     if (!logs.length)
         return ctx.reply({
             content: user ? `No moderation logs found for ${user}.` : 'No moderation logs found.',
-            flags: MessageFlags.Ephemeral,
+            ...eph,
         })
     const PER = 20
-    const pages = Math.ceil(logs.length / PER)
+    const MAX_DESC = 4096
+    const pageChunks = []
+    let current = []
+    let currentLen = 0
+    for (const line of logs) {
+        const safeLine = line.length > MAX_DESC ? `${line.slice(0, MAX_DESC - 3)}...` : line
+        const addedLen = (current.length ? 1 : 0) + safeLine.length
+        if (current.length >= PER || (current.length > 0 && currentLen + addedLen > MAX_DESC)) {
+            pageChunks.push(current.join('\n'))
+            current = [safeLine]
+            currentLen = safeLine.length
+        } else {
+            current.push(safeLine)
+            currentLen += addedLen
+        }
+    }
+    if (current.length) pageChunks.push(current.join('\n'))
+    const pages = pageChunks.length
     let cur = 0
     const mkEmbed = (p) =>
         new EmbedBuilder()
             .setTitle(user ? `📜 Moderation Logs - ${user.username}` : '📜 Moderation Logs')
-            .setDescription(logs.slice(p * PER, (p + 1) * PER).join('\n'))
+            .setDescription(pageChunks[p].slice(0, MAX_DESC))
             .setColor(0x378add)
             .setFooter({
                 text: pages > 1 ? `Page ${p + 1}/${pages} • Total: ${logs.length}` : `Total: ${logs.length}`,
@@ -313,14 +354,13 @@ export async function cmdModlog(ctx, user, { db }) {
                 .setDisabled(p >= pages - 1),
             new ButtonBuilder().setCustomId('ml_del').setEmoji('❌').setStyle(ButtonStyle.Danger),
         )
-    await ctx.reply({
+    const replied = await ctx.reply({
         embeds: [mkEmbed(0)],
         components: [mkRow(0)],
-        // Slash lookups go ephemeral like /warnings; prefix stays public.
-        ...(ctx.isChatInputCommand?.() ? { flags: MessageFlags.Ephemeral } : {}),
+        ...eph,
     })
-    const send = await ctx.fetchReply()
-    if (pages <= 1 && !send) return
+    const send = isSlash ? await ctx.fetchReply().catch(() => null) : replied
+    if (!send?.createMessageComponentCollector) return
     const col = send.createMessageComponentCollector({ componentType: ComponentType.Button, time: 60_000 })
     col.on('collect', async (i) => {
         const auth = ctx.user ?? ctx.author
@@ -377,7 +417,12 @@ export async function cmdFpurge(
     startFrom = null,
     stopAt = null,
 ) {
-    const send = ctx.deferred || ctx.replied ? (data) => ctx.editReply(data) : (data) => ctx.reply(data)
+    const send =
+        ctx.deferred || ctx.replied
+            ? (data) => ctx.editReply(data)
+            : ctx.isChatInputCommand?.()
+              ? (data) => ctx.reply(data)
+              : (data) => ctx.reply(data).catch(() => ctx.channel.send(data))
     const startId = parseMessageRef(startFrom)
     const stopId = parseMessageRef(stopAt)
     if ((startFrom && !startId) || (stopAt && !stopId))
@@ -411,8 +456,8 @@ export async function cmdFpurge(
                 if (exact ? content === searchText : content.includes(searchText)) toDelete.push(m)
             }
             if (toDelete.length) {
-                await ctx.channel.bulkDelete(toDelete, true)
-                found += toDelete.length
+                const deleted = await ctx.channel.bulkDelete(toDelete, true)
+                found += deleted.size
             }
             if (msgs.size < batch) break
         }
@@ -434,18 +479,24 @@ async function processChannel(client, channel, targetUser, cutoffTs, startFromId
         if (!msgs?.size) break
         const toDelete = msgs.filter((m) => m.author.id === targetUser.id && m.createdTimestamp >= cutoffTs)
         if (toDelete.size) {
-            await channel.bulkDelete(toDelete, true).catch(() => {})
-            deleted += toDelete.size
+            const res = await channel.bulkDelete(toDelete, true).catch(() => null)
+            deleted += res?.size ?? 0
         }
-        if (msgs.size < 100) break
-        lastId = msgs.last()?.id
+        const lastMsg = msgs.last()
+        if (msgs.size < 100 || !lastMsg || lastMsg.createdTimestamp < cutoffTs) break
+        lastId = lastMsg.id
         await new Promise((r) => setTimeout(r, 200))
     }
     return deleted
 }
 
 export async function cmdMpurge(ctx, targetUser, serverWide = false, startFromId = null) {
-    const send = ctx.deferred || ctx.replied ? (data) => ctx.editReply(data) : (data) => ctx.reply(data)
+    const send =
+        ctx.deferred || ctx.replied
+            ? (data) => ctx.editReply(data)
+            : ctx.isChatInputCommand?.()
+              ? (data) => ctx.reply(data)
+              : (data) => ctx.reply(data).catch(() => ctx.channel.send(data))
     const cutoffTs = Date.now() - 14 * 24 * 60 * 60 * 1000
     let total = 0
     try {
@@ -468,6 +519,9 @@ export function registerModeration(client, db, config) {
     const BOT_OWNER_ID = config.ownerId ? BigInt(config.ownerId) : 0n
     const ctx_ = { db, BOT_OWNER_ID }
     const isOwner = (id) => BigInt(id) === BOT_OWNER_ID
+    try {
+        if (db && db._stub !== true) getStmts(db)
+    } catch {}
 
     // Custom keyword trigger phrases, configure in config.json to enable. (for funsies like the old days)
     // e.g. "mute_phrases": ["quiet", "shh"], "ban_phrases": ["get out"]
@@ -476,41 +530,41 @@ export function registerModeration(client, db, config) {
     const UNMUTE_CMDS = config.unmutePhrases ?? []
 
     client.commands.set('ban', async (msg, args) => {
-        if (!msg.member.permissions.has(PermissionFlagsBits.BanMembers)) return
+        if (!msg.member?.permissions?.has(PermissionFlagsBits.BanMembers)) return
         const target = await resolveTarget(msg, args, false, false)
         if (!target) return msg.reply('Say who — mention them or give me an ID.')
         await cmdBan(msg, target, args.slice(1).join(' ') || 'No reason provided', ctx_)
     })
     client.commands.set('unban', async (msg, args) => {
-        if (!msg.member.permissions.has(PermissionFlagsBits.BanMembers)) return
+        if (!msg.member?.permissions?.has(PermissionFlagsBits.BanMembers)) return
         await cmdUnban(msg, args[0]?.replace(/[<@!>]/g, ''), ctx_)
     })
     client.commands.set('kick', async (msg, args) => {
-        if (!msg.member.permissions.has(PermissionFlagsBits.KickMembers)) return
+        if (!msg.member?.permissions?.has(PermissionFlagsBits.KickMembers)) return
         const target = await resolveTarget(msg, args, false, false)
         if (!target) return msg.reply('Say who — mention them or give me an ID.')
         await cmdKick(msg, target, args.slice(1).join(' ') || 'No reason provided', ctx_)
     })
     client.commands.set('mute', async (msg, args) => {
-        if (!msg.member.permissions.has(PermissionFlagsBits.ModerateMembers)) return
+        if (!msg.member?.permissions?.has(PermissionFlagsBits.ModerateMembers)) return
         const target = await resolveTarget(msg, args, false, false)
         if (!target) return msg.reply('Say who — mention them or give me an ID.')
         await cmdMute(msg, target, args[1], args.slice(2).join(' ') || 'No reason provided', ctx_)
     })
     client.commands.set('unmute', async (msg, args) => {
-        if (!msg.member.permissions.has(PermissionFlagsBits.ModerateMembers)) return
+        if (!msg.member?.permissions?.has(PermissionFlagsBits.ModerateMembers)) return
         const target = await resolveTarget(msg, args, false, false)
         if (!target) return msg.reply('Say who — mention them or give me an ID.')
         await cmdUnmute(msg, target, ctx_)
     })
     client.commands.set('warn', async (msg, args) => {
-        if (!msg.member.permissions.has(PermissionFlagsBits.ModerateMembers)) return
+        if (!msg.member?.permissions?.has(PermissionFlagsBits.ModerateMembers)) return
         const target = await resolveTarget(msg, args, false, false)
         if (!target) return msg.reply('Say who — mention them or give me an ID.')
         await cmdWarn(msg, target, args.slice(1).join(' ') || 'No reason provided', ctx_)
     })
     client.commands.set('warnings', async (msg, args) => {
-        if (!msg.member.permissions.has(PermissionFlagsBits.ModerateMembers)) return
+        if (!msg.member?.permissions?.has(PermissionFlagsBits.ModerateMembers)) return
         const target = await resolveTarget(msg, args)
         if (!target) return msg.reply('Member not found.')
         await cmdWarnings(msg, target, ctx_)
@@ -519,14 +573,17 @@ export function registerModeration(client, db, config) {
         if (!msg.guild) return msg.reply('❌ Server only.')
         const query = args.join(' ').trim().toLowerCase()
         if (!query) return msg.reply('❌ Give me a name to look up.')
-        const cands = [...msg.guild.members.cache.values()]
-            .filter((m) => {
-                const ns = [m.user?.username, m.user?.globalName, m.displayName, m.nickname]
-                    .filter(Boolean)
-                    .map((n) => String(n).toLowerCase())
-                return ns.some((n) => n === query || n.includes(query))
-            })
-            .slice(0, 5)
+        const cands = []
+        for (const m of msg.guild.members.cache.values()) {
+            const ns = [m.user?.username, m.user?.globalName, m.displayName, m.nickname]
+            for (const n of ns) {
+                if (n && String(n).toLowerCase().includes(query)) {
+                    cands.push(m)
+                    break
+                }
+            }
+            if (cands.length >= 5) break
+        }
         if (!cands.length) return msg.reply(`❌ No member matching \`${query.slice(0, 60)}\` found.`)
         await msg.reply(
             cands
@@ -535,18 +592,15 @@ export function registerModeration(client, db, config) {
         )
     })
     client.commands.set('modlog', async (msg, args) => {
-        if (!msg.member.permissions.has(PermissionFlagsBits.ModerateMembers)) return
+        if (!msg.member?.permissions?.has(PermissionFlagsBits.ModerateMembers)) return
         const user = await resolveTarget(msg, args, true)
         await cmdModlog(msg, user === msg.author ? null : user, ctx_)
     })
     client.commands.set('clearwarns', async (msg, args) => {
-        if (!msg.member.permissions.has(PermissionFlagsBits.ModerateMembers)) return
+        if (!msg.member?.permissions?.has(PermissionFlagsBits.ModerateMembers)) return
         const target = await resolveTarget(msg, args, false, false)
         if (!target) return msg.reply('Say who — mention them or give me an ID.')
-        db.prepare('UPDATE warnings SET active=FALSE WHERE guild_id=? AND user_id=?').run(
-            String(msg.guild.id),
-            String(target.id),
-        )
+        getStmts(db).clearWarns.run(String(msg.guild.id), String(target.id))
         await msg.reply({
             embeds: [
                 modEmbed('Warnings Cleared', target.user ?? target, 'All active warnings cleared', msg.guild),
@@ -554,12 +608,12 @@ export function registerModeration(client, db, config) {
         })
     })
     client.commands.set('clear', async (msg, args) => {
-        if (!msg.member.permissions.has(PermissionFlagsBits.ManageMessages)) return
+        if (!msg.member?.permissions?.has(PermissionFlagsBits.ManageMessages)) return
         await cmdClear(msg, parseInt(args[0]) || 10)
         await msg.delete().catch(() => {})
     })
     client.commands.set('fpurge', async (msg, args) => {
-        if (!msg.member.permissions.has(PermissionFlagsBits.ManageMessages)) return
+        if (!msg.member?.permissions?.has(PermissionFlagsBits.ManageMessages)) return
         await msg.delete().catch(() => {})
         const text = args[0]
         const user = await resolveTarget(msg, args, true)
@@ -578,10 +632,10 @@ export function registerModeration(client, db, config) {
         )
     })
     client.commands.set('mpurge', async (msg, args) => {
-        if (!msg.member.permissions.has(PermissionFlagsBits.ManageMessages)) return
+        if (!msg.member?.permissions?.has(PermissionFlagsBits.ManageMessages)) return
         await msg.delete().catch(() => {})
         const user = await resolveTarget(msg, args, true)
-        if (!user || user === msg.author) return msg.reply('Target User not found.')
+        if (!user || user === msg.author) return msg.channel.send('Target User not found.')
         const serverWide = args.includes('--server')
         const startM = args.join(' ').match(/--start\s+(\d+)/)
         await cmdMpurge(msg, user, serverWide, startM?.[1])
@@ -590,6 +644,8 @@ export function registerModeration(client, db, config) {
     async function handleInteraction(interaction) {
         const { commandName } = interaction
         const perm = interaction.memberPermissions
+        const noPerm = () =>
+            interaction.reply({ content: '❌ No permission.', flags: MessageFlags.Ephemeral })
         // getMember() is null when the target left between opening the menu and
         // submitting — fail soft instead of throwing on member.id downstream.
         const missingMember = () =>
@@ -599,19 +655,37 @@ export function registerModeration(client, db, config) {
             })
 
         if (commandName === 'ban') {
+            if (!perm?.has(PermissionFlagsBits.BanMembers)) {
+                await noPerm()
+                return true
+            }
             const m = interaction.options.getMember('member')
-            if (!m) return missingMember()
+            if (!m) {
+                await missingMember()
+                return true
+            }
             const r = interaction.options.getString('reason') ?? 'No reason provided'
             await cmdBan(interaction, m, r, ctx_)
             return true
         }
         if (commandName === 'unban') {
+            if (!perm?.has(PermissionFlagsBits.BanMembers)) {
+                await noPerm()
+                return true
+            }
             await cmdUnban(interaction, interaction.options.getString('user-id'), ctx_)
             return true
         }
         if (commandName === 'kick') {
+            if (!perm?.has(PermissionFlagsBits.KickMembers)) {
+                await noPerm()
+                return true
+            }
             const m = interaction.options.getMember('member')
-            if (!m) return missingMember()
+            if (!m) {
+                await missingMember()
+                return true
+            }
             await cmdKick(
                 interaction,
                 m,
@@ -621,8 +695,15 @@ export function registerModeration(client, db, config) {
             return true
         }
         if (commandName === 'mute') {
+            if (!perm?.has(PermissionFlagsBits.ModerateMembers)) {
+                await noPerm()
+                return true
+            }
             const m = interaction.options.getMember('member')
-            if (!m) return missingMember()
+            if (!m) {
+                await missingMember()
+                return true
+            }
             await cmdMute(
                 interaction,
                 m,
@@ -633,14 +714,28 @@ export function registerModeration(client, db, config) {
             return true
         }
         if (commandName === 'unmute') {
+            if (!perm?.has(PermissionFlagsBits.ModerateMembers)) {
+                await noPerm()
+                return true
+            }
             const m = interaction.options.getMember('member')
-            if (!m) return missingMember()
+            if (!m) {
+                await missingMember()
+                return true
+            }
             await cmdUnmute(interaction, m, ctx_)
             return true
         }
         if (commandName === 'warn') {
+            if (!perm?.has(PermissionFlagsBits.ModerateMembers)) {
+                await noPerm()
+                return true
+            }
             const m = interaction.options.getMember('member')
-            if (!m) return missingMember()
+            if (!m) {
+                await missingMember()
+                return true
+            }
             await cmdWarn(
                 interaction,
                 m,
@@ -650,14 +745,32 @@ export function registerModeration(client, db, config) {
             return true
         }
         if (commandName === 'warnings') {
-            await cmdWarnings(interaction, interaction.options.getMember('member'), ctx_)
+            if (!perm?.has(PermissionFlagsBits.ModerateMembers)) {
+                await noPerm()
+                return true
+            }
+            const m = interaction.options.getMember('member')
+            if (!m) {
+                await missingMember()
+                return true
+            }
+            await cmdWarnings(interaction, m, ctx_)
             return true
         }
         if (commandName === 'modlog') {
+            if (!perm?.has(PermissionFlagsBits.ModerateMembers)) {
+                await noPerm()
+                return true
+            }
             await cmdModlog(interaction, interaction.options.getUser('user') ?? null, ctx_)
             return true
         }
         if (commandName === 'erase') {
+            if (!perm?.has(PermissionFlagsBits.ManageMessages)) {
+                await noPerm()
+                return true
+            }
+            await interaction.deferReply({})
             await cmdMpurge(
                 interaction,
                 interaction.options.getUser('user'),
@@ -667,6 +780,10 @@ export function registerModeration(client, db, config) {
             return true
         }
         if (commandName === 'sweep') {
+            if (!perm?.has(PermissionFlagsBits.ManageMessages)) {
+                await noPerm()
+                return true
+            }
             const text = interaction.options.getString('text')
             const user = interaction.options.getUser('user')
             const startFrom = interaction.options.getString('start-from')
@@ -692,7 +809,7 @@ export function registerModeration(client, db, config) {
         }
         if (commandName === 'clear') {
             if (!perm?.has(PermissionFlagsBits.ManageMessages)) {
-                await interaction.reply({ content: '❌ No permission.', flags: MessageFlags.Ephemeral })
+                await noPerm()
                 return true
             }
             await interaction.deferReply({ flags: MessageFlags.Ephemeral })
@@ -704,7 +821,7 @@ export function registerModeration(client, db, config) {
 
     async function handleMessage(message) {
         if (!isOwner(message.author.id)) return false
-        if (!message.member?.permissions.has(PermissionFlagsBits.ModerateMembers)) return false
+        if (!message.member?.permissions?.has(PermissionFlagsBits.ModerateMembers)) return false
         const content = (message.content ?? '').trim()
         const lower = content.toLowerCase()
         const now = Date.now()

@@ -1,18 +1,24 @@
 // Research layer: serper/tavily tool loop, source parsing, and the
 // three-stage needsResearch router (signal lists -> cheap classifier).
 import { LRUCache } from 'lru-cache'
-import {
-    ALWAYS_LIVE_RE,
-    DANGEROUS_TERMS,
-    NEVER_RESEARCH_EXACT,
-    NEVER_RESEARCH_PREFIXES,
-    NO_SEARCH_SIGNALS,
-    NSFW_RE,
-} from './constants.js'
+import { DANGEROUS_TERMS, NO_SEARCH_SIGNALS, NSFW_RE } from './constants.js'
 import { ProviderCore } from './providers.js'
 import { FairQueue, estTokens } from './fairqueue.js'
 import { staticCaps } from './capabilities.js'
+import { classifyResearchStatic } from './hot-kernels.js'
 import { loadPerformance } from '../performance.js'
+
+const _escRe = (s) => s.replace(/[.*+?^${}()|[\]\\]/g, '\\$&')
+const NO_SEARCH_TEST_RE = new RegExp(`(?:${NO_SEARCH_SIGNALS.map(_escRe).join('|')})`, 'i')
+const DANGEROUS_RE = new RegExp(`(?:${[...DANGEROUS_TERMS].map(_escRe).join('|')})`, 'i')
+const SELF_METRIC_1 =
+    /^(?:your|ur|medusa'?s?|bot'?s?|her)\s+(?:ram|memory|cpu|uptime|ping|latency|status|vitals|lag|health)\b/i
+const SELF_METRIC_2 = /^(?:ram|memory|cpu|uptime|ping|vitals)\b[^a-z]*\??$/i
+const SELF_METRIC_3 = /^(?:ram|memory|cpu)\s+(?:usage|use|load|status|state|level)\b/i
+const SELF_METRIC_4 = /\bhow much (?:ram|memory) (?:do you|u have|have you got)\b/i
+const SELF_METRIC_5 = /\b(?:you|u|she|medusa) (?:lagging|laggy|slow|down|dead)\b/i
+const PRODUCT_NOUN_RE =
+    /\b(?:20[2-9]\d|v?\d+\.\d+|benchmark|price|cost|vs\b|compare|game|pc\b|phone|laptop|gpu)\b/i
 
 // Query-strip patterns, built once: _extractSearchQuery rebuilt all 14 on
 // every research message. The (you|u|ya) alternation is inlined statically.
@@ -119,13 +125,6 @@ export class ResearchCore extends ProviderCore {
                     }
                 } catch {}
             }
-            // No last-ditch knowledge call here anymore: it returned a memory
-            // answer DISGUISED as research — callers stamped 🔍/"researched
-            // live" footers on it and the stateless path re-chewed it through
-            // a second synthesis call (double LLM spend, lying footer). null
-            // makes every caller take its own honest brain path instead:
-            // stateless -> direct quick-agent answer (with its own fallback
-            // chain), chat -> persona fallback with no research footer.
             return null
         }
         if (!fairCtx || PERF.ai.fairShare === false) return await run()
@@ -155,9 +154,8 @@ export class ResearchCore extends ProviderCore {
             })
             const snippets = (tr.results ?? [])
                 .map((r, i) => {
-                    const date = r.published_date
-                        ? ` (published ${String(r.published_date).slice(0, 10)})`
-                        : ''
+                    const pub = r.publishedDate ?? r.published_date
+                    const date = pub ? ` (published ${String(pub).slice(0, 10)})` : ''
                     return `[${i + 1}] ${r.title}${date}\n${(r.content ?? '').slice(0, 400)}\nURL: ${r.url}`
                 })
                 .join('\n\n')
@@ -174,46 +172,13 @@ export class ResearchCore extends ProviderCore {
     async _callResearchWith(client, model, prompt, allowRotate, _retried = false, pre = undefined) {
         if (!client) return null
 
-        // Keys at method scope: the direct branch below used to declare
-        // serperKey inside its own block while the tool loop read it outside
-        // → ReferenceError on every Tavily-miss turn, silently killing the
-        // fallback the comments promise.
         const serperKey = (this._config ?? this.config).search?.serperKey
         const tavilyKey = (this._config ?? this.config).search?.tavilyKey
 
         // Tavily-primary: one direct search+answer call first, then a SINGLE
         // synthesis round — instead of up to 4 model rounds each possibly
-        // fetching. Falls back to the model tool loop when Tavily is missing,
-        // rate-limited, or returns nothing usable. Each model still does only
-        // its own job: Tavily retrieves, the research model synthesizes.
-        // pre is the once-per-turn result from _callResearch; only search
-        // directly when a caller bypasses it.
+        // fetching.
         const direct = pre === undefined ? await this._tavilyDirect(prompt) : pre
-        if (direct) {
-            try {
-                const r = await client.chat.completions.create({
-                    model,
-                    messages: [
-                        {
-                            role: 'system',
-                            content:
-                                'Answer the question using ONLY the search results below. Be factual and concise. End with: SOURCES: [Name](url), max 3 real URLs from the results. Omit if none.',
-                        },
-                        { role: 'user', content: direct.slice(0, 6000) },
-                    ],
-                    max_completion_tokens: this.searchTokens,
-                    temperature: 0.3,
-                    top_p: this.topP,
-                    ...(this._isLowEffortReasoning(model) ? { reasoning_effort: 'low' } : {}),
-                })
-                const content = r.choices?.[0]?.message?.content
-                if (content?.trim()) return content
-            } catch {}
-            // Synthesis failed: fall through to the tool loop below — unless
-            // Tavily already ran this turn and Serper isn't configured, in
-            // which case the loop would just re-run the same dead search.
-            if (pre !== undefined && !serperKey) return null
-        }
 
         const searchTool = {
             type: 'function',
@@ -240,51 +205,71 @@ export class ResearchCore extends ProviderCore {
                 content:
                     'You are a precise research assistant. Use the web_search tool to find current information when needed. Synthesize results factually, weighing the newest sources heaviest — flag stale or conflicting info with as-of dates. End with: SOURCES: [Name](url), max 3 real URLs. Omit if none.',
             },
-            { role: 'user', content: prompt.slice(0, 800) },
+            { role: 'user', content: String(prompt ?? '').slice(0, 800) },
         ]
 
         const hasSearch = !!(serperKey || tavilyKey)
-        // Native-first: models with server-side browsing (compound, gpt-oss,
-        // sonar family per the capabilities registry) answer directly — one
-        // call instead of up to 4 tool rounds + Tavily fetches. Tavily stays
-        // as the fallback two ways: no-native models keep the loop below, and
-        // a failed/empty native attempt drops into it. The registry is
-        // conservative (exact IDs + search-first families) so a false
-        // positive degrades to the loop, never to silence.
-        if (staticCaps(model).webSearch === true) {
-            try {
-                const r = await client.chat.completions.create({
-                    model,
-                    messages,
-                    max_completion_tokens: this.searchTokens,
-                    temperature: this.researchTemp,
-                    top_p: this.topP,
-                    ...(this._isLowEffortReasoning(model) ? { reasoning_effort: 'low' } : {}),
-                })
-                const content = r.choices?.[0]?.message?.content
-                if (content?.trim()) {
-                    if (this._config?.debug) console.log(`[AI] Research native-search via ${model}`)
-                    return content
-                }
-            } catch (e) {
-                if (!hasSearch) throw e
-                console.warn(
-                    `[AI] Native search failed on ${model}, Tavily loop fallback:`,
-                    String(e?.message ?? e).slice(0, 100),
-                )
-            }
-        }
+
         try {
+            if (direct) {
+                try {
+                    const r = await client.chat.completions.create({
+                        model,
+                        messages: [
+                            {
+                                role: 'system',
+                                content:
+                                    'Answer the question using ONLY the search results below. Be factual and concise. End with: SOURCES: [Name](url), max 3 real URLs from the results. Omit if none.',
+                            },
+                            { role: 'user', content: direct.slice(0, 6000) },
+                        ],
+                        max_completion_tokens: this.searchTokens,
+                        temperature: 0.3,
+                        top_p: this.topP,
+                        ...(this._isLowEffortReasoning(model) ? { reasoning_effort: 'low' } : {}),
+                    })
+                    const content = r.choices?.[0]?.message?.content
+                    if (content?.trim()) return content
+                } catch (e) {
+                    // Propagate 429/key errors to main catch so primary rotates research keys
+                    if (this._isKeyError(e)) throw e
+                }
+                // Synthesis failed: fall through to the tool loop below — unless
+                // Tavily already ran this turn and Serper isn't configured, in
+                // which case the loop would just re-run the same dead search.
+                if (pre !== undefined && !serperKey) return null
+            }
+
+            // Native-first: models with server-side browsing answer directly — inside
+            // main try/catch so 429s rotate keys and trigger fallbacks cleanly.
+            if (staticCaps(model).webSearch === true) {
+                try {
+                    const r = await client.chat.completions.create({
+                        model,
+                        messages,
+                        max_completion_tokens: this.searchTokens,
+                        temperature: this.researchTemp,
+                        top_p: this.topP,
+                        ...(this._isLowEffortReasoning(model) ? { reasoning_effort: 'low' } : {}),
+                    })
+                    const content = r.choices?.[0]?.message?.content
+                    if (content?.trim()) {
+                        if (this._config?.debug) console.log(`[AI] Research native-search via ${model}`)
+                        return content
+                    }
+                } catch (e) {
+                    if (!hasSearch || this._isKeyError(e)) throw e
+                    console.warn(
+                        `[AI] Native search failed on ${model}, Tavily loop fallback:`,
+                        String(e?.message ?? e).slice(0, 100),
+                    )
+                }
+            }
+
             // Bounded tool-calling loop. Tools stay attached on every round so tool_choice is
-            // never implicitly "none" while the model might still emit a call, that mismatch is
-            // exactly what triggers the provider's 400 tool_use_failed (Tool choice is none, but
-            // model called a tool). The round cap prevents runaway search loops.
+            // never implicitly "none" while the model might still emit a call.
             const MAX_ROUNDS = 4
             const convo = [...messages]
-            // Did ANY tool round bring back real data? An all-failed loop must
-            // not return the model's honest "found nothing" apology as if it
-            // were research — callers would synthesize on it and stamp a
-            // "researched live" footer on zero data.
             let toolDataSeen = false
             const NO_DATA_RE = /^(No results found\.|No results\.|Search failed:|No external search tool)/
             for (let round = 0; round < MAX_ROUNDS; round++) {
@@ -299,8 +284,6 @@ export class ResearchCore extends ProviderCore {
                         max_completion_tokens: this.searchTokens,
                         temperature: useTools ? toolRoundTemp : this.researchTemp,
                         top_p: this.topP,
-                        // Reasoning models (notably gpt-oss) think hard by default;
-                        // low effort keeps the 4-round tool loop snappy.
                         ...(this._isLowEffortReasoning(model) ? { reasoning_effort: 'low' } : {}),
                     })
                 let r
@@ -308,10 +291,6 @@ export class ResearchCore extends ProviderCore {
                     r = await runRound(hasSearch)
                 } catch (err) {
                     if (!(hasSearch && this._isToolCallError(err))) throw err
-                    // Groq 400 tool_use_failed: the model emitted a malformed tool call. Retry
-                    // WITH tools first, stripping them mid-round makes gpt-oss emit phantom
-                    // calls that 400 as "Tool choice is none, but model called a tool". Only
-                    // fall back to a tool-less round if the with-tools retry fails too.
                     try {
                         r = await runRound(true)
                     } catch {
@@ -324,8 +303,6 @@ export class ResearchCore extends ProviderCore {
 
                 // No tool call means this is the final synthesized answer.
                 if (!msg.tool_calls?.length) {
-                    // Tools ran but every round came back failed/empty: this
-                    // "answer" is knowledge + an apology, not research.
                     if (!toolDataSeen && convo.some((m) => m.role === 'tool')) return null
                     return msg.content ?? null
                 }
@@ -348,6 +325,7 @@ export class ResearchCore extends ProviderCore {
                                     body: JSON.stringify({ q: query, num: 5 }),
                                     signal: AbortSignal.timeout(8000),
                                 })
+                                if (!res.ok) throw new Error(`Serper HTTP ${res.status}`)
                                 const data = await res.json()
                                 const organic = data.organic ?? []
                                 const snippets = organic
@@ -358,8 +336,6 @@ export class ResearchCore extends ProviderCore {
                                     ? `Quick answer: ${answer}\n\n${snippets}`
                                     : snippets || 'No results.'
                             } else if (this._tavily) {
-                                // Tavily JS SDK: tavily({apiKey}).search(query, { maxResults, searchDepth, includeAnswer })
-                                // https://docs.tavily.com/sdk/javascript/reference
                                 const tr = await this._tavily.search(query, {
                                     maxResults: 5,
                                     searchDepth: 'basic',
@@ -368,20 +344,15 @@ export class ResearchCore extends ProviderCore {
                                 })
                                 const snippets = (tr.results ?? [])
                                     .map((r, i) => {
-                                        const date = r.published_date
-                                            ? ` (published ${String(r.published_date).slice(0, 10)})`
-                                            : ''
-                                        return `[${i + 1}] ${r.title}${date}
-                            ${(r.content ?? '').slice(0, 400)}
-                            URL: ${r.url}`
+                                        const pub = r.publishedDate ?? r.published_date
+                                        const date = pub ? ` (published ${String(pub).slice(0, 10)})` : ''
+                                        return `[${i + 1}] ${r.title}${date}\n${(r.content ?? '').slice(0, 400)}\nURL: ${r.url}`
                                     })
-                                    .join('')
+                                    .join('\n\n')
                                 result = tr.answer
-                                    ? `Quick answer: ${tr.answer}
-                            ${snippets}`
-                                    : snippets
+                                    ? `Quick answer: ${tr.answer}\n\n${snippets}`
+                                    : snippets || 'No results.'
                             } else {
-                                // No search provider configured, tell the model to answer from knowledge
                                 result =
                                     'No external search tool available. Answer using only your training data and be honest about uncertainty.'
                             }
@@ -403,8 +374,6 @@ export class ResearchCore extends ProviderCore {
             }
 
             // Round cap reached without a plain-text answer, force one final synthesis pass.
-            // Unless every search round failed — then there is nothing to
-            // synthesize and the extra call is pure spend.
             if (!toolDataSeen) return null
             const fin = await client.chat.completions.create({
                 model,
@@ -443,20 +412,26 @@ export class ResearchCore extends ProviderCore {
     }
 
     _parseSources(raw) {
-        const match = raw.match(/\n*SOURCES?:\s*(.+?)$/is)
-        if (!match) return { text: raw.trim(), sources: [] }
-        const text = raw.slice(0, match.index).trim()
-        const sources = [...match[1].matchAll(/\[([^\]]+)\]\((https?:\/\/[^)]+)\)/g)]
+        if (!raw || typeof raw !== 'string') return { text: '', sources: [] }
+        // Match the final SOURCES: footer block so an earlier prose mention of "Sources:" doesn't truncate the reply.
+        const headerRe = /(?:^|\n)\s*\*?\*?SOURCES?\*?\*?:\s*/gi
+        let lastMatch = null
+        let m
+        while ((m = headerRe.exec(raw)) !== null) lastMatch = m
+        if (!lastMatch) return { text: raw.trim(), sources: [] }
+
+        const text = raw.slice(0, lastMatch.index).trim()
+        const block = raw.slice(lastMatch.index + lastMatch[0].length)
+        const sources = [...block.matchAll(/\[([^\]]+)\]\((https?:\/\/[^)\s]+)\)/g)]
             .slice(0, 3)
-            .map((m) => ({ name: m[1].trim(), url: m[2].trim() }))
+            .map((mm) => ({ name: mm[1].trim(), url: mm[2].trim() }))
         // The model sometimes cites bare URLs instead of markdown links — harvest
         // those from the SOURCES block so research answers don't silently lose
-        // their footer. Only inside the block: never launder passing mentions
-        // from the prose into fake citations.
+        // their footer.
         if (!sources.length) {
             const seen = new Set()
-            for (const m of match[1].matchAll(/https?:\/\/[^\s)>\]]+/g)) {
-                const url = m[0].slice(0, 300)
+            for (const mm of block.matchAll(/https?:\/\/[^\s)>\]]+/g)) {
+                const url = mm[0].slice(0, 300)
                 if (seen.has(url)) continue
                 seen.add(url)
                 let name = 'link'
@@ -471,24 +446,22 @@ export class ResearchCore extends ProviderCore {
     }
 
     _extractSearchQuery(prompt) {
-        let q = prompt.trim()
+        const raw = String(prompt ?? '').trim()
+        if (!raw) return ''
+        let q = raw
         // Strip leading greetings and filler words
         q = q.replace(/^(?:hi+|hey+|yo+|sup|hello|oi|ok|okay)[,!\s]+/i, '').trim()
         // Trailing instruction verbs ("fake info do web research"): the
-        // ask is the topic, the verb phrase is not. Requires "web" so
-        // activity-form asks ("where do I do research") survive intact.
+        // ask is the topic, the verb phrase is not.
         q = q
             .replace(/(?:^|\s+)(?:do|perform|run|make)(?: a)?\s+web\s+(?:research|search)\s*\.?$/i, '')
             .trim()
         // Strip trailing "…and research" / "…research for me" so the query stays clean.
-        // Bare trailing "research" alone is left intact ("I do research" is
-        // a topic, not an instruction) — the verb-phrase rule above owns those.
         q = q
             .replace(/\s+and\s+research(?:\s+for\s+me|\s+it\s+up|\s+this\s+up|\s+that\s+up)?\.?$/i, '')
             .replace(/\s+research\s+(?:for\s+me|it\s+up|this\s+up|that\s+up)\.?$/i, '')
             .trim()
-        const prefixes = SEARCH_STRIP_RES
-        for (const p of prefixes) q = q.replace(p, '').trim()
+        for (const p of SEARCH_STRIP_RES) q = q.replace(p, '').trim()
         q = q.replace(/\s+for me\.?$|\s+please\.?$/i, '').trim()
         // Parenthetical asides to the bot ("(look it up)", "(search this)")
         // are instructions, not search terms — drop them from the query.
@@ -499,13 +472,11 @@ export class ResearchCore extends ProviderCore {
             )
             .replace(/\s{2,}/g, ' ')
             .trim()
-        return q.length > 3 ? q : prompt.trim()
+        return q.length > 3 ? q : raw
     }
+
     // Classifier with its own fallback chain: primary pinned client first,
     // then each configured classifier fallback. Returns raw text or null.
-    // Never rotates keys and never throws — failure just means "next entry".
-    // ctl lets the 2.5s race stop the chain: without it the loser keeps
-    // burning fallback requests after the caller already gave up.
     async _classifyWithFallbacks(messages, ctl = null) {
         const toks = this.classifierTokens ?? 64
         const r = await this._groqCall(
@@ -520,9 +491,6 @@ export class ResearchCore extends ProviderCore {
         if (typeof r === 'string' && r) return r
         for (const fb of this.agentFallbacks?.classifier ?? []) {
             if (ctl?.stop) return null
-            // Skip entries that duplicate the primary (same model): the
-            // censored config lists gpt-oss-20b as its own fallback, which
-            // would just re-burn the failed hop.
             if (fb.model === this.classifierModel) continue
             try {
                 const client = this._fallbackClient(fb)
@@ -543,6 +511,7 @@ export class ResearchCore extends ProviderCore {
         }
         return null
     }
+
     // Smart routing
     async _classifyNeedsResearch(prompt) {
         if (!this._groq) return false
@@ -553,26 +522,27 @@ export class ResearchCore extends ProviderCore {
             },
             {
                 role: 'user',
-                content: `Does answering this accurately require a live web search?\n\nAnswer YES if: real-time/frequently changing data, events/releases/news from last 12 months, product reveals/announcements/launches tied to a named event/show/award (Monterey Car Week, CES, Grammys), especially with 'this year'/'this week', software/game version numbers, current position holders, step-by-step how-tos for current apps/sites (UIs change), recommendations of real people/creators/businesses/products/social-media handles (invented names and links mislead), anything where a 6-month-old answer would be wrong.\n\nAnswer NO if: conversational/emotional/social, asking for opinion/joke/creative content, timeless knowledge (math, history, stable how-things-work).\n\nReply ONLY YES or NO.\n\nQuestion: ${prompt.slice(0, 300)}`,
+                content: `Does answering this accurately require a live web search?\n\nAnswer YES if: real-time/frequently changing data, events/releases/news from last 12 months, product reveals/announcements/launches tied to a named event/show/award (Monterey Car Week, CES, Grammys), especially with 'this year'/'this week', software/game version numbers, current position holders, step-by-step how-tos for current apps/sites (UIs change), recommendations of real people/creators/businesses/products/social-media handles (invented names and links mislead), anything where a 6-month-old answer would be wrong.\n\nAnswer NO if: conversational/emotional/social, asking for opinion/joke/creative content, timeless knowledge (math, history, stable how-things-work).\n\nReply ONLY YES or NO.\n\nQuestion: ${String(prompt ?? '').slice(0, 300)}`,
             },
         ]
+        let timer = null
         try {
-            // Use a cheap fast model for YES/NO classification instead of big slow overthinking flasgship models (faster + cheaper)
-            // (also which fires an unnecessary server-side web search just to answer YES/NO)
             const ctl = { stop: false }
             const result = await Promise.race([
                 this._classifyWithFallbacks(messages, ctl),
-                new Promise((_, rej) =>
-                    setTimeout(() => {
+                new Promise((_, rej) => {
+                    timer = setTimeout(() => {
                         ctl.stop = true
                         rej(new Error('timeout'))
-                    }, 2500),
-                ),
+                    }, 2500)
+                }),
             ])
             if (!result || typeof result !== 'string') return this._heuristicNeedsResearch(prompt)
             return result.trim().toUpperCase().startsWith('YES')
         } catch {
             return this._heuristicNeedsResearch(prompt)
+        } finally {
+            if (timer) clearTimeout(timer)
         }
     }
 
@@ -581,7 +551,7 @@ export class ResearchCore extends ProviderCore {
     // stays direct. Interpersonal/opinion frames ("do you like X?") are excluded
     // even with a question mark — researching taste is pure waste.
     _heuristicNeedsResearch(prompt) {
-        const t = prompt.trim()
+        const t = String(prompt ?? '').trim()
         if (
             /^(do you|are you|would you|will you|did you|have you|do u|what do you think|how do you feel|should i)\b/i.test(
                 t,
@@ -589,75 +559,41 @@ export class ResearchCore extends ProviderCore {
         ) {
             return /\b(20[2-9]\d|v?\d+\.\d+[\d.]*)\b/.test(t.toLowerCase())
         }
-        if (prompt.includes('?')) return true
-        return /\b(20[2-9]\d|v?\d+\.\d+[\d.]*)\b/.test(prompt.toLowerCase())
+        if (t.includes('?')) return true
+        return /\b(20[2-9]\d|v?\d+\.\d+[\d.]*)\b/.test(t.toLowerCase())
     }
 
     async needsResearch(prompt) {
         // Master switch off: everything answers directly, classifier never runs.
         if (this._searchOff()) return 'direct'
+        const raw = String(prompt ?? '')
         // Pre-resolved by a fast-path (time data, explicit context): answering
         // directly, never researching what we already computed.
-        if (String(prompt ?? '').includes('[TIME DATA')) return 'direct'
-        const lower = prompt.toLowerCase().trim()
-        const wc = prompt.split(/\s+/).length
-        const hasQ = prompt.includes('?')
-        const hasTemp = /\b(20[2-9]\d|v?\d+\.\d+[\d.]*)\b/.test(lower)
+        if (raw.includes('[TIME DATA')) return 'direct'
+        const trimmed = raw.trim()
+        const lower = trimmed.toLowerCase()
 
-        for (const sig of NO_SEARCH_SIGNALS) if (lower.includes(sig)) return 'nosearch'
+        if (NO_SEARCH_TEST_RE.test(lower)) return 'nosearch'
 
-        // Self-status: "ram usage?", "cpu?", "uptime", "ping", "vitals" asked
-        // AT her (mention/reply/DM context) are answered from the SYSTEM STATS
-        // block already injected in-prompt — researching the web for her own
-        // RAM posts a confusing notice and burns a full round trip on
-        // helpdesk fluff the model itself disowns. Product-noun guard keeps
-        // "cpu benchmark 2026" / "ram prices" on the research path. Placed
-        // BEFORE the ALWAYS_LIVE loop: "how much ram do you have" would
-        // otherwise trip the generic "how much" signal.
+        // Self-status: "ram usage?", "cpu?", "uptime", "ping", "vitals"
         const selfMetric =
-            /^(your|ur|medusa'?s?|bot'?s?|her)\s+(ram|memory|cpu|uptime|ping|latency|status|vitals|lag|health)\b/i.test(
-                prompt.trim(),
-            ) ||
-            /^(ram|memory|cpu|uptime|ping|vitals)\b[^a-z]*\??$/i.test(prompt.trim()) ||
-            /^(ram|memory|cpu)\s+(usage|use|load|status|state|level)\b/i.test(prompt.trim()) ||
-            /\bhow much (ram|memory) (do you|u have|have you got)\b/i.test(lower) ||
-            /\b(you|u|she|medusa) (lagging|laggy|slow|down|dead)\b/i.test(lower)
-        const productNoun =
-            /\b(20[2-9]\d|v?\d+\.\d+|benchmark|price|cost|vs\b|compare|game|pc\b|phone|laptop|gpu)\b/i.test(
-                lower,
-            )
-        if (selfMetric && !productNoun) return 'nosearch'
+            SELF_METRIC_1.test(trimmed) ||
+            SELF_METRIC_2.test(trimmed) ||
+            SELF_METRIC_3.test(trimmed) ||
+            SELF_METRIC_4.test(lower) ||
+            SELF_METRIC_5.test(lower)
+        if (selfMetric && !PRODUCT_NOUN_RE.test(lower)) return 'nosearch'
+
         // Censor toggle (config.json "nsfw"): with it off, NSFW/dangerous prompts
-        // short-circuit to refusals. With it on, everything routes normally and
-        // the models judge content themselves.
+        // short-circuit to refusals.
         if (!this._nsfwAllowed()) {
-            // Word-boundaried: substring matching refused whole queries ("hololive"
-            // contains "loli"). Standalone terms still match exactly as before.
             if (NSFW_RE.test(lower)) return 'nsfw'
-            for (const term of DANGEROUS_TERMS) if (lower.includes(term)) return 'dangerous'
+            if (DANGEROUS_RE.test(lower)) return 'dangerous'
         }
-        // Word-boundaried: substring matching sent "costume-shopped" to
-        // research via "cost". Pre-compiled in constants (was ~50 fresh
-        // RegExps per turn).
-        if (ALWAYS_LIVE_RE.test(prompt)) return 'research'
 
-        // Greeting-led messages with no question mark and no live signal are social,
-        // not research. Decided here so archaic/casual hellos ("ho, nice to meeteth
-        // thee…") never burn a classifier call that small models false-positive on.
-        if (!hasQ && /^(hi+|hey+|ho+|hello|hiya|heyo|howdy|salut|yo|sup|oi)\b[,!\s]/i.test(prompt.trim()))
-            return 'direct'
-
-        // Short-message skip only when clearly conversational (greeting/emoji/ack).
-        const CASUAL_SHORT =
-            /^(hi+|hey+|yo+|sup|hello|ty|thx|thanks|ok|okay|cool|nice|bye|cya|gn|gm|lol|lmao|[💜💚🥺💀·👀🪼])/i
-        const isShortCasual = wc <= 3 && CASUAL_SHORT.test(lower)
-
-        const isNever =
-            NEVER_RESEARCH_EXACT.has(lower) ||
-            NEVER_RESEARCH_PREFIXES.some((p) => lower.startsWith(p)) ||
-            (wc <= 6 && !hasQ && !hasTemp) ||
-            isShortCasual
-        if (isNever) return 'direct'
+        const staticDecision = classifyResearchStatic(raw, false)
+        if (staticDecision === 'yes') return 'research'
+        if (staticDecision === 'no') return 'direct'
 
         // Classifier round-trip, cache for 2 min so spam of "what's the weather"
         // doesn't burn 30 LLM calls in a fun channel
@@ -665,7 +601,7 @@ export class ResearchCore extends ProviderCore {
         const cacheKey = lower.slice(0, 200)
         const hit = this._routeCache.get(cacheKey)
         if (hit !== undefined) return hit
-        const needsIt = await this._classifyNeedsResearch(prompt)
+        const needsIt = await this._classifyNeedsResearch(raw)
         const result = needsIt ? 'research' : 'direct'
         this._routeCache.set(cacheKey, result)
         return result

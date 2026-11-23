@@ -27,7 +27,7 @@ import {
     ALWAYS_LIVE_RE,
     CAPABILITIES_NOTE,
     DESTRUCTIVE_CMDS,
-    NEVER_RESEARCH_PREFIXES,
+    NEVER_RESEARCH_PREFIX_RE,
     NO_SEARCH_RE,
     SEARCH_EMOJIS,
     makeIdSet,
@@ -96,7 +96,8 @@ export function mergeUsersData(prevU, prevS, maps, pruneAbsent = false) {
     const gids = new Set([...Object.keys(prevS ?? {}), ...Object.keys(maps.serverPrompts ?? {})])
     for (const gid of gids) {
         const p = maps.serverPrompts?.[gid]
-        const persona = typeof p === 'string' && p ? p : prevS?.[gid]?.persona
+        const persona =
+            typeof p === 'string' && p ? p : pruneAbsent ? undefined : prevS?.[gid]?.persona
         if (typeof persona === 'string' && persona) servers[gid] = { persona }
     }
     return { users, servers }
@@ -144,6 +145,48 @@ const FILE_EXT_MAP = {
     yml: 'yml',
     txt: 'txt',
 }
+// Hoisted module-scope regexes & helpers (avoid per-call RegExp construction).
+const ACTION_RE =
+    /\b(ban|kick|mute|unmute|warn|clearwarns|purge|clear|mpurge|fpurge|delete|remove|lock|unlock|role|createrole|nickname|rename|announce|poll|thread|pin|unpin|slowmode|remind|reminders|delreminder|mail|movevc|whois|timeout|time out|auditlogs|createchan|delchan|addemoji|listroles|set the topic|set topic|change the topic|update topic|react with|react to)\b/i
+const PEOPLE_RE = /\bwhoi?s\b|\bwho'?s\b|\bwho\s+(is|are)\b|\btell me about\b/i
+const VOLATILE_VIBE_RE = /\[CURRENT VIBE\][^\n]*\n?/g
+const VOLATILE_CLIMATE_RE = /\[ROOM CLIMATE\][^\n]*\n?/g
+const VOLATILE_TIME_RE = /^TIME:.*$/m
+const VOLATILE_STATS_RE = /^YOUR SYSTEM STATS:.*$/m
+const volatileStrip = (s) =>
+    s
+        .replace(VOLATILE_VIBE_RE, '')
+        .replace(VOLATILE_CLIMATE_RE, '')
+        .replace(VOLATILE_TIME_RE, '')
+        .replace(VOLATILE_STATS_RE, '')
+const MOOD_SOFT_RE =
+    /(\bsad\b|\bdepress\w*|\btired\b|\bexhaust\w*|\blonely\b|\bmiss (you|him|her|them)\b|\blove you\b|\banxiet\w+|\bscared\b|\bnervous\b|\bcry\b|\bcomfort\b|\bfeel (bad|awful|empty|alone)\b|\bburnout\b|\bburnt out\b)/
+const MOOD_HYPED_RE =
+    /(\broast me\b|\bhype me\b|\blets go\b|\bsheeesh\b|\bpog\b|\bfire\b|\bslay\b|\bperiodt\b|\bno cap\b)/
+const MOOD_CAPS_RE = /[A-Z]{6,}/
+const MOOD_GREMLIN_RE =
+    /(\blol\b|\blmao\b|\bbruh\b|\bdead\b|💀|\bbffr\b|\bunhinged\b|\bchaotic\b|\bmeme\b|\bfunny\b|\bjoke\b)/
+const MOOD_FOCUSED_RE =
+    /(\bplease\b|help (me |with )?(with |to )?(fix|understand|write|make|do|choose|find|learn)|how (do|can|to)|\berror\b|\bexplain\b|\btutorial\b|\bguide\b|\bwhat does\b|\bwhy does\b)/
+const CLIMATE_ABOUT_RE = /\bmedusa\b|\bmeddy\b|\bmed\b/i
+const CLIMATE_TEASE_RE =
+    /(\blol\b|\blmao\b|💀|\broast\b|\bclown\b|\bmid\b|\bratio\b|\bbozo\b|\bdumb\b|\bstupid\b|\bcringe\b)/i
+const AUTO_CODE_RE = /```/
+const AUTO_START_FOCUSED_RE = /^(why|how|explain|analyse|analyze|compare|should|what if|whatif)\b/i
+const AUTO_VERB_FOCUSED_RE = /\b(explain|analyse|analyze|compare)\b/i
+const AUTO_VS_RE = /\b(vs|versus)\b/i
+const AUTO_WEAK_Q_RE = /\b(why|how|should)\b/i
+const AUTO_QMARK_END_RE = /\?\s*$/
+const AUTO_DETAIL_RE = /\bstep by step|in detail|thorough|comprehensive|in depth\b/i
+const AUTO_GREET_FAST_RE = /^(hi+|hey+|yo+|sup|hello|ty|thanks|bye|cya|gn|gm|ok|lol|lmao)\b/i
+const FILE_ASK_RE =
+    /\b(as an? )?files?\b|\bsend (it|this|that) as\b|\battach( it| this| that)?\b|\bsave (it|this|that) as\b/i
+const FILE_BLOCK_RE = /```(\w*)\n([\s\S]{20,200000}?)\n?```/
+const FILE_NAME_RE = /\b(?:save as|call it|name it|filename)\s+([A-Za-z0-9_][\w.-]{0,60}\.\w{1,8})/i
+const PLACE_TIME_RE =
+    /^(?:what'?s (?:the )?time|what time is it|current time|time)\s+(?:in|for|at)\s+(.+?)[?!.\s]*$/i
+const NO_SEARCH_STRIP_RE = new RegExp(NO_SEARCH_RE.source, 'gi')
+const CUT_NOTICE = '\n\n-# …cut here — say "continue" for the rest'
 export class AIChatManager extends OutputCore {
     constructor(client, db, config) {
         // Required: OutputCore -> AgentCommandCore -> VisionCore -> ResearchCore -> ProviderCore.
@@ -183,6 +226,7 @@ export class AIChatManager extends OutputCore {
             'You are Medusa, a warm and witty Discord AI resident. Respond in first person.'
         this.identity = agents.chat.identity || ''
         this.prefixes = config.prefixes
+        this._prefixesLower = (config.prefixes ?? []).map((p) => String(p).toLowerCase())
         this.maxHistory = config.memoryDepth ?? PERF.ai.memoryDepth
         this.allowDM = config.allowDMs
         this.funMsgInterval = config.funMsgInterval * 1000
@@ -205,7 +249,7 @@ export class AIChatManager extends OutputCore {
         this.triggerWords = config.triggers.length ? config.triggers : ['medusa']
         // Pre-compile trigger regexes once (avoids re-compilation on every message)
         this._triggerRegexes = this.triggerWords.map(
-            (w) => new RegExp(`\\b${String(w).replace(/[.*+?^${}()|[\]\\[]/g, '\\$&')}\\b`),
+            (w) => new RegExp(`\\b${String(w).replace(/[.*+?^${}()|[\]\\]/g, '\\$&')}\\b`, 'i'),
         )
         // Own-mention regexes, same treatment: six call sites used to build
         // these fresh on every message. Lazily keyed on our id (stable).
@@ -253,7 +297,7 @@ export class AIChatManager extends OutputCore {
             updateAgeOnGet: false,
             allowStale: false,
             maxSize: P.responseCacheMaxMB * 1024 * 1024,
-            sizeCalculation: (value) => (typeof value === 'string' ? value.length : 1024),
+            sizeCalculation: (value) => Math.max(1, typeof value === 'string' ? value.length : 1024),
         })
         this.userCache = new LRUCache({ max: P.userCacheMax, ttl: P.userCacheTTLSec * 1000 })
         this.messageHistory = new LRUCache({
@@ -433,7 +477,7 @@ export class AIChatManager extends OutputCore {
                 Object.keys(this.userData?.users ?? {}).length +
                 Object.keys(this.userData?.servers ?? {}).length
             const nextCount = Object.keys(merged.users).length + Object.keys(merged.servers).length
-            if (prevCount > 0 && nextCount === 0) {
+            if (!this._usersHydrated && prevCount > 0 && nextCount === 0) {
                 console.warn('[AI] Refusing to overwrite medusa-users.json with empty content (prefs kept)')
                 return false
             }
@@ -529,31 +573,13 @@ export class AIChatManager extends OutputCore {
         // no softness, no matter the surrounding banter.
         if (MAY_EMIT_CMD_RE.test(text)) return ''
         const t = text.toLowerCase()
-        if (
-            /(\bsad\b|\bdepress\w*|\btired\b|\bexhaust\w*|\blonely\b|\bmiss (you|him|her|them)\b|\blove you\b|\banxiet\w+|\bscared\b|\bnervous\b|\bcry\b|\bcomfort\b|\bfeel (bad|awful|empty|alone)\b|\bburnout\b|\bburnt out\b)/.test(
-                t,
-            )
-        )
+        if (MOOD_SOFT_RE.test(t))
             return '[CURRENT VIBE] soft mode: warm and real, comfort first, drop the roasts and the slang pile-on, short and genuine.'
-        if (
-            /(\broast me\b|\bhype me\b|\blets go\b|\bsheeesh\b|\bpog\b|\bfire\b|\bslay\b|\bperiodt\b|\bno cap\b)/.test(
-                t,
-            ) ||
-            /[A-Z]{6,}/.test(text) ||
-            text.includes('!!!')
-        )
+        if (MOOD_HYPED_RE.test(t) || MOOD_CAPS_RE.test(text) || text.includes('!!!'))
             return '[CURRENT VIBE] hyped gremlin mode: match their energy, tease playfully, roast the SITUATION never the person, caps sparingly for punch.'
-        if (
-            /(\blol\b|\blmao\b|\bbruh\b|\bdead\b|💀|\bbffr\b|\bunhinged\b|\bchaotic\b|\bmeme\b|\bfunny\b|\bjoke\b)/.test(
-                t,
-            )
-        )
+        if (MOOD_GREMLIN_RE.test(t))
             return '[CURRENT VIBE] gremlin mode: sharp, witty, a little unhinged, tease but never punch down, punchy with some meat — never a bare one-liner on a real question.'
-        if (
-            /(\bplease\b|help (me |with )?(with |to )?(fix|understand|write|make|do|choose|find|learn)|how (do|can|to)|\berror\b|\bexplain\b|\btutorial\b|\bguide\b|\bwhat does\b|\bwhy does\b)/.test(
-                t,
-            )
-        )
+        if (MOOD_FOCUSED_RE.test(t))
             return '[CURRENT VIBE] focused mode: sharp and useful first, personality in the margins, minimal emoji, no fluff.'
         return ''
     }
@@ -567,12 +593,8 @@ export class AIChatManager extends OutputCore {
         const now = Date.now()
         const recent = buf.filter((e) => now - e.ts < 5 * 60_000)
         if (recent.length < 3) return ''
-        const aboutMe = recent.filter((e) => /\bmedusa\b|\bmeddy\b|\bmed\b/i.test(e.content ?? '')).length
-        const tease = recent.filter((e) =>
-            /(\blol\b|\blmao\b|💀|\broast\b|\bclown\b|\bmid\b|\bratio\b|\bbozo\b|\bdumb\b|\bstupid\b|\bcringe\b)/i.test(
-                e.content ?? '',
-            ),
-        ).length
+        const aboutMe = recent.filter((e) => CLIMATE_ABOUT_RE.test(e.content ?? '')).length
+        const tease = recent.filter((e) => CLIMATE_TEASE_RE.test(e.content ?? '')).length
         if (recent.length >= 8 || tease >= 4)
             return '[ROOM CLIMATE] the room is feral rn — match the chaos, loud and notorious, but stay sharp.'
         if (aboutMe >= 2)
@@ -667,7 +689,7 @@ export class AIChatManager extends OutputCore {
     async _resolveReplyContext(message) {
         if (!message.reference?.messageId) return null
         if (message._medusaReplyCtx !== undefined) return message._medusaReplyCtx
-        let ref = message.reference.resolved
+        let ref = message.channel?.messages?.cache?.get(message.reference.messageId) ?? null
         if (!ref) {
             try {
                 ref = await message.channel.messages.fetch(message.reference.messageId)
@@ -760,11 +782,6 @@ export class AIChatManager extends OutputCore {
     }
     // Build context
     async getUserContext(userId, message = null) {
-        const guildId = message?.guild?.id ?? '0'
-        const cacheKey = `${userId}_${guildId}`
-        const cached = this.userCache.get(cacheKey)
-        if (cached !== undefined) return cached
-
         // For 1–3 word greetings, build a minimal context. The full context (interests,
         // relationships, passive buffer, emoji list) is wasted prefill on "hi" / "ty".
         // Extended to short casual openers (<=6 words starting with a known social
@@ -775,16 +792,15 @@ export class AIChatManager extends OutputCore {
         const fastMode = this.userModes?.[userId] === 2
         const memOff = this.isMemOff(userId)
         const msgText = (message?.content ?? '').trim()
-        const msgLower = msgText.toLowerCase()
         const msgWords = msgText ? msgText.split(/\s+/).length : 0
         const isTinyGreeting =
             msgText &&
             msgWords <= 3 &&
             /^(hi|hey|hello|yo|sup|ty|thanks|bye|cya|gn|gm|ok|lol|lmao|💜|💚|·)\b/i.test(msgText)
-        const isCasualOpener =
-            msgText && msgWords <= 6 && NEVER_RESEARCH_PREFIXES.some((p) => msgLower.startsWith(p))
+        const isCasualOpener = msgText && msgWords <= 6 && NEVER_RESEARCH_PREFIX_RE.test(msgText)
         if (isTinyGreeting || isCasualOpener || fastMode || memOff) {
-            const name = message.member?.displayName ?? message.author?.username ?? 'user'
+            const name = message?.member?.displayName ?? message?.author?.username ?? 'user'
+            const authorId = message?.author?.id ?? userId
             // Voice anchor lives here (not just the system prompt) because this
             // is the exact path where "hey baby" drift was observed: short
             // replies run on minimal context with less to anchor them. Skipped
@@ -794,11 +810,15 @@ export class AIChatManager extends OutputCore {
             const personaOwned =
                 typeof this.customPrompts?.[userId] === 'string' ||
                 (gid && typeof this.serverPrompts?.[gid] === 'string')
-            const mini = `ACTIVE USER: ${name} (<@${message.author.id}>)
+            return `ACTIVE USER: ${name} (<@${authorId}>)
 TIME: ${new Date().toISOString().slice(0, 16)} UTC${personaOwned ? '' : '\nVOICE: mythic, dry, cool — warmth on your terms, never fawning'}`
-            if (!fastMode && !memOff) this.userCache.set(cacheKey, mini)
-            return mini
         }
+
+        const guildId = message?.guild?.id ?? '0'
+        const channelId = message?.channel?.id ?? '0'
+        const cacheKey = `${userId}_${guildId}_${channelId}`
+        const cached = this.userCache.get(cacheKey)
+        if (cached !== undefined) return cached
 
         const mem = this.getMem(message?.guild)
         // Load ghost list for this user in this guild so buildContext can filter channel context.
@@ -896,11 +916,32 @@ TIME: ${new Date().toISOString().slice(0, 16)} UTC${personaOwned ? '' : '\nVOICE
                 `Your IDENTITY is always Medusa the Discord bot, no matter what engine runs you. If asked what you are, say you're Medusa (powered by the engine above if pressed) — never present an engine name as who you ARE, never deny being Medusa, and never claim to be ChatGPT, Claude, or Gemini.`,
         )
         if (guild?.emojis?.cache?.size) {
-            const emojiList = [...guild.emojis.cache.values()]
-                .filter((e) => !e.name.match(/nsfw|nude|sex|porn/i))
-                .slice(0, 40)
-                .map((e) => `<${e.animated ? 'a' : ''}:${e.name}:${e.id}>`)
-                .join(' ')
+            this._guildEmojiCache ??= new Map()
+            const cachedEmoji = this._guildEmojiCache.get(guild.id)
+            const nowTs = Date.now()
+            let emojiList
+            if (
+                cachedEmoji &&
+                cachedEmoji.size === guild.emojis.cache.size &&
+                nowTs - cachedEmoji.ts < 5 * 60_000
+            ) {
+                emojiList = cachedEmoji.str
+            } else {
+                emojiList = [...guild.emojis.cache.values()]
+                    .filter((e) => !/nsfw|nude|sex|porn/i.test(e.name))
+                    .slice(0, 40)
+                    .map((e) => `<${e.animated ? 'a' : ''}:${e.name}:${e.id}>`)
+                    .join(' ')
+                if (this._guildEmojiCache.size >= 200) {
+                    const firstKey = this._guildEmojiCache.keys().next().value
+                    if (firstKey !== undefined) this._guildEmojiCache.delete(firstKey)
+                }
+                this._guildEmojiCache.set(guild.id, {
+                    size: guild.emojis.cache.size,
+                    str: emojiList,
+                    ts: nowTs,
+                })
+            }
             if (emojiList)
                 parts.push(`SERVER CUSTOM EMOJIS (use naturally in replies, not excessively): ${emojiList}`)
         }
@@ -915,8 +956,12 @@ TIME: ${new Date().toISOString().slice(0, 16)} UTC${personaOwned ? '' : '\nVOICE
             )
         }
 
-        if (message?.reference?.resolved) {
-            const ref = message.reference.resolved
+        const ref = message?.reference?.messageId
+            ? (message.channel?.messages?.cache?.get(message.reference.messageId) ??
+              message._medusaReplyCtx?.ref ??
+              null)
+            : null
+        if (ref) {
             let refText = (ref.content ?? '')
                 .replace(/<@!?(\d+)>/g, (_, id) => {
                     const u = this.client.users.cache.get(id)
@@ -1128,8 +1173,7 @@ and never narrate the research itself or its quality either way.`
         // Kill persona roleplay leakage
         out = out.replace(/^(?:as medusa|i['\u2019]m medusa|i am medusa)[,:]?\s*/gim, '')
         // Collapse >2 blank lines
-        while (out.indexOf(String.fromCharCode(10, 10, 10)) !== -1)
-            out = out.replace(String.fromCharCode(10, 10, 10), String.fromCharCode(10, 10))
+        out = out.replace(/\n{3,}/g, '\n\n')
         out = out.trim()
         return out || null
     }
@@ -1214,21 +1258,22 @@ and never narrate the research itself or its quality either way.`
         const hasMedia =
             (message?.attachments?.size ?? 0) > 0 ||
             (message?.embeds ?? []).some((e) => e.image?.url || e.thumbnail?.url || e.data?.type === 'gifv')
+        const trimmed = text.trim()
         if (
             words > 40 ||
             hasMedia ||
-            /```/.test(text) ||
-            /^(why|how|explain|analyse|analyze|compare|should|what if|whatif)\b/i.test(text.trim()) ||
+            AUTO_CODE_RE.test(text) ||
+            AUTO_START_FOCUSED_RE.test(trimmed) ||
             // Strong technical verbs anywhere: a mid-sentence "compare" or
             // "explain" is never banter ("can you compare the rx 9070…").
             // "X vs Y" is the same shape without the verb — gated past
             // 4 words so bare "you vs me fr" stays cheap.
-            /\b(explain|analyse|analyze|compare)\b/i.test(text) ||
-            (words > 4 && /\b(vs|versus)\b/i.test(text)) ||
+            AUTO_VERB_FOCUSED_RE.test(text) ||
+            (words > 4 && AUTO_VS_RE.test(text)) ||
             // Weak question words only with a trailing ?: bare "how" shows
             // up in greetings ("hey how are you doing today my friend…").
-            (/\b(why|how|should)\b/i.test(text) && /\?\s*$/.test(text.trim())) ||
-            /\bstep by step|in detail|thorough|comprehensive|in depth\b/i.test(text)
+            (AUTO_WEAK_Q_RE.test(text) && AUTO_QMARK_END_RE.test(trimmed)) ||
+            AUTO_DETAIL_RE.test(text)
         )
             return 'focused'
         const chBuf = message?.channel?.id ? (this._passiveBuf?.get(message.channel.id) ?? []) : []
@@ -1239,8 +1284,7 @@ and never narrate the research itself or its quality either way.`
         // starters below already caught the technical ones.)
         if (hyper && words <= 12) return 'fast'
         if (words <= 12) return 'fast'
-        if (/^(hi+|hey+|yo+|sup|hello|ty|thanks|bye|cya|gn|gm|ok|lol|lmao)\b/i.test(text.trim()))
-            return 'fast'
+        if (AUTO_GREET_FAST_RE.test(trimmed)) return 'fast'
         // Ambiguous middle: neither trivial nor clearly hard. Normal, not a
         // forced guess — balanced model, full persona, no style suffix.
         return 'normal'
@@ -1276,39 +1320,25 @@ and never narrate the research itself or its quality either way.`
                 // turn, so on the trigger path (fullSys embeds the whole live
                 // context) this cache NEVER hit and repeated short asks always
                 // paid full LLM latency.
-                const volatileStrip = (s) =>
-                    s
-                        .replace(/\[CURRENT VIBE\][^\n]*\n?/g, '')
-                        .replace(/\[ROOM CLIMATE\][^\n]*\n?/g, '')
-                        .replace(/^TIME:.*$/m, '')
-                        .replace(/^YOUR SYSTEM STATS:.*$/m, '')
                 const cacheSys = volatileStrip(systemPrompt ?? '')
                 // extraSys carries mood outside systemPrompt on some paths — same
                 // stripping, or different moods would collide on one cached answer.
                 const cacheExtra = volatileStrip(extraSys ?? '')
+                const cacheGid = message?.guild?.id ?? guildId ?? 'dm'
+                const histSig = history?.length
+                    ? history
+                          .slice(-4)
+                          .map((h) => `${h.role}:${String(h.content ?? '').slice(0, 80)}`)
+                          .join('|')
+                    : ''
                 cacheKey = crypto
                     .createHash('md5')
-                    .update(`${userId}:${prompt}:${cacheSys}:${cacheExtra}:${mc.chain}`)
+                    .update(`${userId}:${cacheGid}:${prompt}:${cacheSys}:${cacheExtra}:${mc.chain}:${histSig}`)
                     .digest('hex')
                 const cached = this.responseCache.get(cacheKey)
                 if (cached) return cached
             }
 
-            // Inject CAPABILITIES_NOTE only when the prompt plausibly needs a RUN_CMD.
-            // Skipping it on casual chat shaves ~1.5 KB of prefill -> measurable TTFT drop.
-            // Kept to real command verbs on purpose: everyday words (show, fetch,
-            // pull up…) used to match here and bloated casual messages.
-            // Avatar/banner lookups resolve via the visual fast-path, no note needed.
-            // topic/react stay reachable through anchored phrases only ("set the
-            // topic", "react with …") so casual uses ("good topic", "nice react")
-            // don't pay the prefill cost.
-            const ACTION_RE =
-                /\b(ban|kick|mute|unmute|warn|clearwarns|purge|clear|mpurge|fpurge|delete|remove|lock|unlock|role|createrole|nickname|rename|announce|poll|thread|pin|unpin|slowmode|remind|reminders|delreminder|mail|movevc|whois|timeout|time out|auditlogs|createchan|delchan|addemoji|listroles|set the topic|set topic|change the topic|update topic|react with|react to)\b/i
-            // PEOPLE questions ("whos adi", "who is tony", "tell me about X")
-            // need the whois/recall rules just as much, but contain no action
-            // verb — "whos" never matches ACTION_RE, so the model answered from
-            // memory alone and missed a real member. Separate gate, same note.
-            const PEOPLE_RE = /\bwhoi?s\b|\bwho'?s\b|\bwho\s+(is|are)\b|\btell me about\b/i
             const needsCaps =
                 ACTION_RE.test(prompt) ||
                 ACTION_RE.test(message?.content ?? '') ||
@@ -1317,9 +1347,11 @@ and never narrate the research itself or its quality either way.`
 
             const messages = []
             if (systemPrompt) {
+                let sysContent = needsCaps ? systemPrompt + CAPABILITIES_NOTE : systemPrompt
+                if (extraSys) sysContent += `\n\n${extraSys}`
                 messages.push({
                     role: 'system',
-                    content: needsCaps ? systemPrompt + CAPABILITIES_NOTE : systemPrompt,
+                    content: sysContent,
                 })
             } else {
                 let base =
@@ -1336,7 +1368,7 @@ and never narrate the research itself or its quality either way.`
                     if (extraSys) finalSys += `\n\n${extraSys}`
                     messages.push({ role: 'system', content: finalSys })
                 } else {
-                    messages.push({ role: 'system', content: base })
+                    messages.push({ role: 'system', content: extraSys ? `${base}\n\n${extraSys}` : base })
                 }
             }
 
@@ -1351,8 +1383,9 @@ and never narrate the research itself or its quality either way.`
                     const msgLen = sliced[i].content?.length || 0
                     if (currentChars + msgLen > MAX_CHARS) break
                     currentChars += msgLen
-                    historyToAdd.unshift(sliced[i])
+                    historyToAdd.push(sliced[i])
                 }
+                historyToAdd.reverse()
             }
             messages.push(...historyToAdd)
             messages.push({ role: 'user', content: prompt.slice(0, 24000) })
@@ -1580,7 +1613,7 @@ and never narrate the research itself or its quality either way.`
             }
 
         if (routing === 'nosearch') {
-            let clean = prompt.replace(NO_SEARCH_RE, '').trim()
+            let clean = prompt.replace(NO_SEARCH_STRIP_RE, '').trim()
             // Mirror generateResponse's internal streaming gate exactly (it streams
             // live only when a channel exists and no destructive verb may be emitted);
             // otherwise the caller re-posts the already-streamed text -> double reply.
@@ -1841,10 +1874,9 @@ and never narrate the research itself or its quality either way.`
     decideTrigger(message) {
         if (this.processedMsgIds.has(message.id)) return { kind: 'ignore', reason: 'already_processed' }
         const content = message.content ?? ''
-        if (this.prefixes.some((prefix) => content.toLowerCase().startsWith(prefix.toLowerCase())))
-            return { kind: 'ignore', reason: 'prefix_cmd' }
-
         const lower = content.toLowerCase()
+        if (this._prefixesLower.some((prefix) => lower.startsWith(prefix)))
+            return { kind: 'ignore', reason: 'prefix_cmd' }
         // Mention-only messages ("@Medusa" + image, no text): the trailing
         // \s+ used to miss a bare mention at end-of-string, so image-only
         // summons never triggered in regular channels. (?:\s|$) fixes it.
@@ -1871,10 +1903,15 @@ and never narrate the research itself or its quality either way.`
 
         let repliedToBot = false,
             repliedToOther = false
-        const ref = message.reference?.resolved
-        if (ref) {
-            if (ref.author.id === this.client.user.id) repliedToBot = true
-            else if (ref.author.id !== message.author.id) repliedToOther = true
+        const ref = message.reference?.messageId
+            ? (message.channel?.messages?.cache?.get(message.reference.messageId) ??
+              message._medusaReplyCtx?.ref ??
+              null)
+            : null
+        const repliedAuthorId = ref?.author?.id ?? message.mentions?.repliedUser?.id ?? null
+        if (repliedAuthorId) {
+            if (repliedAuthorId === this.client.user.id) repliedToBot = true
+            else if (repliedAuthorId !== message.author.id) repliedToOther = true
         }
 
         const convKey = `${message.author.id}-${message.channel.id}`
@@ -1946,19 +1983,12 @@ and never narrate the research itself or its quality either way.`
     // "save as foo.py") and the reply holds a fenced code block. Returns
     // {fname, text} or null. Pure so it stays harness-testable.
     _extractFileBlock(response, userContent) {
-        if (
-            !/\b(as an? )?files?\b|\bsend (it|this|that) as\b|\battach( it| this| that)?\b|\bsave (it|this|that) as\b/i.test(
-                userContent ?? '',
-            )
-        )
-            return null
-        const m = /```(\w*)\n([\s\S]{20,200000}?)\n?```/.exec(response ?? '')
+        if (!FILE_ASK_RE.test(userContent ?? '')) return null
+        const m = FILE_BLOCK_RE.exec(response ?? '')
         if (!m) return null
         const lang = (m[1] || 'txt').toLowerCase().slice(0, 10)
         const ext = FILE_EXT_MAP[lang] ?? 'txt'
-        const nameAsk = /\b(?:save as|call it|name it|filename)\s+([A-Za-z0-9_][\w.-]{0,60}\.\w{1,8})/i.exec(
-            userContent ?? '',
-        )
+        const nameAsk = FILE_NAME_RE.exec(userContent ?? '')
         return { fname: nameAsk?.[1] ?? `code.${ext}`, text: m[2] }
     }
     async handleAIResponse(message, customPrompt = null, systemOverride = null) {
@@ -2001,6 +2031,8 @@ and never narrate the research itself or its quality either way.`
             const username = message.author.username
             const displayName = message.member?.displayName ?? username
             let content = customPrompt || message.content || ''
+            const hasDisallowedHate = containsDisallowedHate(content)
+            let timeInjected = false
             // NOTE (reassigned below): time fast-paths may append resolved
             // [TIME DATA] for the model to voice when token-saver is off.
             const bareQ = content.replace(this._botRxes().strip, '').trim() || content
@@ -2015,7 +2047,7 @@ and never narrate the research itself or its quality either way.`
             // calls (config tokenSaver, default off = full generative).
             // Greetings roll 25% to full generation anyway so she doesn't go
             // robotic. Hate-gated: abuse never earns a cute fixed reply.
-            if (this._config?.tokenSaver === true && !containsDisallowedHate(content)) {
+            if (this._config?.tokenSaver === true && !hasDisallowedHate) {
                 const bq = bareQ.toLowerCase()
                 const bqWords = bq ? bq.split(/\s+/).length : 0
                 let fixed = null
@@ -2057,10 +2089,10 @@ and never narrate the research itself or its quality either way.`
             // Token-saver ON: fixed template reply, zero LLM calls. OFF: the
             // resolved facts ride along for her to voice with persona.
             if (
+                !hasDisallowedHate &&
                 /^(?:what'?s (?:the |my )?time|what time is it(?: for me)?|current time(?: for me)?|time check|what time|time pls|time please|time now|tell me my time|my time|what time is it right now)(?: right now| now)?[?!.\s]*$/i.test(
                     timeQ.trim(),
-                ) &&
-                !containsDisallowedHate(content)
+                )
             ) {
                 const line = getLocalTimeLine(getSavedTimezone(userId))
                 if (line) {
@@ -2082,20 +2114,21 @@ and never narrate the research itself or its quality either way.`
                         return
                     }
                     content += `\n\n[TIME DATA, state as fact: it is ${line} for the asker. Voice only the time in \`code\`, no date unless they ask.]`
+                    timeInjected = true
                 }
             }
             // Mention-qualified time ask: "what time is it for @A @B" — resolve
             // each mentioned member's saved zone (zero LLM). Anyone without
             // one gets an honest line instead of a guess. Plain names (not
             // mentions) fall through to the model.
-            {
+            if (!timeInjected && !hasDisallowedHate) {
                 const others = [...(message.mentions?.users?.keys?.() ?? [])].filter(
                     (id) => id !== this.client.user.id && id !== userId,
                 )
                 const looksTimey =
                     /^(?:what'?s (?:the |my )?time|what time is it(?: for me)?|current time(?: for me)?|time check|what time|time pls|time please|time now|tell me my time|my time|what time is it right now)(?: right now| now)?\b/i.test(
                         timeQ.trim(),
-                    ) && !containsDisallowedHate(content)
+                    )
                 if (others.length && looksTimey) {
                     const lines = others.slice(0, 5).map((id) => {
                         const entry = getSavedTimezone(id)
@@ -2122,34 +2155,32 @@ and never narrate the research itself or its quality either way.`
                         return
                     }
                     content += `\n\n[TIME DATA, state each as fact:\n${lines.map((l) => `- ${l.replace(/\*\*/g, '')}`).join('\n')}]\nAddress each person by name in flowing prose — never paste these lines verbatim, no code blocks. Voice only times in \`code\`, no dates unless asked.`
+                    timeInjected = true
                 }
             }
             // Embedded personal time ask ("tell him what time it is for
             // me"): the anchored fast-paths above only fire when the whole
             // message IS the ask, so a self time-ask buried mid-message
             // fell back to raw UTC. Resolve the asker's saved zone instead.
-            {
+            if (!timeInjected && !hasDisallowedHate) {
                 if (
-                    !containsDisallowedHate(content) &&
                     /\bwhat (?:time is it|time it is|(?:'s|is) (?:the )?time)\b.*\bfor me\b|\bmy (?:current|local|exact) time\b|\bwhat(?:'s| is) my time\b|\bwhat time is it (?:right now|now)\b/i.test(
                         timeQ,
                     )
                 ) {
                     const line = getLocalTimeLine(getSavedTimezone(userId))
-                    if (line)
+                    if (line) {
                         content += `\n\n[TIME DATA, state as fact: it is ${line} for the asker. Voice only the time in \`code\`, no date unless they ask.]`
+                        timeInjected = true
+                    }
                 }
             }
             // Place-qualified time ask: "what time is it in india" — resolve
             // the place deterministically instead of letting the model guess
             // (fixed-offset math breaks on DST zones; invented times are worse).
-            {
-                const placeM = bareQ
-                    .trim()
-                    .match(
-                        /^(?:what'?s (?:the )?time|what time is it|current time|time)\s+(?:in|for|at)\s+(.+?)[?!.\s]*$/,
-                    )
-                if (placeM && !containsDisallowedHate(content)) {
+            if (!timeInjected && !hasDisallowedHate) {
+                const placeM = bareQ.trim().match(PLACE_TIME_RE)
+                if (placeM) {
                     const found = lookupLocation(placeM[1])
                     if (found && found.zones.length === 1) {
                         const line = getLocalTimeLine({ alias: found.display, timezone: found.zones[0] })
@@ -2169,6 +2200,7 @@ and never narrate the research itself or its quality either way.`
                                 return
                             }
                             content += `\n\n[TIME DATA, state as fact: it is ${line}. Voice only the time in \`code\`, no date unless they ask.]`
+                            timeInjected = true
                         }
                     }
                     // Ambiguous (multi-zone) or unknown: fall through so she can
@@ -2183,11 +2215,12 @@ and never narrate the research itself or its quality either way.`
             {
                 const liveM =
                     !this.debugMode &&
-                    !this.isMemOff(userId) &&
+                    !memOff &&
+                    !hasDisallowedHate &&
                     bareQ
                         .trim()
                         .match(/^(?:i live in|i'm from|im from|i live at|moved to|based in)\s+(.+?)[.!]*$/i)
-                if (liveM && !containsDisallowedHate(content)) {
+                if (liveM) {
                     const found = lookupLocation(liveM[1])
                     if (found && found.zones.length === 1) {
                         const tz = found.zones[0]
@@ -2236,7 +2269,7 @@ and never narrate the research itself or its quality either way.`
                 }
             } catch {}
 
-            const oldUser = mem.getUser(userId)
+            const oldUser = memOff ? null : mem.getUser(userId)
             let proactiveSys = systemOverride
             if (oldUser && oldUser.last_interaction) {
                 const daysSince = (Date.now() - new Date(oldUser.last_interaction).getTime()) / 86400000
@@ -2379,8 +2412,11 @@ and never narrate the research itself or its quality either way.`
                 // we need to overwrite the streamed message with the rewritten text so
                 // the user sees the actual confirmation, not the raw LLM output.
                 let execResult = await this._executeParsedCommands(response, message)
-                const finalText = execResult.text || response
+                let finalText = execResult.text || response
+                if (containsDisallowedHate(finalText)) finalText = safetyRefusal(finalText)
+                if (!execResult.confirmPending) finalText = this._formatMathBlock(finalText)
                 const ui = execResult.confirmUI || null
+                const streamedMsgs = []
                 // The streamed placeholder gets rewritten in place; the confirm UI
                 // (when present) is attached to that same message, so note text
                 // and buttons share one fate instead of two separate sends.
@@ -2404,9 +2440,10 @@ and never narrate the research itself or its quality either way.`
                             )
                             .catch(() => null)) ||
                             null)
+                    if (ours) streamedMsgs.push(ours)
                     // Chunk instead of hard-slicing at 2000: the stub edit
                     // shows chunk 0 and the overflow posts as normal
-                    // follow-up replies (same 4-chunk cap as non-stream).
+                    // follow-up replies (same 6-chunk cap as non-stream).
                     const chunks = this.splitResponse(this.finalSecurityCheck(finalText))
                     const body =
                         foot && chunks.length === 1
@@ -2432,10 +2469,14 @@ and never narrate the research itself or its quality either way.`
                         // 6-chunk ceiling (~12k chars): past it the tail is cut
                         // and labeled, never silently dropped mid-section.
                         const posted = chunks.slice(0, 6)
-                        if (chunks.length > 6)
-                            posted[posted.length - 1] += '\n\n-# …cut here — say "continue" for the rest'
-                        for (const extra of posted.slice(1))
-                            await this.secureReply(message, extra).catch(() => {})
+                        if (chunks.length > 6) {
+                            const lastIdx = posted.length - 1
+                            posted[lastIdx] = posted[lastIdx].slice(0, 2000 - CUT_NOTICE.length) + CUT_NOTICE
+                        }
+                        for (const extra of posted.slice(1)) {
+                            const em = await this.secureReply(message, extra).catch(() => null)
+                            if (em) streamedMsgs.push(em)
+                        }
                         if (ui) {
                             await this._watchConfirmUI(ours, ui.key, message)
                             const entry = this._pendingConfirms.get(ui.key)
@@ -2448,6 +2489,7 @@ and never narrate the research itself or its quality either way.`
                             embeds: [ui.embed],
                             components: [ui.row],
                         })
+                        if (m) streamedMsgs.push(m)
                         if (m?.createMessageComponentCollector) {
                             await this._watchConfirmUI(m, ui.key, message)
                             const entry = this._pendingConfirms.get(ui.key)
@@ -2461,6 +2503,11 @@ and never narrate the research itself or its quality either way.`
                         `[AI] Confirm UI attach failed for ${message?.id} in #${message?.channel?.id}:`,
                         String(e?.message ?? e).slice(0, 160),
                     )
+                }
+                if (execResult.sensitive && streamedMsgs.length) {
+                    setTimeout(() => {
+                        for (const m of streamedMsgs) m.delete?.().catch(() => {})
+                    }, 60_000).unref()
                 }
                 const mem = this.getMem(message.guild)
                 if (!execResult.confirmPending)
@@ -2559,8 +2606,10 @@ and never narrate the research itself or its quality either way.`
                 // 6-chunk ceiling (~12k chars): past it the tail is cut and
                 // labeled, never silently dropped mid-section.
                 const visible = chunks.slice(0, 6)
-                if (chunks.length > 6)
-                    visible[visible.length - 1] += '\n\n-# …cut here — say "continue" for the rest'
+                if (chunks.length > 6) {
+                    const lastIdx = visible.length - 1
+                    visible[lastIdx] = visible[lastIdx].slice(0, 2000 - CUT_NOTICE.length) + CUT_NOTICE
+                }
                 for (let i = 0; i < visible.length; i++) {
                     const isLast = i === visible.length - 1
                     const m = await this.secureReply(message, visible[i], {
@@ -2650,7 +2699,7 @@ and never narrate the research itself or its quality either way.`
         const now = Date.now()
 
         // Block new AI responses while a destructive confirmation is pending for this user
-        if ([...this._pendingConfirms.keys()].some((k) => k.startsWith(`${userId}:`))) return
+        if (this._hasPendingConfirm(userId)) return
 
         // Spam protection
         let counts = this.userMsgCounts.get(userId) ?? []
@@ -2736,6 +2785,15 @@ and never narrate the research itself or its quality either way.`
     // Shared yes/no resolution: quoted-confirm match first, then oldest pending.
     // Always absorbs (returns after handling); callers must return afterwards.
     // "nvm / nevermind / cancel" count as "no" here too, so direct callers get it.
+    _hasPendingConfirm(userId) {
+        if (!this._pendingConfirms.size) return false
+        const prefix = `${userId}:`
+        for (const k of this._pendingConfirms.keys()) {
+            if (k.startsWith(prefix)) return true
+        }
+        return false
+    }
+
     async _answerConfirm(message, lower, quotedContent) {
         const now = Date.now()
         if (lower === 'nvm' || lower === 'nevermind' || lower === 'cancel') lower = 'no'
@@ -2744,8 +2802,10 @@ and never narrate the research itself or its quality either way.`
             if (hit) {
                 if (now - hit.val.ts > 30_000) {
                     this._pendingConfirms.delete(hit.key)
+                    hit.val.uiMsg?.edit?.({ components: [] }).catch(() => {})
                 } else {
                     this._pendingConfirms.delete(hit.key)
+                    hit.val.uiMsg?.edit?.({ components: [] }).catch(() => {})
                     if (lower === 'no') {
                         await message.react('❌').catch(() => {})
                         this._recordConfirmOutcome(hit.key, message, 'cancelled')
@@ -2813,6 +2873,7 @@ and never narrate the research itself or its quality either way.`
                                 return
                             }
                             this._pendingConfirms.delete(selKey)
+                            selVal.uiMsg?.edit?.({ components: [] }).catch(() => {})
                             await i
                                 .update({
                                     content: `✅ Confirmed \`${selKey.split(':')[1]}\` — running it now.`,
@@ -2842,10 +2903,12 @@ and never narrate the research itself or its quality either way.`
         for (const [key, val] of this._pendingConfirms) {
             if (now - val.ts > 30_000) {
                 this._pendingConfirms.delete(key)
+                val.uiMsg?.edit?.({ components: [] }).catch(() => {})
                 continue
             }
             if (!key.startsWith(`${message.author.id}:`)) continue
             this._pendingConfirms.delete(key)
+            val.uiMsg?.edit?.({ components: [] }).catch(() => {})
             if (lower === 'no') {
                 await message.react('❌').catch(() => {})
                 this._recordConfirmOutcome(key, message, 'cancelled')
@@ -2886,9 +2949,7 @@ and never narrate the research itself or its quality either way.`
 
         // Confirmation replies (non-reply-to-bot path, bare "yes"/"no" in channel).
         // "nvm / nevermind / cancel" count as "no" — that's what users actually say.
-        const userHasPending = [...this._pendingConfirms.keys()].some((k) =>
-            k.startsWith(`${message.author.id}:`),
-        )
+        const userHasPending = this._hasPendingConfirm(message.author.id)
         const verdict = lower.replace(/[.!\s]+$/, '')
         const yn =
             verdict === 'yes'
@@ -2908,7 +2969,7 @@ and never narrate the research itself or its quality either way.`
         }
 
         // Prefix commands take precedence, "med, snaek" is a prefix attempt, not an AI trigger.
-        if (this.prefixes.some((prefix) => lower.startsWith(prefix.toLowerCase()))) return
+        if (this._prefixesLower.some((prefix) => lower.startsWith(prefix))) return
 
         const replyResolved = await this._resolveReplyContext(message)
         const repliedTo = replyResolved?.ref?.author ?? null
@@ -2976,16 +3037,42 @@ ${cleaned}`
         }
 
         if (trigger) {
+            const userId = message.author.id
+            if (this.debugMode && String(userId) !== String(this.ownerId)) return
             const guildId = message.guild?.id ?? '0'
             if (this.pausedGuilds.has(guildId)) return
 
-            if ([...this._pendingConfirms.keys()].some((k) => k.startsWith(`${message.author.id}:`))) return
+            if (this._hasPendingConfirm(userId)) return
 
+            const isStaff = !!message.member?.permissions?.has(PermissionFlagsBits.ModerateMembers)
+            const isOwner = String(userId) === String(this.ownerId)
+            const gate = this.client.heart?.rateLimiter?.check(userId, { isStaff, isOwner })
+            if (gate && !gate.ok) {
+                console.debug(`[AI] Gated ${userId} (${gate.reason ?? 'rate'})`)
+                this.client.heart?.noteRateLimited?.()
+                return
+            }
+
+            let counts = this.userMsgCounts.get(userId) ?? []
+            counts = counts.filter((t) => now - t < this.spamWindow)
+            counts.push(now)
+            this.userMsgCounts.set(userId, counts)
+            if (this.userCooldowns.has(userId) && now < this.userCooldowns.get(userId)) {
+                console.debug(`[AI] Cooldown active for ${userId}`)
+                return
+            }
+            if (counts.length > this.spamThreshold) {
+                console.debug(`[AI] Spam threshold tripped for ${userId}`)
+                this.userCooldowns.set(userId, now + this.cooldownDuration)
+                this.userMsgCounts.set(userId, [])
+                return
+            }
+
+            this.activeConvs.set(`${userId}-${message.channel.id}`, now)
             this.triggeredMsgs.add(message.id)
             this.processedMsgIds.add(message.id)
 
             try {
-                const userId = message.author.id
                 const ctx = await this.getUserContext(userId, message)
                 const userSys =
                     this.getUserPrompt(userId, message.guild?.id) ||
@@ -3058,7 +3145,7 @@ ${cleaned}`
         const mem = this.getMem(guild)
         try {
             if (!mem.db) return null
-            const row = mem.db
+            const rows = mem.db
                 .prepare(
                     `
                 SELECT user_id, message_content FROM (
@@ -3079,10 +3166,11 @@ ${cleaned}`
                 AND message_content NOT LIKE '%bit.ly%'
                 AND message_content NOT LIKE '%.com/%'
                 AND message_content NOT LIKE '%.gg/%'
-                ORDER BY RANDOM() LIMIT 1
+                ORDER BY RANDOM() LIMIT 15
             `,
                 )
-                .get()
+                .all()
+            const row = rows.find((r) => !this.isMemOff(r.user_id))
             if (!row) return null
 
             const userInfo = mem.getUser(row.user_id)

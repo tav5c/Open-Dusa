@@ -29,7 +29,11 @@ const payloadKey = (model, messages) => {
     try {
         const h = createHash('md5')
         h.update(String(model ?? ''))
-        for (const m of messages ?? []) h.update(`|${m.role ?? ''}:${String(m.content ?? '').slice(-2000)}`)
+        for (const m of messages ?? []) {
+            const content =
+                typeof m.content === 'string' ? m.content : JSON.stringify(m.content ?? '')
+            h.update(`|${m.role ?? ''}:${content.slice(-2000)}`)
+        }
         return h.digest('hex')
     } catch {
         return null
@@ -42,62 +46,148 @@ export class FairQueue {
         this.guildTokens = GUILD_MAX_TOKENS
         this.inflightMax = GLOBAL_INFLIGHT_MAX
         Object.assign(this, overrides)
-        this._usage = new Map() // guildId -> [{t, tokens}]
+        this._usage = new Map() // guildId -> { entries: [{t, tokens}], head: 0, tokenSum: 0, lastT: 0 }
         this._inflight = 0
-        this._queues = new Map() // guildId -> [{resolve}]
+        this._queues = new Map() // guildId -> { items: [waiter], head: 0 }
         this._queueOrder = [] // round-robin rotation of guildIds with waiters
+        this._orderHead = 0
+        this._queuedGuilds = new Set() // O(1) membership for _queueOrder
         this._pending = new Map() // payloadKey -> Promise (coalescing)
         this._shedAt = new Map() // guildId -> ts of last shed notice
         this._throttleLoggedAt = new Map()
+    }
+
+    _pruneTimestampMap(map, ttlMs, maxSize, now) {
+        if (map.size <= maxSize) return
+        for (const [k, ts] of map) {
+            if (now - ts >= ttlMs) map.delete(k)
+        }
+        while (map.size > maxSize) {
+            const oldest = map.keys().next().value
+            map.delete(oldest)
+        }
     }
 
     _logThrottled(guildId, detail) {
         const now = Date.now()
         if (now - (this._throttleLoggedAt.get(guildId) ?? 0) < THROTTLE_LOG_MS) return
         this._throttleLoggedAt.set(guildId, now)
+        this._pruneTimestampMap(this._throttleLoggedAt, THROTTLE_LOG_MS, 500, now)
         console.warn(`[AI] Guild ${guildId} over fair-share budget, shedding (${detail})`)
     }
 
     _prune(guildId, now = Date.now()) {
-        const log = this._usage.get(guildId)
-        if (!log) return []
-        const fresh = log.filter((e) => now - e.t < WINDOW_MS)
-        if (fresh.length) this._usage.set(guildId, fresh)
-        else this._usage.delete(guildId)
-        if (this._usage.size > 1000) {
-            const oldest = this._usage.keys().next().value
-            this._usage.delete(oldest)
+        const bucket = this._usage.get(guildId)
+        if (!bucket) return { count: 0, tokenSum: 0 }
+        const { entries } = bucket
+        while (bucket.head < entries.length && now - entries[bucket.head].t >= WINDOW_MS) {
+            bucket.tokenSum -= entries[bucket.head].tokens
+            entries[bucket.head] = undefined
+            bucket.head++
         }
-        return fresh
+        const count = entries.length - bucket.head
+        if (count <= 0) {
+            this._usage.delete(guildId)
+            return { count: 0, tokenSum: 0 }
+        }
+        if (bucket.tokenSum < 0) bucket.tokenSum = 0
+        if (bucket.head > 64 && bucket.head * 2 >= entries.length) {
+            bucket.entries = entries.slice(bucket.head)
+            bucket.head = 0
+        }
+        if (this._usage.size > 1000) {
+            let stalestKey = null
+            let stalestTs = Infinity
+            for (const [k, b] of this._usage) {
+                if (k === guildId) continue
+                if (b.lastT < stalestTs) {
+                    stalestTs = b.lastT
+                    stalestKey = k
+                }
+            }
+            if (stalestKey !== null) this._usage.delete(stalestKey)
+        }
+        return { count, tokenSum: bucket.tokenSum }
     }
 
     _record(guildId, tokens) {
-        const log = this._usage.get(guildId) ?? []
-        log.push({ t: Date.now(), tokens })
-        this._usage.set(guildId, log)
+        const now = Date.now()
+        let bucket = this._usage.get(guildId)
+        if (!bucket) {
+            bucket = { entries: [], head: 0, tokenSum: 0, lastT: now }
+            this._usage.set(guildId, bucket)
+        }
+        bucket.entries.push({ t: now, tokens })
+        bucket.tokenSum += tokens
+        bucket.lastT = now
     }
 
     shedNoticeOk(guildId) {
         const now = Date.now()
-        if (now - (this._shedAt.get(guildId ?? 'dm') ?? 0) < SHED_NOTICE_MS) return false
-        this._shedAt.set(guildId ?? 'dm', now)
+        const gid = guildId ?? 'dm'
+        if (now - (this._shedAt.get(gid) ?? 0) < SHED_NOTICE_MS) return false
+        this._shedAt.set(gid, now)
+        this._pruneTimestampMap(this._shedAt, SHED_NOTICE_MS, 500, now)
         return true
     }
 
+    _dequeueGuild(q) {
+        while (q.head < q.items.length) {
+            const w = q.items[q.head]
+            q.items[q.head] = undefined
+            q.head++
+            if (w && !w._cancelled) return w
+        }
+        return null
+    }
+
+    _hasActiveWaiters(q) {
+        while (q.head < q.items.length) {
+            const w = q.items[q.head]
+            if (w && !w._cancelled) return true
+            q.items[q.head] = undefined
+            q.head++
+        }
+        return false
+    }
+
+    _compactOrder() {
+        if (this._orderHead >= this._queueOrder.length) {
+            this._queueOrder.length = 0
+            this._orderHead = 0
+        } else if (this._orderHead > 64 && this._orderHead * 2 >= this._queueOrder.length) {
+            this._queueOrder = this._queueOrder.slice(this._orderHead)
+            this._orderHead = 0
+        }
+    }
+
     _pump() {
-        while (this._inflight < this.inflightMax && this._queueOrder.length) {
-            const gid = this._queueOrder.shift()
+        while (this._inflight < this.inflightMax && this._orderHead < this._queueOrder.length) {
+            const gid = this._queueOrder[this._orderHead]
+            this._queueOrder[this._orderHead] = undefined
+            this._orderHead++
+            this._queuedGuilds.delete(gid)
             const q = this._queues.get(gid)
-            if (!q?.length) {
+            if (!q) continue
+            const waiter = this._dequeueGuild(q)
+            if (!waiter) {
                 this._queues.delete(gid)
                 continue
             }
-            const waiter = q.shift()
-            if (!q.length) this._queues.delete(gid)
-            else this._queueOrder.push(gid) // still has waiters, rejoin rotation
+            if (this._hasActiveWaiters(q)) {
+                if (q.head > 64 && q.head * 2 >= q.items.length) {
+                    q.items = q.items.slice(q.head)
+                    q.head = 0
+                }
+                this._queueOrder.push(gid)
+                this._queuedGuilds.add(gid)
+            } else {
+                this._queues.delete(gid)
+            }
             this._inflight++
             waiter()
         }
+        this._compactOrder()
     }
 
     _release() {
@@ -122,8 +212,12 @@ export class FairQueue {
                 const promise = Promise.resolve().then(run)
                 this._pending.set(coalesceKey, promise)
                 promise.then(
-                    () => this._pending.delete(coalesceKey),
-                    () => this._pending.delete(coalesceKey),
+                    () => {
+                        if (this._pending.get(coalesceKey) === promise) this._pending.delete(coalesceKey)
+                    },
+                    () => {
+                        if (this._pending.get(coalesceKey) === promise) this._pending.delete(coalesceKey)
+                    },
                 )
                 return { ok: true, shared: promise }
             }
@@ -134,10 +228,9 @@ export class FairQueue {
             if (ex) return { ok: true, shared: ex }
         }
         const now = Date.now()
-        const log = this._prune(gid, now)
-        const usedTokens = log.reduce((a, e) => a + e.tokens, 0)
-        if (log.length >= this.guildCalls || usedTokens + tokens > this.guildTokens) {
-            this._logThrottled(gid, `${log.length} calls/${usedTokens} tokens in 60s`)
+        const { count, tokenSum } = this._prune(gid, now)
+        if (count >= this.guildCalls || tokenSum + tokens > this.guildTokens) {
+            this._logThrottled(gid, `${count} calls/${tokenSum} tokens in 60s`)
             return { ok: false, reason: 'guild-budget' }
         }
         const takeSlot = () => {
@@ -163,18 +256,20 @@ export class FairQueue {
                     reject = rej
                 })
                 this._pending.set(coalesceKey, promise)
-                run().then(
-                    (v) => {
-                        if (this._pending.get(coalesceKey) === promise) this._pending.delete(coalesceKey)
-                        slot.release()
-                        resolve(v)
-                    },
-                    (e) => {
-                        if (this._pending.get(coalesceKey) === promise) this._pending.delete(coalesceKey)
-                        slot.release()
-                        reject(e)
-                    },
-                )
+                Promise.resolve()
+                    .then(run)
+                    .then(
+                        (v) => {
+                            if (this._pending.get(coalesceKey) === promise) this._pending.delete(coalesceKey)
+                            slot.release()
+                            resolve(v)
+                        },
+                        (e) => {
+                            if (this._pending.get(coalesceKey) === promise) this._pending.delete(coalesceKey)
+                            slot.release()
+                            reject(e)
+                        },
+                    )
                 return { ok: true, shared: promise }
             }
             return slot
@@ -185,31 +280,48 @@ export class FairQueue {
         }
         // Global cap hit: queue per-guild FIFO, shed after QUEUE_WAIT_MS.
         const waited = await new Promise((resolve) => {
+            let waiter
             const timer = setTimeout(() => {
-                const q = this._queues.get(gid) ?? []
-                const i = q.findIndex((w) => w._resolve === resolve)
-                if (i >= 0) q.splice(i, 1)
+                if (waiter) waiter._cancelled = true
+                const q = this._queues.get(gid)
+                if (q && !this._hasActiveWaiters(q)) {
+                    this._queues.delete(gid)
+                    this._queuedGuilds.delete(gid)
+                }
                 resolve(false)
             }, QUEUE_WAIT_MS)
-            const waiter = () => {
+            waiter = () => {
                 clearTimeout(timer)
                 resolve(true)
             }
-            waiter._resolve = resolve
-            const q = this._queues.get(gid) ?? []
-            q.push(waiter)
-            this._queues.set(gid, q)
-            if (!this._queueOrder.includes(gid)) this._queueOrder.push(gid)
+            waiter._cancelled = false
+            let q = this._queues.get(gid)
+            if (!q) {
+                q = { items: [], head: 0 }
+                this._queues.set(gid, q)
+            }
+            q.items.push(waiter)
+            if (!this._queuedGuilds.has(gid)) {
+                this._queuedGuilds.add(gid)
+                this._queueOrder.push(gid)
+            }
             this._pump()
         })
         if (!waited) {
             this._logThrottled(gid, `queue wait > ${QUEUE_WAIT_MS / 1000}s`)
             return { ok: false, reason: 'queue-timeout' }
         }
+        // Re-check coalescing after waking from queue to avoid duplicate flights.
+        if (coalesceKey) {
+            const ex = this._pending.get(coalesceKey)
+            if (ex) {
+                this._release()
+                return { ok: true, shared: ex }
+            }
+        }
         // Re-check budget after the wait: the guild may have burned it meanwhile.
-        const log2 = this._prune(gid)
-        const used2 = log2.reduce((a, e) => a + e.tokens, 0)
-        if (log2.length >= this.guildCalls || used2 + tokens > this.guildTokens) {
+        const { count: count2, tokenSum: used2 } = this._prune(gid)
+        if (count2 >= this.guildCalls || used2 + tokens > this.guildTokens) {
             this._release()
             return { ok: false, reason: 'guild-budget' }
         }

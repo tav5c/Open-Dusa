@@ -6,7 +6,7 @@
 // Pterodactyl "Startup" variables). If it is unset, the bot falls back to
 // plaintext storage so existing self-hosters are unaffected.
 
-import { existsSync, renameSync, unlinkSync } from 'fs'
+import { copyFileSync, existsSync, renameSync, unlinkSync } from 'fs'
 
 let _Database = null
 let _isCipher = false
@@ -76,9 +76,17 @@ export function openDb(path) {
         throw new Error('[DB] SQLite engine unavailable (bindings missing — see startup warning).')
     const key = process.env.DB_ENCRYPTION_KEY || ''
 
-    // No key, or a driver without cipher support -> plain open (backward compatible).
-    if (!key || !_isCipher) {
+    // No key -> plain open (backward compatible).
+    if (!key) {
         return new _Database(path)
+    }
+
+    // Key is configured, but cipher driver is unavailable -> fail closed.
+    if (!_isCipher) {
+        throw new Error(
+            `[DB] DB_ENCRYPTION_KEY is set, but better-sqlite3-multiple-ciphers is unavailable. ` +
+                `Refusing to open ${path} unencrypted.`,
+        )
     }
 
     const fileExists = existsSync(path)
@@ -133,33 +141,58 @@ export function openDb(path) {
         plain.exec(`DETACH DATABASE encrypted;`)
         plain.close()
     } catch (e) {
-        // Encryption isn't usable on this host, almost always because the native build
-        // of better-sqlite3-multiple-ciphers didn't run its install scripts (Pterodactyl
-        // and similar hosts block them by default), so `sqlcipher_export` isn't registered.
-        // A failed migration must NEVER take the whole DB down: close the temp attempt,
-        // leave the original plaintext file untouched, and return a real PLAINTEXT handle
-        // so persistence keeps working. The key is effectively ignored until the host can
-        // build the cipher module.
+        // Fail closed when DB_ENCRYPTION_KEY is set: never silently fall back
+        // to plaintext storage if encryption migration fails.
         try {
             plain.close()
         } catch {}
         try {
             if (existsSync(tmp)) unlinkSync(tmp)
         } catch {}
-        console.warn(
-            `[DB] At-rest encryption unavailable (${e.message}). Running UNENCRYPTED on ${path}, ` +
-                `your data is intact and the bot is fully functional, but DB_ENCRYPTION_KEY is being ignored. ` +
-                `To enable encryption, allow native install scripts (e.g. npm approve-scripts better-sqlite3-multiple-ciphers) so the cipher module builds, then restart.`,
+        throw new Error(
+            `[DB] At-rest encryption migration failed for ${path} (${e.message}). ` +
+                `Refusing to fall back to unencrypted storage while DB_ENCRYPTION_KEY is set. ` +
+                `Ensure better-sqlite3-multiple-ciphers native bindings are built, then restart.`,
         )
-        return new _Database(path)
     }
 
-    // Swap plaintext -> encrypted, keeping a one-time backup of the original.
-    renameSync(path, `${path}.plain-bak`)
-    _rmSidecars(path)
-    renameSync(tmp, path)
+    // Verify the encrypted temp copy before touching the original DB.
+    let verify
+    try {
+        verify = new _Database(tmp)
+        verify.pragma(`key = '${_quote(key)}'`)
+        verify.prepare('SELECT count(*) FROM sqlite_master').get()
+        verify.close()
+    } catch (e) {
+        try {
+            verify?.close()
+        } catch {}
+        try {
+            if (existsSync(tmp)) unlinkSync(tmp)
+        } catch {}
+        throw new Error(
+            `[DB] Encrypted migration verification failed for ${path} (${e.message}). Original plaintext file preserved.`,
+        )
+    }
+
+    // Hardened atomic swap: copy plaintext backup first, then atomically
+    // replace `path` with `tmp` so a crash mid-swap never leaves `path` missing.
+    const bak = `${path}.plain-bak`
+    try {
+        copyFileSync(path, bak)
+        _rmSidecars(path)
+        renameSync(tmp, path)
+    } catch (e) {
+        try {
+            if (!existsSync(path) && existsSync(bak)) copyFileSync(bak, path)
+        } catch {}
+        try {
+            if (existsSync(tmp)) unlinkSync(tmp)
+        } catch {}
+        throw new Error(`[DB] Failed to swap encrypted database into ${path}: ${e.message}`)
+    }
     console.log(
-        `[DB] Encrypted ${path} at rest (SQLCipher). Plaintext backup saved as ${path}.plain-bak, ` +
+        `[DB] Encrypted ${path} at rest (SQLCipher). Plaintext backup saved as ${bak}, ` +
             `delete it once you've confirmed the bot works.`,
     )
 

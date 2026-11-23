@@ -325,7 +325,15 @@ const DANGEROUS_TERMS = new Set([
 // on innocent words ("hololive" contains "loli", "lolita" too) and refused whole
 // queries. Standalone terms still match exactly as before.
 const _escRe = (s) => s.replace(/[.*+?^${}()|[\]\\]/g, '\\$&')
-const NSFW_RE = new RegExp(`\\b(?:${[...NSFW_TERMS].map((t) => _escRe(t.trim())).join('|')})\\b`, 'i')
+const NSFW_RE = new RegExp(
+    `\\b(?:${[...NSFW_TERMS]
+        .map((t) => {
+            const trimmed = t.trim()
+            return trimmed === 'masturbat' ? 'masturbat\\w*' : _escRe(trimmed)
+        })
+        .join('|')})\\b`,
+    'i',
+)
 
 const CAPABILITIES_NOTE =
     `\n\n[AGENT CAPABILITIES & STRICT BEHAVIOR]\n` +
@@ -413,8 +421,13 @@ const ALWAYS_LIVE_RE = new RegExp(
 // (~60) on every research turn. Plain phrases, so a single alternation
 // with the same gi semantics is equivalent.
 const NO_SEARCH_RE = new RegExp(
-    `(?:${NO_SEARCH_SIGNALS.map((s) => s.replace(/[.*+?^${}()|[\]\\]/g, '\\$&')).join('|')})`,
-    'gi',
+    `\\b(?:${NO_SEARCH_SIGNALS.map((s) => _escRe(s.trim())).filter(Boolean).join('|')})\\b`,
+    'i',
+)
+// Pre-compiled anchored prefix regex for O(1) casual-opener / never-research matching.
+const NEVER_RESEARCH_PREFIX_RE = new RegExp(
+    `^(?:${NEVER_RESEARCH_PREFIXES.map((p) => _escRe(p)).join('|')})`,
+    'i',
 )
 
 export {
@@ -422,6 +435,7 @@ export {
     ALWAYS_LIVE,
     ALWAYS_LIVE_RE,
     NEVER_RESEARCH_PREFIXES,
+    NEVER_RESEARCH_PREFIX_RE,
     NEVER_RESEARCH_EXACT,
     NO_SEARCH_SIGNALS,
     NO_SEARCH_RE,

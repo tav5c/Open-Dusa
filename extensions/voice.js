@@ -4,7 +4,7 @@
 // inside the handlers (mods / Manage Channels), since these aren't in the
 // agent's MOD_CMDS map.
 import { PermissionFlagsBits } from 'discord.js'
-import { getVoiceConnection, joinVoiceChannel } from '@discordjs/voice'
+import { entersState, getVoiceConnection, joinVoiceChannel, VoiceConnectionStatus } from '@discordjs/voice'
 
 function canSummon(member, ownerId) {
     if (!member) return false
@@ -20,7 +20,7 @@ export function registerVoice(client, ownerId) {
         const member = ctx.member
         if (!canSummon(member, ownerId))
             return reply({ content: '🔑 You need **Manage Channels** (or mod) to move me around.' })
-        const raw = args[0]?.replace(/[<#>]/g, '') ?? ''
+        const raw = (Array.isArray(args) ? args.join(' ') : String(args ?? '')).trim().replace(/[<#>]/g, '')
         const byId = /^\d{15,20}$/.test(raw) ? ctx.guild.channels.cache.get(raw) : null
         const vcById = byId?.isVoiceBased?.() ? byId : null
         const vcByName =
@@ -42,7 +42,7 @@ export function registerVoice(client, ownerId) {
             // Destroy any stale connection first: repeated joinvc calls must move
             // the single guild connection, never stack half-dead voice websockets.
             getVoiceConnection(ctx.guild.id)?.destroy()
-            joinVoiceChannel({
+            const conn = joinVoiceChannel({
                 channelId: vc.id,
                 guildId: ctx.guild.id,
                 adapterCreator: ctx.guild.voiceAdapterCreator,
@@ -50,6 +50,21 @@ export function registerVoice(client, ownerId) {
                 // as listening, and no audio is sent either.
                 selfDeaf: true,
                 selfMute: true,
+            })
+            conn.on('error', (err) => {
+                console.warn(`[Voice] Connection error in guild ${ctx.guild.id}:`, err?.message ?? err)
+            })
+            conn.on(VoiceConnectionStatus.Disconnected, async () => {
+                try {
+                    await Promise.race([
+                        entersState(conn, VoiceConnectionStatus.Signalling, 5_000),
+                        entersState(conn, VoiceConnectionStatus.Connecting, 5_000),
+                    ])
+                } catch {
+                    try {
+                        if (conn.state.status !== VoiceConnectionStatus.Destroyed) conn.destroy()
+                    } catch {}
+                }
             })
             await reply({ content: `🔊 Joined **${vc.name}**.` })
         } catch (e) {
@@ -77,7 +92,12 @@ export function registerVoice(client, ownerId) {
     client.commands.set('leavevc', leaveCmd)
     client.commands.set('vc', async (ctx) => {
         const conn = ctx.guild ? getVoiceConnection(ctx.guild.id) : null
-        const chanId = conn?.joinConfig?.channelId
+        const status = conn?.state?.status
+        const active =
+            conn &&
+            status !== VoiceConnectionStatus.Destroyed &&
+            status !== VoiceConnectionStatus.Disconnected
+        const chanId = active ? conn.joinConfig?.channelId : null
         const chan = chanId ? ctx.guild.channels.cache.get(chanId) : null
         await ctx
             .reply({ content: chan ? `🔊 I'm in **${chan.name}**.` : "🔇 I'm not in voice here." })

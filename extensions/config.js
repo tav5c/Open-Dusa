@@ -34,8 +34,20 @@ try {
 
 // Discord snowflakes overflow Number.MAX_SAFE_INTEGER, quote bare 15+ digit
 // numbers before parsing so unquoted IDs can't get silently corrupted.
+// Match JSON string literals first so numbers inside strings are left untouched.
 const parseSnowflakeSafe = (raw) =>
-    JSON.parse(raw.replace(/(?<=:\s*|\[\s*|,\s*)\b(\d{15,})\b(?=\s*[,}\]])/g, '"$1"'))
+    JSON.parse(
+        raw.replace(
+            /"(?:\\.|[^"\\])*"|((?<=:\s*|\[\s*|,\s*)\b\d{15,}\b(?=\s*[,}\]]))/g,
+            (match, num) => (num ? `"${num}"` : match),
+        ),
+    )
+
+function writeFileAtomic(filePath, content) {
+    const tmp = `${filePath}.${process.pid}.${Date.now()}.tmp`
+    writeFileSync(tmp, content, 'utf8')
+    renameSync(tmp, filePath)
+}
 
 const asArray = (v) => (Array.isArray(v) ? v : v == null || v === '' ? [] : [v])
 const asPrompt = (v) => (Array.isArray(v) ? v.join('\n') : typeof v === 'string' ? v : '')
@@ -73,13 +85,17 @@ function normalizeProviders(raw) {
 function resolveAgentProvider(providers, providerName, legacyUrl, legacyKeys) {
     if (providerName) {
         const p = providers.find((x) => x.name === providerName)
-        if (p) return { baseUrl: p.baseUrl, keys: p.keys }
+        if (p) return { provider: p.name, baseUrl: p.baseUrl, keys: p.keys }
         console.warn(`[Config] agents.*.provider '${providerName}' not found in providers[]`)
     }
     if (legacyUrl) {
         const keys = realKeys(legacyKeys)
         const pool = providers.find((x) => x.baseUrl === legacyUrl)
-        return { baseUrl: legacyUrl, keys: keys.length ? keys : (pool?.keys ?? []) }
+        return {
+            provider: pool?.name ?? null,
+            baseUrl: legacyUrl,
+            keys: keys.length ? keys : (pool?.keys ?? []),
+        }
     }
     return null
 }
@@ -94,14 +110,19 @@ function parseFallbackString(t, ownResolved, providers) {
     // agent's own provider ("qwen/qwen3.8-max", "mistralai/...").
     const slash = t.indexOf('/')
     const head = slash > 0 ? t.slice(0, slash) : ''
-    if (head && providers.some((x) => x.name === head)) {
-        const p = providers.find((x) => x.name === head)
+    const p = head ? providers.find((x) => x.name === head) : null
+    if (p) {
         const model = t.slice(slash + 1).trim()
         if (model && p.keys?.length) return { provider: p.name, baseUrl: p.baseUrl, keys: p.keys, model }
         return null
     }
     if (!ownResolved?.baseUrl || !ownResolved?.keys?.length) return null
-    return { provider: null, baseUrl: ownResolved.baseUrl, keys: ownResolved.keys, model: t }
+    return {
+        provider: ownResolved?.provider ?? null,
+        baseUrl: ownResolved.baseUrl,
+        keys: ownResolved.keys,
+        model: t,
+    }
 }
 function resolveFallbacks(list, ownResolved, providers) {
     const out = []
@@ -153,7 +174,7 @@ function resolveFallbacks(list, ownResolved, providers) {
                 }
                 push({ provider: p.name, baseUrl: p.baseUrl, keys: p.keys, model })
             } else if (own?.baseUrl && own?.keys?.length) {
-                push({ provider: null, baseUrl: own.baseUrl, keys: own.keys, model })
+                push({ provider: own?.provider ?? null, baseUrl: own.baseUrl, keys: own.keys, model })
             }
         }
     }
@@ -207,7 +228,7 @@ export function normalizeConfig(raw) {
         )
 
     const providers = normalizeProviders(raw)
-    const primary = providers[0] ?? { baseUrl: 'https://api.groq.com/openai/v1', keys: [] }
+    const primary = providers[0] ?? { name: null, baseUrl: 'https://api.groq.com/openai/v1', keys: [] }
     const a = raw.agents ?? {}
 
     // Reasoning effort per agent/mode: off | low | medium. high clamps to
@@ -248,7 +269,7 @@ export function normalizeConfig(raw) {
         chat.provider,
         raw.llmBaseUrl ?? raw.llm_base_url,
         raw.llmKeys ?? raw.llm_keys,
-    ) ?? { baseUrl: primary.baseUrl, keys: primary.keys }
+    ) ?? { provider: primary.name ?? null, baseUrl: primary.baseUrl, keys: primary.keys }
     chat.fallbacks = resolveFallbacks(fallbackRaw(a.chat), chat.resolved, providers)
 
     const research = {
@@ -318,7 +339,11 @@ export function normalizeConfig(raw) {
         }
     }
     const qa = a.quickAgent ?? raw.quickAgent ?? {}
+    // Resolve quickAgent provider BEFORE fallbacks so plain-string fallbacks
+    // inherit quickAgent's pinned provider (or chat.resolved when unpinned).
+    const qaResolved = resolveAgentProvider(providers, qa.provider) ?? chat.resolved
     const quickAgent = {
+        provider: qa.provider ?? null,
         model: typeof qa.model === 'string' && qa.model.trim() ? qa.model : chat.model,
         temperature: qa.temperature ?? 0.4,
         topP: qa.topP ?? 0.9,
@@ -326,14 +351,9 @@ export function normalizeConfig(raw) {
         reasoningEffort: normEffort(qa.reasoningEffort, 'low'),
         allowResearch: qa.allowResearch !== false,
         systemPrompt: asPrompt(qa.systemPrompt),
-        // No own provider: plain-string fallbacks are skipped, entries with an
-        // explicit provider still resolve.
-        fallbacks: resolveFallbacks(fallbackRaw(qa), null, providers),
+        resolved: qaResolved,
+        fallbacks: resolveFallbacks(fallbackRaw(qa), qaResolved, providers),
     }
-    // Optional pin: without it the quick agent rides the chat provider.
-    // The router uses this as its preferred base so xkiro slugs are never
-    // opened on groq first.
-    quickAgent.resolved = resolveAgentProvider(providers, qa.provider) ?? chat.resolved
 
     // Legacy top-level fallbackModels: historically tried on the chat provider
     // only. Merged into the chat chain (deduped) so there is exactly one
@@ -445,12 +465,15 @@ function readRuntime() {
     }
 }
 
+let _cached = null
+
 export function saveRuntime(patch) {
     try {
         const existing = readRuntime()
         for (const key of RUNTIME_MUTABLE) if (patch[key] !== undefined) existing[key] = patch[key]
         for (const legacy of Object.keys(RUNTIME_LEGACY)) delete existing[legacy]
-        writeFileSync(RUNTIME_PATH, JSON.stringify(existing, null, 2), 'utf8')
+        writeFileAtomic(RUNTIME_PATH, JSON.stringify(existing, null, 2))
+        _cached = null
     } catch (e) {
         console.error('[Config] runtime save error:', e)
     }
@@ -465,41 +488,50 @@ export function readConfigRaw() {
 // 403s can mean region/entitlement on a live key, timeouts and network
 // errors are inconclusive and never flagged. Report-only: returns masked
 // labels, never key material. fetchFn is injectable for tests.
-export async function probeDeadKeys(providers, fetchFn = fetch, timeoutMs = 8000) {
-    const dead = []
-    let probed = 0
+export async function probeDeadKeys(providers, fetchFn = fetch, timeoutMs = 8000, concurrency = 6) {
+    const tasks = []
     const provs = (Array.isArray(providers) ? providers : []).filter((pv) => pv && typeof pv === 'object')
     for (const pv of provs) {
         const base = String(pv.baseUrl ?? '').replace(/\/+$/, '')
         if (!base || !Array.isArray(pv.keys) || !pv.keys.length) continue
         const label = pv.name ?? base
         for (let i = 0; i < pv.keys.length; i++) {
-            const k = pv.keys[i]
-            probed++
-            try {
+            tasks.push({ label, base, key: pv.keys[i], index: i })
+        }
+    }
+    const dead = []
+    const limit = Math.max(1, concurrency)
+    for (let start = 0; start < tasks.length; start += limit) {
+        const batch = tasks.slice(start, start + limit)
+        const results = await Promise.allSettled(
+            batch.map(async ({ label, base, key, index }) => {
                 const ctl = new AbortController()
                 const t = setTimeout(() => ctl.abort(), timeoutMs)
-                let status = 0
                 try {
                     const r = await fetchFn(`${base}/models`, {
-                        headers: { Authorization: `Bearer ${k}` },
+                        headers: { Authorization: `Bearer ${key}` },
                         signal: ctl.signal,
                     })
-                    status = r?.status ?? 0
+                    const status = r?.status ?? 0
+                    await r?.body?.cancel?.().catch(() => {})
+                    if (status === 401)
+                        return `\`${label}\` key #${index + 1} (\`…${String(key).slice(-4)}\`)`
+                    return null
                 } finally {
                     clearTimeout(t)
                 }
-                if (status === 401) dead.push(`\`${label}\` key #${i + 1} (\`…${String(k).slice(-4)}\`)`)
-            } catch {
-                // unreachable/timeout: inconclusive, never flagged
-            }
+            }),
+        )
+        for (const res of results) {
+            if (res.status === 'fulfilled' && res.value) dead.push(res.value)
         }
     }
-    return { dead, probed }
+    return { dead, probed: tasks.length }
 }
 
 export function writeConfigRaw(raw) {
-    writeFileSync(CONFIG_PATH, JSON.stringify(raw, null, 2) + '\n', 'utf8')
+    writeFileAtomic(CONFIG_PATH, JSON.stringify(raw, null, 2) + '\n')
+    _cached = null
 }
 
 // Flip per-guild flags (like /ai-pause's { ai: false }) in the authored config.
@@ -523,8 +555,6 @@ export function setConfigGuild(guildId, patch) {
         console.error('[Config] config.json update failed:', e)
     }
 }
-
-let _cached = null
 
 export function loadConfig() {
     if (_cached) return _cached

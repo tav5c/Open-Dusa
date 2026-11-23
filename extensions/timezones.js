@@ -19,7 +19,7 @@ import {
     MessageFlags,
     SlashCommandBuilder,
 } from 'discord.js'
-import fs, { existsSync, readFileSync, renameSync, writeFileSync } from 'fs'
+import fs from 'fs'
 
 export const manifest = {
     name: 'timezones',
@@ -75,17 +75,20 @@ function getCache() {
     return _cache
 }
 
+let _persistChain = Promise.resolve()
 function persistCache() {
-    // Fire-and-forget. Caller never awaits, no interaction latency.
-    // Atomic tmp+rename: a kill mid-write must never leave a truncated
-    // timezones.json behind (that failure mode wiped its neighbor file).
-    try {
-        const tmp = `${DATA_FILE}.tmp.${process.pid}`
-        writeFileSync(tmp, JSON.stringify(_cache, null, 2))
-        renameSync(tmp, DATA_FILE)
-    } catch (err) {
-        console.error('[timezone] persist failed:', err.message)
-    }
+    // Serialized fire-and-forget async write with recursive mkdir and atomic tmp+rename.
+    const snapshot = JSON.stringify(_cache, null, 2)
+    _persistChain = _persistChain
+        .then(async () => {
+            await fs.promises.mkdir('data/ai', { recursive: true })
+            const tmp = `${DATA_FILE}.tmp.${process.pid}`
+            await fs.promises.writeFile(tmp, snapshot, 'utf8')
+            await fs.promises.rename(tmp, DATA_FILE)
+        })
+        .catch((err) => {
+            console.error('[timezone] persist failed:', err.message)
+        })
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
@@ -103,9 +106,9 @@ setInterval(
     5 * 60 * 1000,
 ).unref()
 
-function createSession(type, lines, extra = {}) {
+function createSession(type, lines, extra = {}, ownerId = null) {
     const id = Math.random().toString(36).slice(2, 10)
-    _sessions.set(id, { type, lines, extra, expiresAt: Date.now() + SESSION_TTL })
+    _sessions.set(id, { type, lines, extra, ownerId, expiresAt: Date.now() + SESSION_TTL })
     return id
 }
 
@@ -159,12 +162,23 @@ function buildPageRow(sessionId, page, totalLines) {
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
-// TIME HELPERS, pure Intl, no network, DST handled by JS engine
+// TIME HELPERS, pure Intl (cached per IANA zone), no network, DST handled by JS engine
 // ─────────────────────────────────────────────────────────────────────────────
-function getUTCOffsetLabel(tz) {
+const _fmtCache = new Map()
+function getFormatter(kind, tz, locale, options) {
+    const key = `${kind}:${tz}`
+    let fmt = _fmtCache.get(key)
+    if (!fmt) {
+        fmt = new Intl.DateTimeFormat(locale, { ...options, timeZone: tz })
+        _fmtCache.set(key, fmt)
+    }
+    return fmt
+}
+
+function getUTCOffsetLabel(tz, date = new Date()) {
     try {
-        const p = new Intl.DateTimeFormat('en', { timeZone: tz, timeZoneName: 'shortOffset' })
-            .formatToParts(new Date())
+        const p = getFormatter('shortOffset', tz, 'en', { timeZoneName: 'shortOffset' })
+            .formatToParts(date)
             .find((p) => p.type === 'timeZoneName')
         return (p?.value ?? '').replace('GMT', 'UTC')
     } catch {
@@ -172,10 +186,16 @@ function getUTCOffsetLabel(tz) {
     }
 }
 
-function getTZAbbreviation(tz) {
+function getUTCOffsetMinutes(tz, date = new Date()) {
+    const m = getUTCOffsetLabel(tz, date).match(/UTC([+-])(\d+)(?::(\d+))?/)
+    if (!m) return 0
+    return (m[1] === '+' ? 1 : -1) * (parseInt(m[2], 10) * 60 + parseInt(m[3] ?? '0', 10))
+}
+
+function getTZAbbreviation(tz, date = new Date()) {
     try {
-        const p = new Intl.DateTimeFormat('en', { timeZone: tz, timeZoneName: 'short' })
-            .formatToParts(new Date())
+        const p = getFormatter('short', tz, 'en', { timeZoneName: 'short' })
+            .formatToParts(date)
             .find((p) => p.type === 'timeZoneName')
         return p?.value ?? ''
     } catch {
@@ -183,36 +203,42 @@ function getTZAbbreviation(tz) {
     }
 }
 
+function formatTime12(tz, date = new Date(), withSeconds = true) {
+    const kind = withSeconds ? 'time12s' : 'time12m'
+    return getFormatter(kind, tz, 'en-US', {
+        hour: '2-digit',
+        minute: '2-digit',
+        ...(withSeconds ? { second: '2-digit' } : {}),
+        hour12: true,
+    }).format(date)
+}
+
 function getTimeForTimezone(tz) {
     try {
-        const time = new Date().toLocaleTimeString('en-US', {
-            hour: '2-digit',
-            minute: '2-digit',
-            second: '2-digit',
-            hour12: true,
-            timeZone: tz,
-        })
-        return { time, abbreviation: getTZAbbreviation(tz), utcOffset: getUTCOffsetLabel(tz), tzName: tz }
+        const now = new Date()
+        const time = formatTime12(tz, now, true)
+        return {
+            time,
+            abbreviation: getTZAbbreviation(tz, now),
+            utcOffset: getUTCOffsetLabel(tz, now),
+            tzName: tz,
+        }
     } catch {
         return null
     }
 }
 
-function formatLabel(alias, tz) {
-    const offset = getUTCOffsetLabel(tz)
+function formatLabel(alias, tz, date = new Date()) {
+    const offset = getUTCOffsetLabel(tz, date)
     const a = alias.toUpperCase()
-    if (offset && a !== offset && a !== offset.replace('UTC+', 'UTC') && a !== offset.replace('UTC-', 'UTC-'))
+    if (offset && a !== offset && a !== offset.replace('UTC+', 'UTC'))
         return `${a} · ${offset}`
     return a
 }
 
 function hourDiff(tzA, tzB) {
-    const parseMin = (tz) => {
-        const m = getUTCOffsetLabel(tz).match(/UTC([+-])(\d+)(?::(\d+))?/)
-        if (!m) return 0
-        return (m[1] === '+' ? 1 : -1) * (parseInt(m[2]) * 60 + parseInt(m[3] ?? 0))
-    }
-    return (parseMin(tzB) - parseMin(tzA)) / 60
+    const now = new Date()
+    return (getUTCOffsetMinutes(tzB, now) - getUTCOffsetMinutes(tzA, now)) / 60
 }
 
 function formatDiff(diff) {
@@ -232,23 +258,25 @@ const ABBR_RE =
 
 function getReverseMap() {
     if (_reverseMap) return _reverseMap
-    _reverseMap = {}
+    const sets = {}
     for (const [alias, zones] of Object.entries(locationMap)) {
-        if (zones.length !== 1) continue
+        if (zones.length !== 1 || ABBR_RE.test(alias)) continue
         const tz = zones[0]
-        ;(_reverseMap[tz] ??= new Set()).add(alias)
+        ;(sets[tz] ??= new Set()).add(alias)
+    }
+    _reverseMap = {}
+    for (const [tz, aliases] of Object.entries(sets)) {
+        _reverseMap[tz] = [...aliases].slice(0, 12).join(', ')
     }
     return _reverseMap
 }
 
 function tzFooterInfo(tz) {
-    const abbr = getTZAbbreviation(tz)
-    const offset = getUTCOffsetLabel(tz)
+    const now = new Date()
+    const abbr = getTZAbbreviation(tz, now)
+    const offset = getUTCOffsetLabel(tz, now)
     const showAbbr = abbr.replace('GMT', 'UTC') !== offset ? abbr : null
-    const places = [...(getReverseMap()[tz] ?? [])]
-        .filter((a) => !ABBR_RE.test(a))
-        .slice(0, 12)
-        .join(', ')
+    const places = getReverseMap()[tz] ?? ''
     return [showAbbr, offset, places].filter(Boolean).join('  ·  ')
 }
 
@@ -355,6 +383,7 @@ async function cmdTzset(interaction) {
     const td = getTimeForTimezone(tz)
     const cache = getCache()
     cache[user.id] = {
+        name: user.username,
         alias: result.display,
         timezone: tz,
         setBy: interaction.user.id,
@@ -477,7 +506,7 @@ async function cmdTz(interaction) {
         })
     }
 
-    const sid = createSession('tz', lines)
+    const sid = createSession('tz', lines, {}, interaction.user.id)
     return interaction.reply({
         embeds: [buildPageEmbed(getSession(sid), 0)],
         components: [buildPageRow(sid, 0, lines.length)],
@@ -514,32 +543,39 @@ async function cmdTzbesttime(interaction) {
         })
     }
 
-    const fmtHour = (h) => `${h % 12 || 12}:00 ${h >= 12 ? 'PM' : 'AM'}`
-    const scores = []
+    const fmtHour = (h, m = 0) =>
+        `${h % 12 || 12}:${String(m).padStart(2, '0')} ${h >= 12 ? 'PM' : 'AM'}`
+    const ref0 = new Date()
+    ref0.setUTCHours(0, 0, 0, 0)
+    // Pre-resolve each user's local hour/minute at 00:00 UTC once (O(N) instead of 24*N formatters)
+    const userOffsets = []
+    for (const uid of userIds) {
+        const { timezone, alias } = cache[uid]
+        try {
+            // Validate zone + get h23 hour at 00:00 UTC and minute offset
+            const baseHour = parseInt(
+                getFormatter('hour23', timezone, 'en-US', { hour: '2-digit', hourCycle: 'h23' }).format(ref0),
+                10,
+            )
+            const offsetMin = getUTCOffsetMinutes(timezone, ref0)
+            const minutePart = ((offsetMin % 60) + 60) % 60
+            userOffsets.push({ id: uid, baseHour, minutePart, label: alias || timezone })
+        } catch {}
+    }
 
+    const scores = []
     for (let utcHour = 0; utcHour < 24; utcHour++) {
-        const ref = new Date()
-        ref.setUTCHours(utcHour, 0, 0, 0)
         let score = 0
         const userTimes = []
 
-        for (const uid of userIds) {
-            const { timezone, alias } = cache[uid]
-            try {
-                const localHour = parseInt(
-                    new Intl.DateTimeFormat('en-US', {
-                        hour: '2-digit',
-                        hour12: false,
-                        timeZone: timezone,
-                    }).format(ref),
-                )
-                let s = 0
-                if (localHour >= 16 && localHour <= 22) s = 3
-                else if (localHour >= 21 || localHour <= 3) s = 2
-                else if (localHour >= 8 && localHour < 12) s = 1
-                score += s
-                userTimes.push({ id: uid, hour: localHour, label: alias || timezone })
-            } catch {}
+        for (const u of userOffsets) {
+            const localHour = (u.baseHour + utcHour) % 24
+            let s = 0
+            if (localHour >= 16 && localHour <= 22) s = 3
+            else if (localHour >= 12 && localHour < 16) s = 2
+            else if (localHour === 23 || (localHour >= 8 && localHour < 12)) s = 1
+            score += s
+            userTimes.push({ id: u.id, hour: localHour, minute: u.minutePart, label: u.label })
         }
         scores.push({ utcHour, score, userTimes })
     }
@@ -549,7 +585,7 @@ async function cmdTzbesttime(interaction) {
     ref.setUTCHours(best.utcHour, 0, 0, 0)
     const ts = Math.floor(ref.getTime() / 1000)
 
-    const lines = best.userTimes.map((ut) => `<@${ut.id}>\n\`${fmtHour(ut.hour)}\` (${ut.label})`)
+    const lines = best.userTimes.map((ut) => `<@${ut.id}>\n\`${fmtHour(ut.hour, ut.minute)}\` (${ut.label})`)
     const scopeNote =
         taggedIds.length > 0 ? ` · scoped to ${taggedIds.length} user${taggedIds.length > 1 ? 's' : ''}` : ''
 
@@ -566,7 +602,7 @@ async function cmdTzbesttime(interaction) {
         })
     }
 
-    const sid = createSession('tzbt', lines, { ts, utcHour: best.utcHour })
+    const sid = createSession('tzbt', lines, { ts, utcHour: best.utcHour }, interaction.user.id)
     return interaction.reply({
         embeds: [buildPageEmbed(getSession(sid), 0)],
         components: [buildPageRow(sid, 0, lines.length)],
@@ -672,6 +708,7 @@ async function cmdTzwhen(interaction) {
 
     // Resolve source timezone
     let sourceTz = null
+    let sourceTzAlias = null
     if (rawTZ) {
         const r = lookupLocation(rawTZ)
         if (!r || r.zones.length > 1) {
@@ -683,6 +720,7 @@ async function cmdTzwhen(interaction) {
             })
         }
         sourceTz = r.zones[0]
+        sourceTzAlias = r.display
     } else {
         const inv = cache[interaction.user.id]
         if (!inv) {
@@ -693,35 +731,24 @@ async function cmdTzwhen(interaction) {
             })
         }
         sourceTz = inv.timezone
+        sourceTzAlias = inv.alias ?? sourceTz
     }
 
-    // Build UTC instant from local time + sourceTz offset
+    // Build UTC instant from local time + sourceTz offset at the target instant (DST-safe)
     const now = new Date()
-    const dateParts = new Intl.DateTimeFormat('en-CA', {
-        timeZone: sourceTz,
+    const dateParts = getFormatter('ymd', sourceTz, 'en-CA', {
         year: 'numeric',
         month: '2-digit',
         day: '2-digit',
     }).format(now)
     const pad = (n) => String(n).padStart(2, '0')
-    const localISO = `${dateParts}T${pad(hours)}:${pad(minutes)}:${pad(seconds)}`
-    const offMatch = getUTCOffsetLabel(sourceTz).match(/UTC([+-])(\d+)(?::(\d+))?/)
-    const offsetMin = offMatch
-        ? (offMatch[1] === '+' ? 1 : -1) * (parseInt(offMatch[2]) * 60 + parseInt(offMatch[3] ?? '0'))
-        : 0
-    const utcDate = new Date(new Date(localISO + 'Z').getTime() - offsetMin * 60000)
+    const naiveUtcMs = new Date(`${dateParts}T${pad(hours)}:${pad(minutes)}:${pad(seconds)}Z`).getTime()
+    const off1 = getUTCOffsetMinutes(sourceTz, new Date(naiveUtcMs))
+    const off2 = getUTCOffsetMinutes(sourceTz, new Date(naiveUtcMs - off1 * 60000))
+    const utcDate = new Date(naiveUtcMs - off2 * 60000)
 
-    const sourceTzAlias = rawTZ
-        ? (lookupLocation(rawTZ)?.display ?? rawTZ.toUpperCase())
-        : (cache[interaction.user.id]?.alias ?? sourceTz)
-    const sourceLabel = formatLabel(sourceTzAlias, sourceTz)
-    const srcFormatted = utcDate.toLocaleTimeString('en-US', {
-        hour: '2-digit',
-        minute: '2-digit',
-        second: seconds ? '2-digit' : undefined,
-        hour12: true,
-        timeZone: sourceTz,
-    })
+    const sourceLabel = formatLabel(sourceTzAlias, sourceTz, utcDate)
+    const srcFormatted = formatTime12(sourceTz, utcDate, Boolean(seconds))
 
     // Build target list
     let targets
@@ -746,15 +773,9 @@ async function cmdTzwhen(interaction) {
     }
 
     const lines = targets.map(({ id, alias, timezone }) => {
-        const converted = utcDate.toLocaleTimeString('en-US', {
-            hour: '2-digit',
-            minute: '2-digit',
-            second: seconds ? '2-digit' : undefined,
-            hour12: true,
-            timeZone: timezone,
-        })
+        const converted = formatTime12(timezone, utcDate, Boolean(seconds))
         const sameZone = timezone === sourceTz
-        return `<@${id}>\n\`${converted}\` (${formatLabel(alias || timezone, timezone)})${sameZone ? ' ← same as source' : ''}`
+        return `<@${id}>\n\`${converted}\` (${formatLabel(alias || timezone, timezone, utcDate)})${sameZone ? ' ← same as source' : ''}`
     })
 
     return interaction.reply({
@@ -797,7 +818,22 @@ async function handleTzInteraction(interaction) {
             })
             return true
         }
-        const page = parseInt(parts[2])
+        if (session.ownerId && interaction.user.id !== session.ownerId) {
+            await interaction.reply({
+                content: '❌ Only the user who ran this command can use these buttons.',
+                flags: MessageFlags.Ephemeral,
+            })
+            return true
+        }
+        const totalPages = Math.max(1, Math.ceil(session.lines.length / PAGE_SIZE))
+        const page = Number.parseInt(parts[2], 10)
+        if (!Number.isInteger(page) || page < 0 || page >= totalPages) {
+            await interaction.reply({
+                content: '❌ Invalid page.',
+                flags: MessageFlags.Ephemeral,
+            })
+            return true
+        }
         await interaction.update({
             embeds: [buildPageEmbed(session, page)],
             components: [buildPageRow(parts[1], page, session.lines.length)],
@@ -1361,11 +1397,11 @@ const locationMap = {
     PRISTINA: ['Europe/Belgrade'],
     MOLDOVA: ['Europe/Chisinau'],
     CHISINAU: ['Europe/Chisinau'],
-    UKRAINE: ['Europe/Kiev', 'Europe/Uzhgorod', 'Europe/Zaporozhye'],
-    KYIV: ['Europe/Kiev'],
-    KIEV: ['Europe/Kiev'],
-    KHARKIV: ['Europe/Kiev'],
-    ODESSA: ['Europe/Kiev'],
+    UKRAINE: ['Europe/Kyiv', 'Europe/Uzhgorod', 'Europe/Zaporozhye'],
+    KYIV: ['Europe/Kyiv'],
+    KIEV: ['Europe/Kyiv'],
+    KHARKIV: ['Europe/Kyiv'],
+    ODESSA: ['Europe/Kyiv'],
     BELARUS: ['Europe/Minsk'],
     MINSK: ['Europe/Minsk'],
     LITHUANIA: ['Europe/Vilnius'],
@@ -1803,7 +1839,7 @@ const locationMap = {
     'PORT VILA': ['Pacific/Efate'],
     'SOLOMON ISLANDS': ['Pacific/Guadalcanal'],
     HONIARA: ['Pacific/Guadalcanal'],
-    KIRIBATI: ['Pacific/Tarawa', 'Pacific/Enderbury', 'Pacific/Kiritimati'],
+    KIRIBATI: ['Pacific/Tarawa', 'Pacific/Kanton', 'Pacific/Kiritimati'],
     TARAWA: ['Pacific/Tarawa'],
     PALAU: ['Pacific/Palau'],
     KOROR: ['Pacific/Palau'],
@@ -1939,11 +1975,12 @@ function shimInteraction(msg, { users = {}, strings = {}, bools = {} } = {}) {
 const firstMentionedUser = (msg) => msg.mentions?.users?.first?.() ?? null
 
 async function prefixTz(msg, args) {
-    // m.tz / m.timezone — with a location acts like /tzis, otherwise like /tz.
+    // m.tz / m.timezone — with a user mention acts like /tz @user, with a location acts like /tzis, otherwise /tz.
+    const mentioned = firstMentionedUser(msg)
+    if (mentioned) return cmdTz(shimInteraction(msg, { users: { user: mentioned } }))
     const rest = args.join(' ').trim()
     if (rest) return cmdTzis(shimInteraction(msg, { strings: { location: rest } }))
-    const mentioned = firstMentionedUser(msg)
-    return cmdTz(shimInteraction(msg, { users: mentioned ? { user: mentioned } : {} }))
+    return cmdTz(shimInteraction(msg, {}))
 }
 
 async function prefixTzis(msg, args) {

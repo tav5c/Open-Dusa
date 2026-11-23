@@ -1,5 +1,19 @@
 import { formatDuration } from './utils.js'
 
+const AFK_PREFIX = '[🪼] '
+
+function buildAfkNick(displayName) {
+    if (!displayName || displayName.startsWith(AFK_PREFIX)) return null
+    const maxBase = 32 - AFK_PREFIX.length
+    let base = displayName
+    if (base.length > maxBase) {
+        base = base.slice(0, maxBase)
+        const last = base.charCodeAt(base.length - 1)
+        if (last >= 0xd800 && last <= 0xdbff) base = base.slice(0, -1)
+    }
+    return `${AFK_PREFIX}${base}`
+}
+
 export function registerAfk(client, db = null) {
     const afkData = new Map()
     const userCooldowns = new Map()
@@ -31,6 +45,24 @@ export function registerAfk(client, db = null) {
         return { afk: afkData.get(gid), cd: userCooldowns.get(gid), mc: mentionCounts.get(gid) }
     }
 
+    // Periodically prune expired cooldowns and stale mention counters
+    setInterval(() => {
+        const now = Math.floor(Date.now() / 1000)
+        for (const [gid, cd] of userCooldowns) {
+            for (const [uid, exp] of cd) {
+                if (now >= exp) cd.delete(uid)
+            }
+            if (!cd.size) userCooldowns.delete(gid)
+        }
+        for (const [gid, mc] of mentionCounts) {
+            const cd = userCooldowns.get(gid)
+            for (const uid of mc.keys()) {
+                if (!cd?.has(uid)) mc.delete(uid)
+            }
+            if (!mc.size) mentionCounts.delete(gid)
+        }
+    }, 5 * 60_000).unref()
+
     client.on('guildDelete', (guild) => {
         afkData.delete(guild.id)
         userCooldowns.delete(guild.id)
@@ -39,13 +71,14 @@ export function registerAfk(client, db = null) {
     })
 
     client.commands.set('afk', async (msg, args) => {
+        if (!msg.guild) return
         const reason = args.join(' ') || 'AFK'
         const { afk } = afkGuild(msg.guild.id)
         const entry = { reason, timestamp: Math.floor(Date.now() / 1000) }
         afk.set(msg.author.id, entry)
         stmts?.set.run(msg.guild.id, msg.author.id, entry.reason, entry.timestamp)
-        if (!msg.member.displayName.startsWith('[🪼] '))
-            msg.member.setNickname(`[🪼] ${msg.member.displayName}`).catch(() => {})
+        const nextNick = buildAfkNick(msg.member?.displayName)
+        if (nextNick) msg.member.setNickname(nextNick).catch(() => {})
         await msg.reply({
             content: `> 🪼 | <@${msg.author.id}> **is now AFK** - ${reason}`,
             allowedMentions: { parse: [] },
@@ -53,12 +86,14 @@ export function registerAfk(client, db = null) {
     })
 
     client.commands.set('unafk', async (msg) => {
+        if (!msg.guild) return
         const { afk } = afkGuild(msg.guild.id)
         if (afk.has(msg.author.id)) {
             afk.delete(msg.author.id)
             stmts?.del.run(msg.guild.id, msg.author.id)
-            const nick = msg.member.displayName
-            if (nick.startsWith('[🪼] ')) msg.member.setNickname(nick.slice(5)).catch(() => {})
+            const nick = msg.member?.displayName
+            if (nick?.startsWith(AFK_PREFIX))
+                msg.member.setNickname(nick.slice(AFK_PREFIX.length)).catch(() => {})
             await msg.reply({
                 content: `> 🪼 | <@${msg.author.id}> **is back.**`,
                 allowedMentions: { parse: [] },
@@ -72,30 +107,47 @@ export function registerAfk(client, db = null) {
     })
 
     async function handleMessage(message) {
-        const gId = message.guild.id
+        const gId = message.guild?.id
+        if (!gId) return
+        const afk = afkData.get(gId)
+        if (!afk?.size) return
+
         const userId = message.author.id
         const now = Math.floor(Date.now() / 1000)
-        const { afk, cd, mc } = afkGuild(gId)
+        const { cd, mc } = afkGuild(gId)
 
         if (afk.has(userId)) {
             afk.delete(userId)
             stmts?.del.run(gId, userId)
             mc.delete(userId)
-            if (message.member?.displayName.startsWith('[🪼] '))
-                message.member.setNickname(message.member.displayName.slice(5)).catch(() => {})
+            const nick = message.member?.displayName
+            if (nick?.startsWith(AFK_PREFIX))
+                message.member.setNickname(nick.slice(AFK_PREFIX.length)).catch(() => {})
             await message.channel.send({
                 content: `> 🪼 | <@${userId}> **is back.**`,
                 allowedMentions: { parse: [] },
             })
         }
 
-        for (const [afkId, data] of afk) {
-            if (afkId === userId) continue
-            const mentioned = message.mentions.users.has(afkId)
-            const isReply = message.reference?.resolved?.author.id === afkId
-            if (!mentioned && !isReply) continue
+        if (!afk.size) return
+
+        // Check only explicitly mentioned and replied user IDs (O(mentions))
+        const candidates = new Set()
+        for (const id of message.mentions.users.keys()) {
+            if (id !== userId) candidates.add(id)
+        }
+        const repliedId =
+            message.mentions.repliedUser?.id ??
+            (message.reference?.messageId
+                ? message.channel?.messages?.cache?.get(message.reference.messageId)?.author?.id
+                : null)
+        if (repliedId && repliedId !== userId) candidates.add(repliedId)
+
+        for (const afkId of candidates) {
+            const data = afk.get(afkId)
+            if (!data) continue
             const cdExp = cd.get(userId) ?? 0
-            if (now < cdExp) continue
+            if (now < cdExp) break
             const count = (mc.get(userId) ?? 0) + 1
             mc.set(userId, count)
             if (count > 3) {

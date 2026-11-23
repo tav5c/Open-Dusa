@@ -3,56 +3,89 @@
 import { MessageFlags } from 'discord.js'
 import { AgentCommandCore } from './agent-commands.js'
 import { containsDisallowedHate, inPersonaRefusal, safetyRefusal } from './safety.js'
+import { isDegenerate, splitResponse as splitResponseKernel } from './hot-kernels.js'
 import { logAction } from '../moderation.js'
+
+const CONTROL_CHARS_RE = /[\u0000-\u0008\u000B-\u001F\u007F-\u009F\uE000-\uF8FF\uFFF0-\uFFFF]/g
+const EVERYONE_HERE_RE =
+    /@(?:[\u200B-\u200F\u202A-\u202E\u2060-\u2064\uFEFF\u00AD\u034F\u061C\u180E]*)(everyone|here)/gi
+const INTERNAL_LEAD_RE =
+    /^[\s>"'`]*(?:\*\*[^\n*]+\*\*\s*:?\s*["']?)?\s*\[INTERNAL\b[\s\S]*?(?:\]\s*["']?|\n\s*\n|$)/i
+const REPLY_CTX_TAG_RE = /<\/?reply_context[^>]*>/g
+const USER_MSG_ECHO_RE = /^\s*User['’]s message:\s*"[^"]*"\s*$/gim
+const REPLY_ECHO_RE = /^\s*\w+:\s*"User is replying to your message:[\s\S]*?"\s*$/gim
+const MALFORMED_MENTION_RE = /<@!?([^0-9>\s][^>]{0,50})>/g
+const ROLE_PING_RE = /<@&(\d+)>/g
+const PING_CHECK_RE = /<@!?\d+>|<@&\d+>|@everyone|@here/
+const PARTIAL_TOKEN_TAIL_RE = /<(?:@!?|@&|#|a?:[a-zA-Z0-9_]*:?)?[^>]*$/
+const EMOJI_SHORTCODE_RE = /:([a-zA-Z0-9_]{2,32}):/g
+const MATH_SYM_RE = /[=^√∫∑∏πθωαβ∞≠≤≥×÷²³½¼→⇒∀∃∈∂λΔΣΠφψΩ]/
+const MATH_EQ_RE = /[a-zA-Z0-9]\s*=\s*\S/
+const SERIOUS_RE = /\b(ban|mute|warn|kick|purge|moderat|you are (now|hereby)|action has been|case #)\b/i
+const NSFW_BLOCK_RE = /\b(nsfw|porn|nude|sex|hentai|lewd|explicit)\b/i
+const FUNNY_WORDS_RE = /\b(lmao|lol|bruh|bro|omg|dead|crying|aint no way|no cap|bffr)\b/i
+const FUNNY_EMOJI_RE = /[💀😭😂]/
+const HYPE_WORDS_RE = /\b(lets go|yesss|slay|bestie|periodt|love|excited|amazing|fire)\b/i
+const HYPE_EMOJI_RE = /[🔥💜✨]/
+const CONFUSED_RE = /\b(wait what|huh|idk|honestly|lowkey|hmm|i mean)\b/i
+const CHAOS_WORDS_RE = /\b(skull|unhinged|chaotic|wild|insane|absolutely not)\b/i
+const CHAOS_EMOJI_RE = /[💀😭]/
+const STICKER_NSFW_RE = /nsfw|nude|sex|porn|lewd/
+
+// Balanced bracket stripper for [INTERNAL ...] tags that may contain nested [...]
+function stripInternalBlocks(str) {
+    let out = ''
+    let i = 0
+    const upper = str.toUpperCase()
+    while (i < str.length) {
+        const idx = upper.indexOf('[INTERNAL', i)
+        if (idx === -1) {
+            out += str.slice(i)
+            break
+        }
+        // Require word boundary after INTERNAL (whitespace, colon, bracket, or end)
+        const after = str[idx + 9]
+        if (after && /[a-zA-Z0-9_]/.test(after)) {
+            out += str.slice(i, idx + 9)
+            i = idx + 9
+            continue
+        }
+        out += str.slice(i, idx)
+        let depth = 0
+        let j = idx
+        while (j < str.length) {
+            const ch = str[j]
+            if (ch === '[') depth++
+            else if (ch === ']') {
+                depth--
+                if (depth === 0) {
+                    j++
+                    break
+                }
+            } else if (ch === '\n' && str[j + 1] === '\n') {
+                // Bound unclosed [INTERNAL to double newline
+                break
+            }
+            j++
+        }
+        i = j
+    }
+    return out
+}
+
+function safeTruncate(text, max = 2000) {
+    if (text.length <= max) return text
+    let cut = text.slice(0, max - 3)
+    // Avoid bisecting <@123456>, <:emoji:123456>, <a:emoji:123456>, <#123>, <@&123>
+    const m = cut.match(PARTIAL_TOKEN_TAIL_RE)
+    if (m && m.index > 0) cut = cut.slice(0, m.index).trimEnd()
+    return cut + '...'
+}
 
 export class OutputCore extends AgentCommandCore {
     // Degenerate response check
     _isDegenerate(response) {
-        if (!response || response.length < 100) return false
-        const noSpace = response.replace(/[\s]/g, '')
-        if (noSpace.length > 80) {
-            const freq = {}
-            for (const c of noSpace) freq[c] = (freq[c] ?? 0) + 1
-            const [topChar, topCount] = Object.entries(freq).sort((a, b) => b[1] - a[1])[0]
-            if (topCount / noSpace.length > 0.65 && !topChar.match(/[a-zA-Z0-9]/)) return true
-            for (const len of [2, 3, 4]) {
-                if (noSpace.length < len * 20) continue
-                const seqFreq = {}
-                for (let i = 0; i <= noSpace.length - len; i++) {
-                    const s = noSpace.slice(i, i + len)
-                    seqFreq[s] = (seqFreq[s] ?? 0) + 1
-                }
-                const [, topSeqCount] = Object.entries(seqFreq).sort((a, b) => b[1] - a[1])[0]
-                if (topSeqCount / (noSpace.length / len) > 0.55) return true
-            }
-        }
-        const words = response.split(/\s+/)
-        if (words.length < 15) return false
-        const wFreq = {}
-        for (const w of words) wFreq[w] = (wFreq[w] ?? 0) + 1
-        const [, topWCount] = Object.entries(wFreq).sort((a, b) => b[1] - a[1])[0]
-        if (topWCount / words.length > 0.45 && topWCount > 20) return true
-        for (const n of [2, 3, 4]) {
-            if (words.length < n * 12) continue
-            const pFreq = {}
-            for (let i = 0; i <= words.length - n; i++) {
-                const p = words.slice(i, i + n).join(' ')
-                pFreq[p] = (pFreq[p] ?? 0) + 1
-            }
-            const [, topP] = Object.entries(pFreq).sort((a, b) => b[1] - a[1])[0]
-            if (topP > 12 && topP / (words.length / n) > 0.4) return true
-        }
-        const lines = response
-            .split('\n')
-            .map((l) => l.trim())
-            .filter(Boolean)
-        if (lines.length >= 10) {
-            const lFreq = {}
-            for (const l of lines) lFreq[l] = (lFreq[l] ?? 0) + 1
-            const [, topL] = Object.entries(lFreq).sort((a, b) => b[1] - a[1])[0]
-            if (topL / lines.length > 0.6) return true
-        }
-        return false
+        return isDegenerate(response)
     }
 
     // Security / formatting
@@ -82,23 +115,18 @@ export class OutputCore extends AgentCommandCore {
         text = inPersonaRefusal(text)
         // Strip unrenderable/control/private-use codepoints the model occasionally
         // emits (shows up as □ boxes in Discord) before any other cleanup.
-        let text2 = text.replace(/[\u0000-\u0008\u000B-\u001F\u007F-\u009F\uE000-\uF8FF\uFFF0-\uFFFF]/g, '')
-        let out = text2.replace(/@(?:[\u200B\u200C\u200D\uFEFF]*)?(everyone|here)/gi, '🪼')
-        // Strip leaked internal-context markers: tolerate a missing ']' and an echoed "**Name**:" preface, and bound to the first blank line so a top-of-reply echo can't wipe the real message
-        out = out
-            .replace(
-                /^[\s>"'`]*(?:\*\*[^\n*]+\*\*\s*:?\s*["']?)?\s*\[INTERNAL\b[\s\S]*?(?:\]\s*["']?|\n\s*\n|$)/i,
-                '',
-            )
-            .replace(/\[INTERNAL\b[^\]]*\]/gi, '')
-            .trim()
-        out = out.replace(/<\/?reply_context[^>]*>/g, '')
-        out = out.replace(/^\s*User['’]s message:\s*"[^"]*"\s*$/gim, '').trim()
-        out = out.replace(/^\s*\w+:\s*"User is replying to your message:[\s\S]*?"\s*$/gim, '').trim()
+        const text2 = text.replace(CONTROL_CHARS_RE, '')
+        let out = text2.replace(EVERYONE_HERE_RE, '🪼')
+        // Strip leaked internal-context markers: handle both leading echoed
+        // prefaces and balanced nested [INTERNAL ...] blocks.
+        out = stripInternalBlocks(out.replace(INTERNAL_LEAD_RE, '')).trim()
+        out = out.replace(REPLY_CTX_TAG_RE, '')
+        out = out.replace(USER_MSG_ECHO_RE, '').trim()
+        out = out.replace(REPLY_ECHO_RE, '').trim()
         // Strip malformed <@username> where LLM wrote a name instead of a numeric ID, leaves valid <@123456789> untouched
-        out = out.replace(/<@!?([^0-9>\s][^>]{0,50})>/g, (_, name) => `@${name.trim()}`)
+        out = out.replace(MALFORMED_MENTION_RE, (_, name) => `@${name.trim()}`)
         // role pings never survive, user mentions stay but every send goes out silent
-        out = out.replace(/<@&(\d+)>/g, '@role-$1')
+        out = out.replace(ROLE_PING_RE, '@role-$1')
         return out
     }
 
@@ -113,10 +141,9 @@ export class OutputCore extends AgentCommandCore {
         if (!text || text.includes('```')) return text
         const lines = String(text).split('\n')
         if (lines.some((l) => /^\s*>/.test(l))) return text
-        const MATH = /[=^√∫∑∏πθωαβ∞≠≤≥×÷²³½¼→⇒∀∃∈∂λΔΣΠφψΩ]/
         const eqIdx = []
         lines.forEach((l, i) => {
-            if (MATH.test(l) && /[a-zA-Z0-9]\s*=\s*\S/.test(l)) eqIdx.push(i)
+            if (MATH_SYM_RE.test(l) && MATH_EQ_RE.test(l)) eqIdx.push(i)
         })
         if (eqIdx.length < 2) return text
         // Answer = longest equation line (usually the boxed final result).
@@ -134,38 +161,7 @@ export class OutputCore extends AgentCommandCore {
     }
 
     splitResponse(text, max = 2000) {
-        if (text.length <= max) return [text]
-        const chunks = []
-        let inCodeBlock = false
-
-        while (text.length > 0) {
-            if (text.length <= max) {
-                chunks.push(inCodeBlock ? text + '\n```' : text)
-                break
-            }
-
-            let sp = max
-            for (const delim of ['\n\n', '\n', '. ', ', ', ' ']) {
-                const pos = text.lastIndexOf(delim, max)
-                if (pos > max / 2) {
-                    sp = pos + delim.length
-                    break
-                }
-            }
-
-            let chunk = text.slice(0, sp).trim()
-            text = text.slice(sp).trim()
-
-            const backticks = (chunk.match(/```/g) || []).length
-
-            if (inCodeBlock) chunk = '```\n' + chunk
-            if (backticks % 2 !== 0) inCodeBlock = !inCodeBlock
-            if (inCodeBlock) chunk += '\n```'
-
-            chunks.push(chunk)
-        }
-
-        return chunks
+        return splitResponseKernel(text, max)
     }
 
     async secureReply(message, content, opts = {}) {
@@ -178,12 +174,12 @@ export class OutputCore extends AgentCommandCore {
 
         if (!hasContent && !hasEmbeds) return null
 
-        const safe = validated.length > 2000 ? validated.slice(0, 1997) + '...' : validated
+        const safe = safeTruncate(validated, 2000)
         const payload = { allowedMentions: { parse: ['users'], repliedUser: false }, ...opts }
         if (hasContent) payload.content = safe
 
-        if (/<@!?\d+>|<@&\d+>|@everyone|@here/.test(safe)) {
-            payload.flags = MessageFlags.SuppressNotifications
+        if (PING_CHECK_RE.test(safe)) {
+            payload.flags = (payload.flags ?? 0) | MessageFlags.SuppressNotifications
         }
 
         // Try reply first (keeps the thread visual). Fall back to plain channel send on:
@@ -195,7 +191,7 @@ export class OutputCore extends AgentCommandCore {
             const code = e?.code
             if (code === 10008 || code === 50035) {
                 // Strip the reply-reference and send as a normal channel message
-                const { message_reference, ...safePayload } = payload
+                const { reply, message_reference, ...safePayload } = payload
                 try {
                     return await message.channel.send(safePayload)
                 } catch (e2) {
@@ -207,7 +203,8 @@ export class OutputCore extends AgentCommandCore {
                 }
             }
             try {
-                return await message.channel.send(payload)
+                const { reply, message_reference, ...safePayload } = payload
+                return await message.channel.send(safePayload)
             } catch (e2) {
                 // Never fail silently: a swallowed confirm note looks exactly like
                 // "she doesn't send confirms". Log it loud with routing info.
@@ -242,9 +239,21 @@ export class OutputCore extends AgentCommandCore {
     // Resolve :emojiName: shortcodes -> full <:name:ID> Discord format
     // LLMs habitually write :name: even when given the full format, handle it here instead of trusting the prompt
     _resolveCustomEmojis(text, guild) {
-        if (!guild?.emojis?.cache?.size || !text) return text
-        return text.replace(/:([a-zA-Z0-9_]{2,32}):/g, (match, name) => {
-            const emoji = guild.emojis.cache.find((e) => e.name === name)
+        const cache = guild?.emojis?.cache
+        if (!cache?.size || !text || !text.includes(':')) return text
+        this._emojiNameCache ??= new Map()
+        let entry = this._emojiNameCache.get(guild.id)
+        const now = Date.now()
+        if (!entry || entry.size !== cache.size || now - entry.ts > 60_000) {
+            const map = new Map()
+            for (const e of cache.values()) {
+                if (e.name && !map.has(e.name)) map.set(e.name, e)
+            }
+            entry = { size: cache.size, ts: now, map }
+            this._emojiNameCache.set(guild.id, entry)
+        }
+        return text.replace(EMOJI_SHORTCODE_RE, (match, name) => {
+            const emoji = entry.map.get(name)
             if (!emoji) return match
             return `<${emoji.animated ? 'a' : ''}:${emoji.name}:${emoji.id}>`
         })
@@ -325,9 +334,7 @@ export class OutputCore extends AgentCommandCore {
         if (!message?.guild) return null
         const text = response.toLowerCase()
         // Hard blocks, never attach media on these
-        const SERIOUS = /\b(ban|mute|warn|kick|purge|moderat|you are (now|hereby)|action has been|case #)\b/i
-        const NSFW_BLOCK = /\b(nsfw|porn|nude|sex|hentai|lewd|explicit)\b/i
-        if (SERIOUS.test(response) || NSFW_BLOCK.test(response)) return null
+        if (SERIOUS_RE.test(response) || NSFW_BLOCK_RE.test(response)) return null
         // Explicit GIF asks bypass everything below (tone gate, dice roll):
         // the user asked, the subject IS the query.
         const gifSubject = this._extractGifSubject(message?.content)
@@ -340,17 +347,11 @@ export class OutputCore extends AgentCommandCore {
         // Skip if response is just a command execution (no real text)
         if (response.trim().startsWith('⚙️') || response.length < 20) return null
         // Tone detection. Note: \b never matches emoji (💜/🔥/✨ have no
-        // word boundaries), so emoji are tested with plain includes.
-        const isFunny =
-            /\b(lmao|lol|bruh|bro|omg|dead|crying|aint no way|no cap|bffr)\b/i.test(text) ||
-            /[💀😭😂]/.test(text)
-        const isHype =
-            /\b(lets go|yesss|slay|bestie|periodt|love|excited|amazing|fire)\b/i.test(text) ||
-            /[🔥💜✨]/.test(text)
-        const isConfused = /\b(wait what|huh|idk|honestly|lowkey|hmm|i mean)\b/i.test(text)
-        const isChaos =
-            /\b(skull|unhinged|chaotic|wild|insane|absolutely not)\b/i.test(text) || /[💀😭]/.test(text)
-        const isPositive = isHype || isFunny
+        // word boundaries), so emoji are tested with plain character classes.
+        const isFunny = FUNNY_WORDS_RE.test(text) || FUNNY_EMOJI_RE.test(text)
+        const isHype = HYPE_WORDS_RE.test(text) || HYPE_EMOJI_RE.test(text)
+        const isConfused = CONFUSED_RE.test(text)
+        const isChaos = CHAOS_WORDS_RE.test(text) || CHAOS_EMOJI_RE.test(text)
         const anythingTriggered = isFunny || isHype || isConfused || isChaos
 
         if (!anythingTriggered) return null
@@ -364,7 +365,7 @@ export class OutputCore extends AgentCommandCore {
         if (stickers.length) {
             const safe = stickers.filter((s) => {
                 const n = (s.name + (s.description ?? '')).toLowerCase()
-                return !/nsfw|nude|sex|porn|lewd/.test(n)
+                return !STICKER_NSFW_RE.test(n)
             })
             if (safe.length && Math.random() > 0.5) {
                 // Pick contextually: prefer stickers whose name matches tone keywords
@@ -380,7 +381,6 @@ export class OutputCore extends AgentCommandCore {
                               'sob',
                               'bradar',
                               'i drink soda i eat pizza',
-                              '',
                           ]
                         : []),
                     ...(isHype

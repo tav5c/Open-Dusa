@@ -103,7 +103,8 @@ const KNOWN = {
 const FAMILY = [
     { re: /vl\b|vision|scout|qwen.*3.*(27b|32b)|nemotron.*vl/i, caps: { vision: true, maxImages: 3 } },
     { re: /sonar|perplexity/i, caps: { tools: true, jsonObject: true, webSearch: true } },
-    { re: /gpt-oss|compound/i, caps: { tools: true, jsonObject: true, webSearch: true } },
+    { re: /compound/i, caps: { tools: true, jsonObject: true, builtInTools: true, webSearch: true } },
+    { re: /gpt-oss/i, caps: { tools: true, jsonObject: true, builtInTools: true, webSearch: false } },
     {
         re: /llama-3|mistral|qwen|deepseek|moonshot|grok/i,
         caps: { tools: true, jsonObject: true },
@@ -117,6 +118,7 @@ const _base = (seed = {}) => ({
     jsonObject: true,
     jsonSchemaStrict: false,
     maxImages: 0,
+    builtInTools: false,
     // Endpoint-level, never per-chat-model: no OpenAI-compatible chat API
     // takes video_url today (Groq/NIM/OpenAI all 400) — send frames as images.
     video: false,
@@ -138,8 +140,9 @@ const _base = (seed = {}) => ({
 
 export function staticCaps(model = '') {
     const id = String(model).trim()
-    if (KNOWN[id])
-        return { ..._base(KNOWN[id]), builtInTools: KNOWN[id].builtInTools, source: 'registry:exact' }
+    const known = KNOWN[id.toLowerCase()]
+    if (known)
+        return { ..._base(known), source: 'registry:exact' }
     const caps = _base()
     for (const f of FAMILY) {
         if (f.re.test(id)) {

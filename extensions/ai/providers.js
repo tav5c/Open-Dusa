@@ -2,7 +2,7 @@
 // key rotation with cooldowns, circuit breakers, payload shaping, streaming.
 import { existsSync, mkdirSync, readFileSync, writeFileSync } from 'fs'
 import OpenAI from 'openai'
-import { Agent } from 'undici'
+import { Agent, fetch as undiciFetch } from 'undici'
 import { DEAD_KEYS_FILE } from './constants.js'
 
 // Tavily client pool: same `.search()` shape as a single client, rotates to
@@ -41,12 +41,15 @@ export function createTavilyPool(tavily, keys) {
     }
 }
 
+const HARD_DEAD_RE =
+    /organization has been (?:restricted|disabled)|account has been (?:disabled|suspended)|key has been revoked|api key not valid|invalid api key provided/i
+
 export const _undiciAgent = new Agent({
     connections: 30,
     pipelining: 1,
     keepAliveTimeout: 60_000,
     keepAliveMaxTimeout: 300_000,
-    connectTimeout: 8_000,
+    connect: { timeout: 8_000 },
     // undici defaults (300 s): per-call budgets stay on the openai SDK
     // timeouts / AbortSignal, which always fire first. A low ceiling here
     // would truncate @discordjs/rest traffic (it imports undici directly);
@@ -56,6 +59,34 @@ export const _undiciAgent = new Agent({
 })
 
 export class ProviderCore {
+    _createOpenAIClient(baseURL, apiKey, timeout = 12_000, retries = 0) {
+        const opts = {
+            apiKey,
+            baseURL,
+            timeout,
+            maxRetries: retries,
+            fetch: undiciFetch,
+            fetchOptions: { dispatcher: _undiciAgent },
+        }
+        // NVIDIA NIM uses api-key header instead of Bearer
+        if (baseURL?.includes('nvidia.com') || baseURL?.includes('integrate.api.nvidia')) {
+            opts.defaultHeaders = { Authorization: `Bearer ${apiKey}` }
+        }
+        // OpenRouter needs extra headers for routing
+        if (baseURL?.includes('openrouter.ai')) {
+            opts.defaultHeaders = {
+                Authorization: `Bearer ${apiKey}`,
+                'HTTP-Referer': this._config?.siteUrl || 'https://medusa.bot',
+                'X-Title': 'Medusa',
+            }
+        }
+        // Anthropic via OpenAI compatibility layer
+        if (baseURL?.includes('anthropic')) {
+            opts.defaultHeaders = { 'anthropic-version': '2023-06-01' }
+        }
+        return new OpenAI(opts)
+    }
+
     _initGroq() {
         const key = this.aiTokens[this.currentKeyIdx]
         if (!key) {
@@ -63,26 +94,8 @@ export class ProviderCore {
             return
         }
 
-        const createClient = (baseURL, apiKey, timeout, retries) => {
-            const opts = { apiKey, baseURL, timeout, maxRetries: retries }
-            // NVIDIA NIM uses api-key header instead of Bearer
-            if (baseURL?.includes('nvidia.com') || baseURL?.includes('integrate.api.nvidia')) {
-                opts.defaultHeaders = { Authorization: `Bearer ${apiKey}` }
-            }
-            // OpenRouter needs extra headers for routing
-            if (baseURL?.includes('openrouter.ai')) {
-                opts.defaultHeaders = {
-                    Authorization: `Bearer ${apiKey}`,
-                    'HTTP-Referer': this._config?.siteUrl || 'https://medusa.bot',
-                    'X-Title': 'Medusa',
-                }
-            }
-            // Anthropic via OpenAI compatibility layer
-            if (baseURL?.includes('anthropic')) {
-                opts.defaultHeaders = { 'anthropic-version': '2023-06-01' }
-            }
-            return new OpenAI(opts)
-        }
+        const createClient = (baseURL, apiKey, timeout, retries) =>
+            this._createOpenAIClient(baseURL, apiKey, timeout, retries)
 
         try {
             this._groq = createClient(this.llmBaseUrl, key, 12_000, 0)
@@ -170,7 +183,7 @@ export class ProviderCore {
                 continue
             }
             try {
-                p.client = new OpenAI({ apiKey: key, baseURL: p.baseUrl, timeout: 12_000, maxRetries: 0 })
+                p.client = this._createOpenAIClient(p.baseUrl, key, 12_000, 0)
             } catch (e) {
                 p.client = null
                 if (this._config?.debug)
@@ -203,7 +216,7 @@ export class ProviderCore {
     _errorStatus(err) {
         const direct = Number(err?.status ?? err?.statusCode ?? err?.response?.status)
         if (Number.isInteger(direct) && direct >= 400 && direct <= 599) return direct
-        const match = String(err).match(/(?:error code:|status(?: code)?[:=]?|\b)(4\d\d|5\d\d)\b/i)
+        const match = String(err).match(/(?:^|\b(?:http|status(?: code)?|error(?: code)?)\s*[:=]?\s*)(4\d\d|5\d\d)\b/i)
         return match ? Number(match[1]) : null
     }
 
@@ -251,12 +264,7 @@ export class ProviderCore {
             if (p.state.deadKeys.has(next)) continue
             if ((p.state.keyCooldowns.get(next) ?? 0) > now) continue
             try {
-                p.client = new OpenAI({
-                    apiKey: p.keys[next],
-                    baseURL: p.baseUrl,
-                    timeout: 12_000,
-                    maxRetries: 0,
-                })
+                p.client = this._createOpenAIClient(p.baseUrl, p.keys[next], 12_000, 0)
                 console.log(
                     `[AI] \x1b[32mProvider '${p.name}' key rotated: ${p.state.keyIdx + 1} -> ${next + 1} (${reason}, cooldown ${Math.round(retryMs / 1000)}s)\x1b[0m`,
                 )
@@ -285,7 +293,7 @@ export class ProviderCore {
         effort = 'low',
     ) {
         if (!this._providers) this._initProviders()
-        const now = Date.now()
+        const startTime = Date.now()
         // Stable sort: the agent's pinned provider first (it owns this model family —
         // avoids a doomed cross-provider call when the slug is aggregator-specific,
         // e.g. OpenRouter-style `:free` suffixes that 404 elsewhere), then exact
@@ -294,7 +302,7 @@ export class ProviderCore {
         const ordered = [...this._providers].sort((a, b) => {
             const pref = (b.baseUrl === preferredBase ? 1 : 0) - (a.baseUrl === preferredBase ? 1 : 0)
             if (pref !== 0) return pref
-            return (b.priority ?? 99) - (a.priority ?? 99)
+            return (a.priority ?? 99) - (b.priority ?? 99)
         })
         let attempts = 0
         // First-miss forensics: "Routed via x in Ns (2 attempts)" never says what
@@ -306,7 +314,8 @@ export class ProviderCore {
         for (const p of ordered) {
             // Hard per-reply cap: attempts share one deadline, and each
             // attempt gets at most what the budget has left.
-            const remainMs = budget ? budget.until - Date.now() : Infinity
+            const loopNow = Date.now()
+            const remainMs = budget ? budget.until - loopNow : Infinity
             if (remainMs < 1000) break
             // This reply already proved the base dead (stream-open timeout /
             // 5xx): skip it here too, not only in the fallback chain.
@@ -315,7 +324,7 @@ export class ProviderCore {
                 continue
             }
             if (!p.client) continue
-            if (now < p.state.openUntil) {
+            if (loopNow < p.state.openUntil) {
                 noteFailure(p, 'breaker open')
                 continue // breaker open
             }
@@ -355,7 +364,7 @@ export class ProviderCore {
                     // Slow-provider forensics: a "slow ass" complaint is otherwise
                     // unprovable after the fact. Log whenever failover happened or
                     // a single provider took a while — including WHAT missed first.
-                    const elapsed = Date.now() - now
+                    const elapsed = Date.now() - startTime
                     if (attempts > 1 || elapsed > 8000) {
                         // Prefill size rides along so slow turns can be split
                         // into provider-side vs payload-side after the fact.
@@ -401,6 +410,11 @@ export class ProviderCore {
                     let stopReason = null // null = walked the ring, every key cooling
                     const ring = p.keys?.length ?? 1
                     for (let hop = 1; hop < ring; hop++) {
+                        const retryRemain = budget ? budget.until - Date.now() : Infinity
+                        if (retryRemain < 1000) {
+                            stopReason = 'budget exhausted'
+                            break
+                        }
                         const retryMs = this._parseRetryMs(lastErr)
                         const status = this._errorStatus(lastErr)
                         if (
@@ -413,11 +427,14 @@ export class ProviderCore {
                         )
                             break
                         try {
-                            const r2 = await p.client.chat.completions.create(payload)
-                            const out2 = r2.choices?.[0]?.message?.content
+                            const ceiling = p.baseUrl === preferredBase ? 25_000 : 12_000
+                            const r2 = await p.client.chat.completions.create(payload, {
+                                timeout: Math.min(ceiling, retryRemain),
+                            })
+                            const out2 = r2?.choices?.[0]?.message?.content
                             if (out2) {
                                 this._resetBreaker(p)
-                                const elapsed2 = Date.now() - now
+                                const elapsed2 = Date.now() - startTime
                                 if (elapsed2 > 8000) {
                                     console.log(
                                         `[AI] Routed via '${p.name}' after key burn in ${(elapsed2 / 1000).toFixed(1)}s (first miss: HTTP ${this._errorStatus(e) ?? '?'} ${String(e?.message ?? e).slice(0, 60)})`,
@@ -643,17 +660,7 @@ export class ProviderCore {
         return /permission.denied|free plan|upgrade your plan|top up|entitle/i.test(String(e?.message ?? e))
     }
     _isDeadKeyError(e) {
-        const s = String(e).toLowerCase()
-        const HARD_DEAD = [
-            'organization has been restricted',
-            'organization has been disabled',
-            'account has been disabled',
-            'account has been suspended',
-            'key has been revoked',
-            'api key not valid',
-            'invalid api key provided',
-        ]
-        return HARD_DEAD.some((x) => s.includes(x))
+        return HARD_DEAD_RE.test(String(e))
     }
     // Research master switch (config search.enabled:false): every web
     // path checks this, so one flag quiets chat routing, slash commands,
@@ -697,7 +704,7 @@ export class ProviderCore {
             id: 'google',
             match: (url, model) => /google|generativelanguage/i.test(url) || /gemini/i.test(model),
             paramMap: (p, maxTokens) => {
-                p.maxOutputTokens = maxTokens
+                p.max_tokens = maxTokens
                 p.temperature = Math.min(p.temperature ?? 1, 0.9)
                 return p
             },
@@ -788,7 +795,7 @@ export class ProviderCore {
         client ??= this._groq
         if (!client) return null
 
-        const payload = this._buildPayload(model, messages, maxTokens, temp, topP, undefined, effort)
+        const payload = this._buildPayload(model, messages, maxTokens, temp, topP, client?.baseURL, effort)
         // _groqCall is ALWAYS non-streaming (_streamChat owns streaming): force
         // it, because _buildPayload sets stream:true when global streaming is
         // on, and reading .choices[0] off a stream response throws -> null.
@@ -820,7 +827,7 @@ export class ProviderCore {
                 if (!pinned && (await this.rotateKey(err))) {
                     try {
                         const r2 = await (pinned ?? this._groq).chat.completions.create(payload)
-                        return r2.choices[0].message.content
+                        return r2?.choices?.[0]?.message?.content ?? null
                     } catch {
                         return null
                     }
@@ -893,6 +900,7 @@ export class ProviderCore {
         let full = ''
         let lastEdit = 0
         let lastShown = ''
+        let editChain = Promise.resolve()
         const t0 = Date.now()
         // Edit pace: 1/s. Discord rate-limits message edits aggressively, and
         // sub-second edits 429 silently (swallowed .catch) leaving the stream
@@ -956,7 +964,9 @@ export class ProviderCore {
                     ) {
                         lastShown = shown
                         lastEdit = now
-                        placeholder.edit(shown + ' ▌').catch(() => {})
+                        editChain = editChain
+                            .then(() => placeholder.edit(shown + ' ▌'))
+                            .catch(() => {})
                     }
                 }
                 // No early break past MAX_LEN: edits stop (gate above) but the
@@ -966,22 +976,34 @@ export class ProviderCore {
                 // (and drop any RUN_CMD tag the model emitted late).
             }
             if (placeholder) {
+                await editChain
                 const finalText = this.finalSecurityCheck(this._stripPartialTags(full).slice(0, 2000))
-                if (finalText.trim()) placeholder.edit(finalText).catch(() => {})
-                else placeholder.delete().catch(() => {})
+                if (finalText.trim()) await placeholder.edit(finalText).catch(() => {})
+                else await placeholder.delete().catch(() => {})
             }
             return full || null
         } catch (e) {
             console.warn('[AI] stream failed, falling back to non-stream:', String(e).slice(0, 160))
             // Feed the failure back into routing state so the next turn doesn't
-            // repeat it: rotate on key errors, trip the breaker otherwise
-            // (request errors like 400/404 are the caller's fault, not the key's).
+            // repeat it: check billing before key errors, rotate on key errors,
+            // trip the breaker otherwise (request errors like 400/404 are the
+            // caller's fault, not the key's).
+            const isBilling = this._isBillingError(e)
             if (routerP) {
-                if (this._isKeyError(e))
+                if (isBilling) {
+                    routerP.state.openUntil = Date.now() + 5 * 60_000
+                    routerP.state.failures = 0
+                    console.warn(
+                        `[AI] Provider '${routerP.name}' billing-blocked during stream (keys untouched): ${String(e?.message ?? e).slice(0, 160)}`,
+                    )
+                } else if (this._isKeyError(e)) {
                     this._rotateProviderKey(routerP, this._parseRetryMs(e), 'stream open', e)
-                else if (!this._isRequestError(e)) this._tripBreaker(routerP, e)
+                } else if (!this._isRequestError(e)) {
+                    this._tripBreaker(routerP, e)
+                }
             }
             try {
+                await editChain
                 const s = stubP ? await stubP : placeholder
                 await s?.delete?.().catch(() => {})
                 // Don't let the caller resurrect it: the streamed branch would
@@ -995,7 +1017,11 @@ export class ProviderCore {
             // re-hitting the corpse for another 25s inside a fresh 30s budget.
             const budget = {
                 until: Date.now() + 15_000,
-                dead: new Set(this._isKeyError(e) || this._isRequestError(e) ? [] : [this._agentBase(agent)]),
+                dead: new Set(
+                    !isBilling && (this._isKeyError(e) || this._isRequestError(e))
+                        ? []
+                        : [this._agentBase(agent)],
+                ),
             }
             return this._groqCallWithFallbacks(messages, model, maxTokens, temp, undefined, agent, budget)
         }
@@ -1014,12 +1040,7 @@ export class ProviderCore {
             try {
                 this._fallbackClients.set(
                     id,
-                    new OpenAI({
-                        apiKey: entry.keys[0],
-                        baseURL: entry.baseUrl,
-                        timeout: 12_000,
-                        maxRetries: 0,
-                    }),
+                    this._createOpenAIClient(entry.baseUrl, entry.keys[0], 12_000, 0),
                 )
             } catch {
                 return null

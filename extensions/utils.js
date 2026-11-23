@@ -14,31 +14,51 @@ export function guildBlockedReason(client, guild) {
     return null
 }
 
-// Force reply-style responses on this interaction ephemeral (reply/edit/
-// followUp/defer), merging with existing flags. For blocked servers:
-// nothing the bot says there is publicly visible. Idempotent per
-// interaction. `update` is excluded (button updates reject unknown fields).
+// Force reply-style responses on this interaction ephemeral (reply/followUp/
+// deferReply), merging with existing flags without mutating caller options.
+// For blocked servers: nothing the bot says there is publicly visible.
+// Idempotent per interaction. `editReply` and `update` are excluded (they
+// inherit the original ephemerality and reject MessageFlags.Ephemeral).
 export function forceEphemeral(interaction) {
     if (!interaction || interaction._forceEph) return
     interaction._forceEph = true
-    for (const m of ['reply', 'editReply', 'followUp', 'deferReply']) {
+    for (const m of ['reply', 'followUp', 'deferReply']) {
         const orig = interaction[m]?.bind(interaction)
         if (!orig) continue
         interaction[m] = (opts, ...rest) => {
-            if (typeof opts === 'string') opts = { content: opts }
-            if (opts && typeof opts === 'object') {
-                if (Array.isArray(opts.flags)) {
-                    if (!opts.flags.includes(MessageFlags.Ephemeral))
-                        opts.flags = [...opts.flags, MessageFlags.Ephemeral]
-                } else opts.flags = (opts.flags ?? 0) | MessageFlags.Ephemeral
+            let next
+            if (opts === undefined || opts === null) {
+                next = { flags: MessageFlags.Ephemeral }
+            } else if (typeof opts === 'string') {
+                next = { content: opts, flags: MessageFlags.Ephemeral }
+            } else if (typeof opts === 'object') {
+                next = { ...opts }
+                if (Array.isArray(next.flags)) {
+                    if (!next.flags.includes(MessageFlags.Ephemeral))
+                        next.flags = [...next.flags, MessageFlags.Ephemeral]
+                } else {
+                    next.flags = (next.flags ?? 0) | MessageFlags.Ephemeral
+                }
+            } else {
+                next = opts
             }
-            return orig(opts, ...rest)
+            return orig(next, ...rest)
         }
     }
 }
+
 export async function resolveTarget(ctx, args, fetchUser = false, allowSelfFallback = true) {
     const isMsg = ctx.content !== undefined
-    if (!isMsg) return ctx.options?.getMember?.('user') || ctx.member
+    if (!isMsg) {
+        const picked =
+            ctx.options?.getMember?.('member') ||
+            ctx.options?.getMember?.('user') ||
+            ctx.options?.getUser?.('member') ||
+            ctx.options?.getUser?.('user')
+        if (picked) return fetchUser && picked.user ? picked.user : picked
+        if (!allowSelfFallback) return null
+        return fetchUser ? ctx.user : (ctx.member ?? ctx.user)
+    }
 
     if (args && args.length > 0) {
         const id = args[0].replace(/[<@!>]/g, '')
@@ -61,13 +81,14 @@ export async function resolveTarget(ctx, args, fetchUser = false, allowSelfFallb
 export function parseTime(str) {
     const m = str?.match(/^(\d+)([smhd])$/)
     if (!m) return { delta: null, error: '❌ Invalid format. Use `10m`, `2h`, `1d`, max `28d`.' }
-    const secs = parseInt(m[1]) * TIME_UNITS[m[2]]
+    const secs = parseInt(m[1], 10) * TIME_UNITS[m[2]]
+    if (secs <= 0) return { delta: null, error: '❌ Duration must be greater than `0s`.' }
     if (secs > MAX_SECONDS) return { delta: null, error: '❌ Max mute duration is `28d`.' }
     return { delta: secs * 1000, error: null }
 }
 
 export function formatDuration(ms) {
-    const s = Math.floor(ms / 1000)
+    const s = Math.max(0, Math.floor(ms / 1000))
     if (s >= 2592000) return `${Math.floor(s / 2592000)}mo`
     if (s >= 604800) return `${Math.floor(s / 604800)}w`
     if (s >= 86400) return `${Math.floor(s / 86400)}d`

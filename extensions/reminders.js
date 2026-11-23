@@ -1,12 +1,12 @@
 // extensions/reminders.js, persistent reminders that survive restarts.
 //
-// Reminders live in SQLite, not in setTimeout: a 20s poll tick fires anything
+// Reminders live in SQLite, not in setTimeout: a 15s poll tick fires anything
 // due, and on boot anything that came due while the bot was offline fires
 // immediately with a "sorry I'm late" note. Commands are registered on
 // client.commands, so they work both as prefix commands (med, remind ...) and
 // as AI-dispatched <<RUN_CMD: remind ...>> actions with zero extra wiring.
 import { loadConfig } from './config.js'
-import { ActionRowBuilder, ButtonBuilder, ButtonStyle, ComponentType, EmbedBuilder } from 'discord.js'
+import { ActionRowBuilder, ButtonBuilder, ButtonStyle, ComponentType, EmbedBuilder, MessageFlags } from 'discord.js'
 
 const TICK_MS = 15_000
 const MAX_PER_USER = 25
@@ -25,7 +25,18 @@ export function parseDuration(str) {
 // HH:MM optional, UTC). Returns {spec, nextAt} or null. Intervals floor at
 // 5 minutes (anti-spam); weekly needs a weekday name.
 const WEEKDAYS = { sunday: 0, monday: 1, tuesday: 2, wednesday: 3, thursday: 4, friday: 5, saturday: 6 }
+const WEEKLY_RE = /^(sunday|monday|tuesday|wednesday|thursday|friday|saturday)(?:\s+(\d{1,2})(?::?(\d{2}))?)?$/
 const MIN_RECUR_MS = 5 * 60_000
+
+function nextWeeklyTimestamp(dayName, hh, mm, from) {
+    const base = new Date(from)
+    const d = new Date(Date.UTC(base.getUTCFullYear(), base.getUTCMonth(), base.getUTCDate(), hh, mm))
+    let delta = (WEEKDAYS[dayName] - d.getUTCDay() + 7) % 7
+    if (delta === 0 && d.getTime() <= from) delta = 7
+    d.setUTCDate(d.getUTCDate() + delta)
+    return d.getTime()
+}
+
 export function parseEvery(s) {
     const t = String(s ?? '')
         .trim()
@@ -35,38 +46,30 @@ export function parseEvery(s) {
         if (iv < MIN_RECUR_MS) return { error: 'shortest repeat is every 5 minutes' }
         return { spec: `every ${t}`, nextAt: Date.now() + iv }
     }
-    const m = /^(sunday|monday|tuesday|wednesday|thursday|friday|saturday)\s*(\d{1,2}):?(\d{2})?$/.exec(t)
+    const m = WEEKLY_RE.exec(t)
     if (m) {
         const hh = Math.min(23, Number(m[2] ?? '9'))
         const mm = Math.min(59, Number(m[3] ?? '0'))
-        const now = new Date()
-        const d = new Date(Date.UTC(now.getUTCFullYear(), now.getUTCMonth(), now.getUTCDate(), hh, mm))
-        let delta = (WEEKDAYS[m[1]] - d.getUTCDay() + 7) % 7
-        if (delta === 0 && d.getTime() <= Date.now()) delta = 7
-        d.setUTCDate(d.getUTCDate() + delta)
         return {
             spec: `every ${m[1]} ${String(hh).padStart(2, '0')}:${String(mm).padStart(2, '0')}`,
-            nextAt: d.getTime(),
+            nextAt: nextWeeklyTimestamp(m[1], hh, mm, Date.now()),
         }
     }
     return null
 }
 
 export function nextRecur(spec, from = Date.now()) {
-    const t = String(spec ?? '').replace(/^every\s+/, '')
+    const t = String(spec ?? '')
+        .trim()
+        .toLowerCase()
+        .replace(/^every\s+/, '')
     const iv = parseDuration(t)
     if (iv && iv >= MIN_RECUR_MS) return from + iv
-    const m = /^(sunday|monday|tuesday|wednesday|thursday|friday|saturday)\s*(\d{1,2}):?(\d{2})?$/.exec(t)
+    const m = WEEKLY_RE.exec(t)
     if (m) {
-        const p = parseEvery(t)
-        if (p?.nextAt && p.nextAt > from) return p.nextAt
-        // Same weekday next week (parseEvery anchors on now, so recompute anyway).
         const hh = Math.min(23, Number(m[2] ?? '9'))
         const mm = Math.min(59, Number(m[3] ?? '0'))
-        const base = new Date(from)
-        const d = new Date(Date.UTC(base.getUTCFullYear(), base.getUTCMonth(), base.getUTCDate(), hh, mm))
-        d.setUTCDate(d.getUTCDate() + 7)
-        return d.getTime()
+        return nextWeeklyTimestamp(m[1], hh, mm, from)
     }
     return null
 }
@@ -80,7 +83,8 @@ export function parseWhen(str) {
     if (rel) return rel
     const s = String(str ?? '').trim()
     if (!/^\d{4}-\d{2}-\d{2}(T\d{2}:\d{2}(:\d{2})?)?$/.test(s)) return null
-    const d = new Date(s)
+    const normalized = s.includes('T') ? s : `${s}T00:00:00`
+    const d = new Date(normalized)
     if (isNaN(d.getTime())) return null
     const delta = d.getTime() - Date.now()
     return delta > 0 ? delta : null
@@ -153,12 +157,18 @@ export async function init(client, db) {
             'INSERT INTO reminders (user_id, guild_id, channel_id, message, due_at, created_at, recur, runs) VALUES (?, ?, ?, ?, ?, ?, ?, 0)',
         ),
         due: db.prepare('SELECT * FROM reminders WHERE due_at <= ? ORDER BY due_at LIMIT 10'),
+        nextDue: db.prepare('SELECT MIN(due_at) AS next FROM reminders'),
         byUser: db.prepare('SELECT * FROM reminders WHERE user_id = ? ORDER BY due_at'),
         countUser: db.prepare('SELECT COUNT(*) AS n FROM reminders WHERE user_id = ?'),
         countRecur: db.prepare('SELECT COUNT(*) AS n FROM reminders WHERE user_id = ? AND recur IS NOT NULL'),
         byId: db.prepare('SELECT * FROM reminders WHERE id = ?'),
         del: db.prepare('DELETE FROM reminders WHERE id = ?'),
         resched: db.prepare('UPDATE reminders SET due_at = ?, runs = runs + 1 WHERE id = ?'),
+    }
+
+    let nextDueAt = q.nextDue.get()?.next ?? Infinity
+    const refreshNextDue = () => {
+        nextDueAt = q.nextDue.get()?.next ?? Infinity
     }
 
     async function fire(row) {
@@ -181,7 +191,9 @@ export async function init(client, db) {
     // Delete-before-send: a crash mid-delivery beats a double-fire loop.
     // Recurring rows reschedule instead of dying (capped at MAX_RUNS).
     setInterval(async () => {
-        for (const row of q.due.all(Date.now())) {
+        const now = Date.now()
+        if (now < nextDueAt) return
+        for (const row of q.due.all(now)) {
             if (row.recur) {
                 const next = nextRecur(row.recur)
                 const runs = (row.runs ?? 0) + 1
@@ -195,6 +207,7 @@ export async function init(client, db) {
             }
             await fire(row)
         }
+        refreshNextDue()
     }, TICK_MS).unref()
 
     const create = ({ userId, guildId, channelId, message, dueAt, recur = null }) => {
@@ -219,6 +232,7 @@ export async function init(client, db) {
             Date.now(),
             recur,
         )
+        if (dueAt < nextDueAt) nextDueAt = dueAt
         return { id: info.lastInsertRowid, dueAt, recur }
     }
     client.reminders = { create, list: (uid) => q.byUser.all(uid), fire }
@@ -244,26 +258,23 @@ export async function init(client, db) {
             )
             if (chan) {
                 targetChannelId = chan.id
+                args = args.slice(1)
             }
-            // Resolved or not, the token is consumed: an unknown #name falls
-            // back to the origin channel instead of usage-erroring.
-            args = args.slice(1)
         }
         // Optional repeat: `remind every 1d text` or `remind every friday 17:00 text`
         // (weekly time is UTC). Must come after channel parsing, before duration.
         let recurSpec = null
         let dueAt = null
         if ((args[0] ?? '').toLowerCase() === 'every') {
-            // Try interval first (`every 1d`), then weekly (`every friday 17:00`).
-            let parsed = parseEvery(args[1] ?? '')
+            // Try two-token weekly with time first (`every friday 17:00`), then single-token (`every 1d` or `every friday`).
+            let parsed = null
             let consumed = 1
-            if (!parsed || parsed.error) {
-                const two = `${args[1] ?? ''} ${args[2] ?? ''}`.trim()
-                const weekly = parseEvery(two)
-                if (weekly && !weekly.error) {
-                    parsed = weekly
-                    consumed = 2
-                }
+            const two = `${args[1] ?? ''} ${args[2] ?? ''}`.trim().toLowerCase()
+            if (args[2] && WEEKLY_RE.test(two)) {
+                parsed = parseEvery(two)
+                consumed = 2
+            } else {
+                parsed = parseEvery(args[1] ?? '')
             }
             if (!parsed) {
                 return msg.reply({
@@ -366,6 +377,7 @@ export async function init(client, db) {
                     return
                 }
                 q.del.run(target.id)
+                refreshNextDue()
                 await i
                     .update({
                         content: `⏰ Reminder **#${target.id}** cancelled.`,
@@ -394,6 +406,7 @@ export async function init(client, db) {
                 allowedMentions: { parse: [] },
             })
         q.del.run(row.id)
+        refreshNextDue()
         await msg.reply({ content: `⏰ Reminder **#${row.id}** cancelled.`, allowedMentions: { parse: [] } })
     })
 

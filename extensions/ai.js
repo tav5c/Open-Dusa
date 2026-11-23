@@ -3,15 +3,17 @@
 // this file wires it into the client and owns slash/prefix registration.
 import {
     ActionRowBuilder,
+    ApplicationIntegrationType,
     ButtonBuilder,
     ButtonStyle,
     ComponentType,
     EmbedBuilder,
+    InteractionContextType,
     MessageFlags,
     PermissionFlagsBits,
     SlashCommandBuilder,
 } from 'discord.js'
-import { existsSync, readdirSync, statSync } from 'fs'
+import { existsSync, readdirSync, statSync, writeFileSync } from 'fs'
 import { join } from 'path'
 import { loadPerformance } from './performance.js'
 import { readConfigRaw, saveRuntime, setConfigGuild, writeConfigRaw, probeDeadKeys } from './config.js'
@@ -175,6 +177,9 @@ export async function registerAI(client, db, config) {
                     }
                 }
             }
+            try {
+                writeFileSync(sentinel, new Date().toISOString())
+            } catch {}
         }
     } catch (e) {
         console.warn('[AI] Folder migration scan failed:', e.message)
@@ -220,37 +225,41 @@ export async function registerAI(client, db, config) {
         ai.triggeredMsgs?.delete?.(msg.id)
     })
 
-    client.on('messageCreate', (msg) => {
-        if (msg.author.bot) return
-        if (ai.debugMode) return // debug mode: no passive buffering anywhere
-        if (ai.isMemOff(msg.author.id)) return // memory-off: leave no room-context trace
-        if (!msg.guild) return
-        if (!msg.content?.trim()) return
-        if (msg.content.length < 3) return
-        if (containsDisallowedHate(msg.content)) return
-        const everyonePerms = msg.channel.permissionsFor(msg.guild.roles.everyone)
-        if (!everyonePerms?.has('ViewChannel')) return
+    const invalidateGuildCache = (gid) => {
+        for (const k of ai.userCache?.keys?.() ?? []) {
+            if (k.includes(`_${gid}_`) || k.endsWith(`_${gid}`)) ai.userCache.delete(k)
+        }
+    }
 
-        if (ai.allowedGuilds.size && !ai.allowedGuilds.has(msg.guild.id)) return
-        if (ai.pausedGuilds.has(msg.guild.id)) return // paused: no room context accrues either
+    client.on('messageCreate', (msg) => {
+        if (msg.author.bot || !msg.guild || ai.debugMode) return
+        const gid = msg.guild.id
+        if (ai.pausedGuilds.has(gid)) return // paused: no room context accrues either
+        if (ai.allowedGuilds.size && !ai.allowedGuilds.has(gid)) return
+        const rawContent = msg.content
+        if (!rawContent || rawContent.length < 3 || !rawContent.trim()) return
+        if (ai.isMemOff(msg.author.id)) return // memory-off: leave no room-context trace
+        const everyonePerms = msg.channel.permissionsFor(msg.guild.roles.everyone)
+        if (!everyonePerms?.has(PermissionFlagsBits.ViewChannel)) return
+        if (containsDisallowedHate(rawContent)) return
 
         const entry = {
             userId: msg.author.id,
             displayName: msg.member?.displayName ?? msg.author.username,
-            content: msg.content.slice(0, 200),
+            content: rawContent.slice(0, 200),
             ts: Date.now(),
         }
         let buf = _passiveBuf.get(msg.channel.id)
         if (!buf) {
             if (_passiveBuf.size >= _PASSIVE_CHANNELS_MAX) {
                 const firstKey = _passiveBuf.keys().next().value
-                if (firstKey) _passiveBuf.delete(firstKey)
+                if (firstKey !== undefined) _passiveBuf.delete(firstKey)
             }
             buf = []
             _passiveBuf.set(msg.channel.id, buf)
         }
+        if (buf.length >= _PASSIVE_MAX) buf.splice(0, buf.length - _PASSIVE_MAX + 1)
         buf.push(entry)
-        if (buf.length > _PASSIVE_MAX) buf.shift()
     })
 
     // Auto-extract server lore every 30 min, throttled to once per 2h per guild
@@ -259,6 +268,9 @@ export async function registerAI(client, db, config) {
         const now = Date.now()
         const staleTime = now - 3600_000 // 1h stale
         const minGap = 2 * 3600_000 // 2h per-guild throttle
+        for (const [gid, ts] of _loreExtractedAt) {
+            if (now - ts >= minGap || !client.guilds.cache.has(gid)) _loreExtractedAt.delete(gid)
+        }
         for (const [channelId, buf] of _passiveBuf) {
             if (!buf.length || buf[buf.length - 1].ts < staleTime) {
                 _passiveBuf.delete(channelId)
@@ -270,6 +282,10 @@ export async function registerAI(client, db, config) {
             if (ai.pausedGuilds.has(ch.guild.id)) continue
             const last = _loreExtractedAt.get(ch.guild.id) ?? 0
             if (now - last < minGap) continue
+            if (_loreExtractedAt.size >= 500) {
+                const oldest = _loreExtractedAt.keys().next().value
+                if (oldest !== undefined) _loreExtractedAt.delete(oldest)
+            }
             _loreExtractedAt.set(ch.guild.id, now)
             try {
                 ai.getMem(ch.guild).autoExtractLore(buf)
@@ -456,7 +472,13 @@ export async function registerAI(client, db, config) {
                     return interaction.editReply({ content: '✗ All providers failed. Try again shortly.' })
                 if (!memOff) {
                     try {
-                        mem.updateUser(uid, interaction.user.username, interaction.user.username)
+                        mem.updateUser(
+                            uid,
+                            interaction.user.username,
+                            interaction.member?.displayName ??
+                                interaction.user.displayName ??
+                                interaction.user.username,
+                        )
                         const chId = interaction.channel?.id ?? 'ask'
                         mem.addConversation(uid, chId, prompt.slice(0, 2000), String(response).slice(0, 2000))
                     } catch {}
@@ -991,8 +1013,7 @@ export async function registerAI(client, db, config) {
                 if (ai.serverPrompts[gid]) {
                     delete ai.serverPrompts[gid]
                     ai._scheduleUsersSave()
-                    for (const k of ai.userCache?.keys?.() ?? [])
-                        if (k.endsWith(`_${gid}`)) ai.userCache.delete(k)
+                    invalidateGuildCache(gid)
                     return interaction.reply({
                         content: '✅ Server persona reset to default.',
                         flags: MessageFlags.Ephemeral,
@@ -1018,7 +1039,7 @@ export async function registerAI(client, db, config) {
             }
             ai.serverPrompts[gid] = system.slice(0, 2000)
             ai._scheduleUsersSave()
-            for (const k of ai.userCache?.keys?.() ?? []) if (k.endsWith(`_${gid}`)) ai.userCache.delete(k)
+            invalidateGuildCache(gid)
             return interaction.reply({
                 content: `✅ Server persona set for **${interaction.guild.name}**.`,
                 flags: MessageFlags.Ephemeral,
@@ -1079,13 +1100,16 @@ export async function registerAI(client, db, config) {
         if (commandName === 'debug') {
             ai.debugMode = !ai.debugMode
             globalThis._medusaDebug = ai.debugMode
+            try {
+                ai._debugMem?.db?.close?.()
+            } catch {}
+            ai._debugMem = null
             if (ai.debugMode) {
                 // Fresh scratch state per session: prod DBs stay untouched.
                 try {
                     const { rmSync } = await import('fs')
                     rmSync('data/ai/debug - debug', { recursive: true, force: true })
                 } catch {}
-                ai._debugMem = null
             }
             try {
                 const raw = readConfigRaw()
@@ -1127,6 +1151,9 @@ export async function registerAI(client, db, config) {
                 })
             }
             ai.isolatedServers.delete(guild.id)
+            try {
+                ai.isolatedMems.get(guild.id)?.db?.close?.()
+            } catch {}
             ai.isolatedMems.delete(guild.id)
             saveRuntime({ isolatedGuilds: [...ai.isolatedServers] })
             return interaction.reply({
@@ -1141,8 +1168,9 @@ export async function registerAI(client, db, config) {
                 if (client.channels.cache.has(id)) return true
                 return !!(await client.channels.fetch(id).catch(() => null))
             }
+            let raw = null
             try {
-                const raw = readConfigRaw()
+                raw = readConfigRaw()
                 if (raw.guilds && typeof raw.guilds === 'object' && !Array.isArray(raw.guilds)) {
                     for (const id of Object.keys(raw.guilds)) {
                         if (!client.guilds.cache.has(String(id))) {
@@ -1213,6 +1241,9 @@ export async function registerAI(client, db, config) {
             const staleIso = [...ai.isolatedServers].filter((id) => !client.guilds.cache.has(id))
             for (const id of staleIso) {
                 ai.isolatedServers.delete(id)
+                try {
+                    ai.isolatedMems.get(id)?.db?.close?.()
+                } catch {}
                 ai.isolatedMems.delete(id)
                 removed.push(`isolation \`${id}\``)
             }
@@ -1224,7 +1255,7 @@ export async function registerAI(client, db, config) {
             let deadKeys = []
             let probedKeys = 0
             try {
-                const probed = await probeDeadKeys(raw.providers)
+                const probed = await probeDeadKeys(raw?.providers)
                 deadKeys = probed.dead
                 probedKeys = probed.probed
             } catch {}
@@ -1266,8 +1297,9 @@ export async function registerAI(client, db, config) {
                 )
             return msg.reply(safetyRefusal(text))
         }
-        ai.customPrompts[uid] = text
+        ai.customPrompts[uid] = text.slice(0, 2000)
         ai._scheduleUsersSave()
+        ai._invalidateUserCache?.(uid)
         const modeNote =
             ai.userModes[uid] === 1
                 ? ` (focused mode stays on and styles it)`
@@ -1279,7 +1311,6 @@ export async function registerAI(client, db, config) {
         await msg.reply(`✅ Custom prompt set for ${msg.author.displayName}${modeNote}`)
     })
     client.commands.set('prompt', client.commands.get('p'))
-    client.commands.set('promptreset', client.commands.get('pr'))
     client.commands.set('pr', async (msg) => {
         const uid = String(msg.author.id)
         if (ai.customPrompts[uid]) {
@@ -1289,13 +1320,14 @@ export async function registerAI(client, db, config) {
             await msg.reply(`✅ Prompt reset to default for ${msg.author.displayName}`)
         } else await msg.reply("You don't have a custom prompt set.")
     })
+    client.commands.set('promptreset', client.commands.get('pr'))
     client.commands.set('serverp', async (msg, args) => {
         if (!msg.guild) return msg.reply('Server personas only work in a server.')
         const canManage =
             String(msg.author.id) === String(config.ownerId) ||
             msg.member?.permissions?.has(PermissionFlagsBits.ManageGuild)
         if (!canManage) return msg.reply('You need **Manage Server** to change the server persona.')
-        const text = args.join(' ')
+        const text = args.join(' ').trim()
         if (!text) {
             const cur = ai.serverPrompts[msg.guild.id]
             return msg.reply(cur ? `Current server persona: ${cur.slice(0, 600)}` : 'No server persona set.')
@@ -1311,8 +1343,9 @@ export async function registerAI(client, db, config) {
             )
             return msg.reply(safetyRefusal(text))
         }
-        ai.serverPrompts[msg.guild.id] = text
+        ai.serverPrompts[msg.guild.id] = text.slice(0, 2000)
         ai._scheduleUsersSave()
+        invalidateGuildCache(msg.guild.id)
         await msg.reply(`✅ Server persona set for ${msg.guild.name}`)
     })
     client.commands.set('serverpr', async (msg) => {
@@ -1324,6 +1357,7 @@ export async function registerAI(client, db, config) {
         if (!ai.serverPrompts[msg.guild.id]) return msg.reply('This server has no custom persona.')
         delete ai.serverPrompts[msg.guild.id]
         ai._scheduleUsersSave()
+        invalidateGuildCache(msg.guild.id)
         await msg.reply('✅ Server persona reset to default')
     })
     client.commands.set('serverprompt', client.commands.get('serverp'))
@@ -1484,7 +1518,7 @@ export function buildAISlashCommands() {
         new SlashCommandBuilder()
             .setName('memory')
             .setDescription('Peek at what Medusa remembers — or turn memory On/Off for you')
-            .setContexts(0)
+            .setContexts(InteractionContextType.Guild)
             .addStringOption((o) =>
                 o
                     .setName('mode')
@@ -1493,11 +1527,11 @@ export function buildAISlashCommands() {
             ),
         new SlashCommandBuilder()
             .setName('forgetme')
-            .setContexts(0)
+            .setContexts(InteractionContextType.Guild)
             .setDescription('Delete everything Medusa remembers about you'),
         new SlashCommandBuilder()
             .setName('prompt')
-            .setContexts(0)
+            .setContexts(InteractionContextType.Guild)
             .setDescription('Set, view, or reset your custom persona')
             .addStringOption((o) =>
                 o.setName('system').setDescription('Your custom persona/instructions (omit to view current)'),
@@ -1510,7 +1544,7 @@ export function buildAISlashCommands() {
             ),
         new SlashCommandBuilder()
             .setName('server-prompt')
-            .setContexts(0)
+            .setContexts(InteractionContextType.Guild)
             .setDescription('Set, view, or reset this server persona (Manage Server)')
             .addStringOption((o) =>
                 o.setName('system').setDescription('Server persona/instructions (omit to view current)'),
@@ -1523,7 +1557,7 @@ export function buildAISlashCommands() {
             ),
         new SlashCommandBuilder()
             .setName('mode')
-            .setContexts(0, 1, 2)
+            .setContexts(InteractionContextType.Guild, InteractionContextType.BotDM, InteractionContextType.PrivateChannel)
             .setDescription('Switch between focused/normal/fast/auto AI mode')
             .addStringOption((o) =>
                 o
@@ -1538,7 +1572,7 @@ export function buildAISlashCommands() {
             ),
         new SlashCommandBuilder()
             .setName('streaming')
-            .setContexts(0)
+            .setContexts(InteractionContextType.Guild)
             .setDescription('Pick instant replies or fancy streaming text (just for you)')
             .addStringOption((o) =>
                 o
@@ -1548,7 +1582,7 @@ export function buildAISlashCommands() {
             ),
         new SlashCommandBuilder()
             .setName('billing')
-            .setContexts(0)
+            .setContexts(InteractionContextType.Guild)
             .setDescription('Show token usage footer on replies (just for you)')
             .addStringOption((o) =>
                 o
@@ -1560,14 +1594,14 @@ export function buildAISlashCommands() {
         new SlashCommandBuilder()
             .setName('recall')
             .setDescription('Look up what Medusa remembers about a member (only you see this)')
-            .setContexts(0)
+            .setContexts(InteractionContextType.Guild)
             .addStringOption((o) =>
                 o.setName('target').setDescription('Name, @mention, or user ID').setRequired(true),
             ),
         new SlashCommandBuilder()
             .setName('ai-pause')
             .setDescription('Pause or resume the AI in this server (admins)')
-            .setContexts(0)
+            .setContexts(InteractionContextType.Guild)
             .setDefaultMemberPermissions(PermissionFlagsBits.Administrator)
             .addStringOption((o) =>
                 o
@@ -1581,7 +1615,7 @@ export function buildAISlashCommands() {
         new SlashCommandBuilder()
             .setName('isolation')
             .setDescription('Give this server its own AI memory (owner)')
-            .setContexts(0)
+            .setContexts(InteractionContextType.Guild)
             .setDefaultMemberPermissions('0')
             .addStringOption((o) =>
                 o
@@ -1593,18 +1627,18 @@ export function buildAISlashCommands() {
         new SlashCommandBuilder()
             .setName('configclean')
             .setDescription('Sweep dead servers/channels/keys out of config (owner)')
-            .setContexts(0)
+            .setContexts(InteractionContextType.Guild)
             .setDefaultMemberPermissions('0'),
         new SlashCommandBuilder()
             .setName('debug')
             .setDescription('Toggle debug mode: owner-only replies, scratch DB, verbose logs (owner)')
-            .setContexts(0)
+            .setContexts(InteractionContextType.Guild)
             .setDefaultMemberPermissions('0'),
         new SlashCommandBuilder()
             .setName('summarize')
             .setDescription('Summarize recent conversation')
-            .setIntegrationTypes(0, 1)
-            .setContexts(0, 1, 2)
+            .setIntegrationTypes(ApplicationIntegrationType.GuildInstall, ApplicationIntegrationType.UserInstall)
+            .setContexts(InteractionContextType.Guild, InteractionContextType.BotDM, InteractionContextType.PrivateChannel)
             .addStringOption((o) =>
                 o.setName('start-from').setDescription('Message ID or link to start from'),
             )
@@ -1639,8 +1673,8 @@ export function buildAISlashCommands() {
             .setDescription(
                 'Ask Medusa one quick question, nothing gets remembered. DMs and group chats only.',
             )
-            .setIntegrationTypes(0, 1)
-            .setContexts(1, 2)
+            .setIntegrationTypes(ApplicationIntegrationType.GuildInstall, ApplicationIntegrationType.UserInstall)
+            .setContexts(InteractionContextType.BotDM, InteractionContextType.PrivateChannel)
             .addStringOption((o) =>
                 o
                     .setName('prompt')
@@ -1676,7 +1710,7 @@ export function buildAISlashCommands() {
             ),
         new SlashCommandBuilder()
             .setName('ask')
-            .setContexts(0)
+            .setContexts(InteractionContextType.Guild)
             .setDescription('Quick precise answer with light memory (server only, instant)')
             .addStringOption((o) =>
                 o

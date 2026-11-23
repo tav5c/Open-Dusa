@@ -56,13 +56,20 @@ const DEFAULTS = {
     },
 }
 
+const UNSAFE_KEYS = new Set(['__proto__', 'constructor', 'prototype'])
+
 function deepMerge(base, override) {
     if (!override || typeof override !== 'object') return base
     const out = { ...base }
     for (const [k, v] of Object.entries(override)) {
+        if (UNSAFE_KEYS.has(k)) continue
         if (v === null || v === undefined) continue
         if (v && typeof v === 'object' && !Array.isArray(v)) {
-            out[k] = deepMerge(base[k] ?? {}, v)
+            const baseVal =
+                Object.prototype.hasOwnProperty.call(base, k) && base[k] && typeof base[k] === 'object'
+                    ? base[k]
+                    : {}
+            out[k] = deepMerge(baseVal, v)
         } else {
             out[k] = v
         }

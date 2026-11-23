@@ -5,6 +5,7 @@ import { mkdir, writeFile } from 'fs/promises'
 import { dirname, join } from 'path'
 import { loadPerformance } from '../performance.js'
 import { containsDisallowedHate } from './safety.js'
+import { extractLoreCandidates } from './hot-kernels.js'
 
 const PERF = loadPerformance()
 
@@ -25,12 +26,108 @@ export function dateTag(ts, always = false) {
     }
 }
 
+// Hoisted static stopword set & personality patterns (avoid per-call allocations)
+const INTEREST_STOPWORDS = new Set([
+    'that',
+    'this',
+    'with',
+    'have',
+    'they',
+    'will',
+    'been',
+    'from',
+    'were',
+    'said',
+    'each',
+    'what',
+    'just',
+    'like',
+    'more',
+    'about',
+    'time',
+    'very',
+    'when',
+    'come',
+    'could',
+    'know',
+    'into',
+    'over',
+    'think',
+    'also',
+    'back',
+    'after',
+    'first',
+    'well',
+    'good',
+    'where',
+    'much',
+    'some',
+    'only',
+    'make',
+    'work',
+    'still',
+    'should',
+    'your',
+    'want',
+    'because',
+    'through',
+    'being',
+    'before',
+    'here',
+    'then',
+    'than',
+    'any',
+    'may',
+    'say',
+    'use',
+    'all',
+    'there',
+    'which',
+    'their',
+    'has',
+    'had',
+    'two',
+    'go',
+    'way',
+    'user',
+    'replying',
+    'message',
+    'channel',
+    'activity',
+    'recent',
+    'server',
+    'context',
+    'content',
+    'system',
+    'replyed',
+    'replied',
+    'response',
+])
+
+const PERSONALITY_PATTERNS = Object.entries({
+    direct: ['just', 'simply', 'exactly', 'straight up'],
+    analytical: ['because', 'therefore', 'analyze', 'consider'],
+    casual: ['lol', 'lmao', 'bruh', 'dude', 'nah', 'yeah', 'tbh'],
+    formal: ['please', 'thank you', 'would you kindly', 'appreciate'],
+    emotional: ['feel', 'love', 'hate', 'excited', 'frustrated'],
+    technical: ['function', 'algorithm', 'database', 'api', 'debug'],
+    creative: ['imagine', 'create', 'design', 'art', 'music'],
+    helpful: ['help', 'assist', 'support', 'guide', 'teach'],
+})
+
+const LORE_SIGNALS =
+    /\b(our thing|server rule|inside joke|we always|we call|everyone knows|classic|tradition|always happens|server lore)\b/i
+
 // No-op handle: every consumer already tolerates it (checked via `db._stub`
 // or try/catch), so a dead engine means "no persistence", never a crash.
 const stubDb = () => ({
-    prepare: () => ({ run: () => {}, get: () => null, all: () => [] }),
+    prepare: () => ({ run: () => {}, get: () => null, all: () => [], iterate: () => [][Symbol.iterator]() }),
     exec: () => {},
     pragma: () => {},
+    transaction:
+        (fn) =>
+        (...args) =>
+            fn(...args),
     close: () => {},
     _stub: true,
 })
@@ -49,6 +146,20 @@ class DBPool {
         if (!this._pool.has(path)) {
             mkdirSync(dirname(path) || '.', { recursive: true })
             const conn = globalThis._openDb ? globalThis._openDb(path) : new globalThis._sqlite3.default(path)
+            // Fresh-file pragmas MUST run BEFORE journal_mode = WAL and before
+            // any tables are created, otherwise SQLite ignores page_size / auto_vacuum.
+            try {
+                const existing =
+                    conn
+                        .prepare(
+                            "SELECT COUNT(*) AS n FROM sqlite_master WHERE type IN ('table','index','trigger') AND name NOT LIKE 'sqlite_%'",
+                        )
+                        .get()?.n ?? 1
+                if (existing === 0) {
+                    conn.pragma('page_size = 4096')
+                    conn.pragma('auto_vacuum = INCREMENTAL')
+                }
+            } catch {}
             // EXCLUSIVE locking avoids the need for a -shm file in WAL mode (fixes SQLITE_IOERR_SHMSIZE on cheap hosts)
             conn.pragma('locking_mode = EXCLUSIVE')
             try {
@@ -131,39 +242,67 @@ class AIMemoryManager {
         }
         this._interestsThrottle = new Map()
         this._personalityThrottle = new Map()
-        // Auto-vacuum: each DB compacts on its own schedule so no two files block each
-        // other. The boot delay keeps first-message latency clean; runtime-created
-        // isolated DBs pick this up automatically since it lives in the constructor.
-        setTimeout(() => this.vacuum(), 30_000).unref()
-        setInterval(() => this.vacuum(), (24 + Math.random() * 2) * 3600_000).unref()
+        this._lastVacuum = 0
+        // Incremental auto-vacuum: each DB compacts non-blockingly on its own schedule.
+        this._bootVacuumTimer = setTimeout(() => this.vacuum(), 30_000).unref()
+        this._dailyVacuumInterval = setInterval(
+            () => this.vacuum(),
+            (24 + Math.random() * 2) * 3600_000,
+        ).unref()
+    }
+
+    destroy() {
+        if (this._bootVacuumTimer) {
+            clearTimeout(this._bootVacuumTimer)
+            this._bootVacuumTimer = null
+        }
+        if (this._dailyVacuumInterval) {
+            clearInterval(this._dailyVacuumInterval)
+            this._dailyVacuumInterval = null
+        }
+        if (this._flushTimer) {
+            clearTimeout(this._flushTimer)
+            this._flushTimer = null
+            this._flushWrites()
+        }
+        globalThis._aiMemManagers?.delete?.(this)
+    }
+
+    close() {
+        this.destroy()
+    }
+
+    _flushWrites() {
+        const batch = this._writeQueue
+        if (!batch.length) return
+        this._writeQueue = []
+        const tx = this.db.transaction(() => {
+            for (const f of batch) {
+                try {
+                    f()
+                } catch (e) {
+                    console.error('[DB] deferred write error:', e)
+                }
+            }
+        })
+        try {
+            tx()
+        } catch (e) {
+            console.error('[DB] deferred batch transaction error:', e)
+        }
     }
 
     _deferWrite(fn) {
         this._writeQueue.push(fn)
         if (!this._flushTimer) {
             this._flushTimer = setTimeout(() => {
-                const batch = this._writeQueue
-                this._writeQueue = []
                 this._flushTimer = null
-                for (const f of batch) f()
+                this._flushWrites()
             }, 150)
         }
     }
 
     _initSchema() {
-        // Fresh-file pragmas first (no-ops on existing DBs by guard): tighter
-        // packing from byte zero instead of a later VACUUM migration.
-        try {
-            const existing =
-                this.db
-                    .prepare(
-                        "SELECT COUNT(*) AS n FROM sqlite_master WHERE type IN ('table','index','trigger') AND name NOT LIKE 'sqlite_%'",
-                    )
-                    .get()?.n ?? 1
-            if (existing === 0) {
-                this.db.exec('PRAGMA auto_vacuum = INCREMENTAL; PRAGMA page_size = 4096;')
-            }
-        } catch {}
         this.db.exec(`
             CREATE TABLE IF NOT EXISTS users (
                 user_id TEXT PRIMARY KEY, username TEXT, display_name TEXT, avatar_url TEXT,
@@ -202,11 +341,14 @@ class AIMemoryManager {
             );
             CREATE INDEX IF NOT EXISTS idx_conv_user ON conversations(user_id);
             CREATE INDEX IF NOT EXISTS idx_conv_time ON conversations(timestamp DESC);
+            CREATE INDEX IF NOT EXISTS idx_conv_user_time ON conversations(user_id, timestamp DESC);
+            CREATE INDEX IF NOT EXISTS idx_conv_chan_time ON conversations(channel_id, timestamp DESC);
+            CREATE INDEX IF NOT EXISTS idx_aliases_alias ON user_aliases(alias);
             CREATE INDEX IF NOT EXISTS idx_interests_user ON interests(user_id);
             CREATE INDEX IF NOT EXISTS idx_rel_user ON relationships(user_id);
             CREATE TABLE IF NOT EXISTS server_lore (
                 id INTEGER PRIMARY KEY AUTOINCREMENT,
-                fact TEXT NOT NULL,
+                fact TEXT NOT NULL UNIQUE,
                 source TEXT DEFAULT 'auto',
                 frequency INTEGER DEFAULT 1,
                 last_seen DATETIME DEFAULT CURRENT_TIMESTAMP,
@@ -219,7 +361,7 @@ class AIMemoryManager {
             );
             -- FTS5 mirror of conversations for real memory search (recall with
             -- keywords). Content-sync triggers keep it exact; backfilled below
-            -- for pre-existing rows exactly once (empty index + rows present).
+            -- via FTS5 rebuild when conversations_fts_docsize is empty.
             CREATE VIRTUAL TABLE IF NOT EXISTS conversations_fts USING fts5(
                 message_content, ai_response,
                 content='conversations', content_rowid='id'
@@ -232,17 +374,41 @@ class AIMemoryManager {
                 INSERT INTO conversations_fts(conversations_fts, rowid, message_content, ai_response)
                 VALUES ('delete', old.id, old.message_content, old.ai_response);
             END;
+            CREATE TRIGGER IF NOT EXISTS conv_fts_update AFTER UPDATE ON conversations BEGIN
+                INSERT INTO conversations_fts(conversations_fts, rowid, message_content, ai_response)
+                VALUES ('delete', old.id, old.message_content, old.ai_response);
+                INSERT INTO conversations_fts(rowid, message_content, ai_response)
+                VALUES (new.id, new.message_content, new.ai_response);
+            END;
         `)
-        // One-time backfill: triggers only cover new writes.
+
+        // Ensure UNIQUE index on server_lore(fact) for pre-existing tables without UNIQUE constraint
         try {
-            const ftsCount = this.db.prepare('SELECT COUNT(*) AS n FROM conversations_fts').get()?.n ?? 1
+            this.db.exec('CREATE UNIQUE INDEX IF NOT EXISTS idx_lore_fact ON server_lore(fact)')
+        } catch {
+            try {
+                // Deduplicate existing rows keeping highest frequency/newest, then create unique index
+                this.db.exec(`
+                    DELETE FROM server_lore WHERE id NOT IN (
+                        SELECT id FROM (
+                            SELECT id, ROW_NUMBER() OVER (PARTITION BY fact ORDER BY frequency DESC, last_seen DESC, id DESC) AS rn
+                            FROM server_lore
+                        ) WHERE rn = 1
+                    );
+                    CREATE UNIQUE INDEX IF NOT EXISTS idx_lore_fact ON server_lore(fact);
+                `)
+            } catch {}
+        }
+
+        // One-time FTS5 external-content backfill: COUNT(*) on an external-content
+        // FTS5 table queries the backing table, not the index! Inspect the shadow
+        // docsize table and run FTS5 'rebuild' if unindexed rows exist.
+        try {
+            const docsizeCount =
+                this.db.prepare('SELECT COUNT(*) AS n FROM conversations_fts_docsize').get()?.n ?? 1
             const convCount = this.db.prepare('SELECT COUNT(*) AS n FROM conversations').get()?.n ?? 0
-            if (ftsCount === 0 && convCount > 0) {
-                this.db
-                    .prepare(
-                        'INSERT INTO conversations_fts(rowid, message_content, ai_response) SELECT id, message_content, ai_response FROM conversations',
-                    )
-                    .run()
+            if (docsizeCount === 0 && convCount > 0) {
+                this.db.prepare("INSERT INTO conversations_fts(conversations_fts) VALUES('rebuild')").run()
             }
         } catch {}
 
@@ -251,10 +417,10 @@ class AIMemoryManager {
             this._stmts = {
                 updateUser: this.db.prepare(`
                     INSERT INTO users (user_id, username, display_name, conversation_count, last_interaction, updated_at)
-                    VALUES (?,?,?,COALESCE((SELECT conversation_count FROM users WHERE user_id=?),0)+1,CURRENT_TIMESTAMP,CURRENT_TIMESTAMP)
+                    VALUES (?,?,?,1,CURRENT_TIMESTAMP,CURRENT_TIMESTAMP)
                     ON CONFLICT(user_id) DO UPDATE SET
                         username=excluded.username, display_name=excluded.display_name,
-                        conversation_count=conversation_count+1,
+                        conversation_count=users.conversation_count+1,
                         last_interaction=CURRENT_TIMESTAMP, updated_at=CURRENT_TIMESTAMP
                 `),
                 addConversation: this.db.prepare(
@@ -262,8 +428,8 @@ class AIMemoryManager {
                 ),
                 upsertInterest: this.db.prepare(`
                     INSERT INTO interests (user_id, topic, frequency, last_mentioned)
-                    VALUES (?,?,COALESCE((SELECT frequency FROM interests WHERE user_id=? AND topic=?),0)+1,CURRENT_TIMESTAMP)
-                    ON CONFLICT(user_id, topic) DO UPDATE SET frequency=frequency+1, last_mentioned=CURRENT_TIMESTAMP
+                    VALUES (?,?,1,CURRENT_TIMESTAMP)
+                    ON CONFLICT(user_id, topic) DO UPDATE SET frequency=interests.frequency+1, last_mentioned=CURRENT_TIMESTAMP
                 `),
                 upsertPersonality: this.db.prepare(`
                     INSERT INTO personality (user_id, traits, updated_at) VALUES (?,?,CURRENT_TIMESTAMP)
@@ -271,8 +437,8 @@ class AIMemoryManager {
                 `),
                 upsertRelationship: this.db.prepare(`
                     INSERT INTO relationships (user_id, related_user_id, relationship_type, strength, last_interaction)
-                    VALUES (?,?,'interaction',COALESCE((SELECT strength FROM relationships WHERE user_id=? AND related_user_id=?),0)+1,CURRENT_TIMESTAMP)
-                    ON CONFLICT(user_id, related_user_id) DO UPDATE SET strength=strength+1, last_interaction=CURRENT_TIMESTAMP
+                    VALUES (?,?,'interaction',1,CURRENT_TIMESTAMP)
+                    ON CONFLICT(user_id, related_user_id) DO UPDATE SET strength=relationships.strength+1, last_interaction=CURRENT_TIMESTAMP
                 `),
                 getUser: this.db.prepare('SELECT * FROM users WHERE user_id=?'),
                 getHistory: this.db.prepare(
@@ -288,6 +454,35 @@ class AIMemoryManager {
                 getRelationships: this.db.prepare(
                     'SELECT related_user_id, strength FROM relationships WHERE user_id=? ORDER BY strength DESC LIMIT 3',
                 ),
+                getSummary: this.db.prepare('SELECT summary FROM user_summaries WHERE user_id=?'),
+                searchConvUser: this.db.prepare(
+                    `SELECT c.user_id, c.message_content, c.timestamp FROM conversations_fts f
+                     JOIN conversations c ON c.id = f.rowid
+                     WHERE conversations_fts MATCH ? AND c.user_id = ?
+                     ORDER BY c.id DESC LIMIT ?`,
+                ),
+                searchConvAll: this.db.prepare(
+                    `SELECT c.user_id, c.message_content, c.timestamp FROM conversations_fts f
+                     JOIN conversations c ON c.id = f.rowid
+                     WHERE conversations_fts MATCH ?
+                     ORDER BY c.id DESC LIMIT ?`,
+                ),
+                setAlias: this.db.prepare(
+                    'INSERT OR REPLACE INTO user_aliases (user_id, alias, set_by_user_id) VALUES (?,?,?)',
+                ),
+                getUserIdByAlias: this.db.prepare('SELECT user_id FROM user_aliases WHERE alias=?'),
+                getLore: this.db.prepare(
+                    'SELECT id, fact, source, frequency FROM server_lore ORDER BY frequency DESC, last_seen DESC LIMIT ?',
+                ),
+                getLoreByFact: this.db.prepare('SELECT id FROM server_lore WHERE fact=?'),
+                bumpLore: this.db.prepare(
+                    'UPDATE server_lore SET frequency=frequency+1, last_seen=CURRENT_TIMESTAMP WHERE id=?',
+                ),
+                countLore: this.db.prepare('SELECT COUNT(*) as c FROM server_lore'),
+                pruneOldestLore: this.db.prepare(
+                    'DELETE FROM server_lore WHERE id=(SELECT id FROM server_lore ORDER BY frequency ASC, last_seen ASC LIMIT 1)',
+                ),
+                insertLore: this.db.prepare('INSERT INTO server_lore (fact, source) VALUES (?,?)'),
             }
         }
     }
@@ -295,27 +490,42 @@ class AIMemoryManager {
     _purgeUnsafeMemory() {
         if (this.db._stub) return
         try {
+            const badConvIds = []
+            for (const row of this.db
+                .prepare('SELECT id, message_content, ai_response FROM conversations')
+                .iterate()) {
+                if (containsDisallowedHate(row.message_content) || containsDisallowedHate(row.ai_response)) {
+                    badConvIds.push(row.id)
+                }
+            }
+            const badLoreIds = []
+            for (const row of this.db.prepare('SELECT id, fact FROM server_lore').iterate()) {
+                if (containsDisallowedHate(row.fact)) badLoreIds.push(row.id)
+            }
+            const badPersIds = []
+            for (const row of this.db
+                .prepare('SELECT user_id, traits, preferences, communication_style FROM personality')
+                .iterate()) {
+                if (
+                    containsDisallowedHate([row.traits, row.preferences, row.communication_style].join(' '))
+                ) {
+                    badPersIds.push(row.user_id)
+                }
+            }
+            if (!badConvIds.length && !badLoreIds.length && !badPersIds.length) return
             const tx = this.db.transaction(() => {
-                for (const row of this.db
-                    .prepare('SELECT id, message_content, ai_response FROM conversations')
-                    .iterate())
-                    if (
-                        containsDisallowedHate(row.message_content) ||
-                        containsDisallowedHate(row.ai_response)
-                    )
-                        this.db.prepare('DELETE FROM conversations WHERE id=?').run(row.id)
-                for (const row of this.db.prepare('SELECT id, fact FROM server_lore').iterate())
-                    if (containsDisallowedHate(row.fact))
-                        this.db.prepare('DELETE FROM server_lore WHERE id=?').run(row.id)
-                for (const row of this.db
-                    .prepare('SELECT user_id, traits, preferences, communication_style FROM personality')
-                    .iterate())
-                    if (
-                        containsDisallowedHate(
-                            [row.traits, row.preferences, row.communication_style].join(' '),
-                        )
-                    )
-                        this.db.prepare('DELETE FROM personality WHERE user_id=?').run(row.user_id)
+                if (badConvIds.length) {
+                    const delConv = this.db.prepare('DELETE FROM conversations WHERE id=?')
+                    for (const id of badConvIds) delConv.run(id)
+                }
+                if (badLoreIds.length) {
+                    const delLore = this.db.prepare('DELETE FROM server_lore WHERE id=?')
+                    for (const id of badLoreIds) delLore.run(id)
+                }
+                if (badPersIds.length) {
+                    const delPers = this.db.prepare('DELETE FROM personality WHERE user_id=?')
+                    for (const uid of badPersIds) delPers.run(uid)
+                }
             })
             tx()
         } catch {}
@@ -324,20 +534,20 @@ class AIMemoryManager {
     updateUser(userId, username, displayName) {
         // Execute immediately to prevent read-after-write race conditions for new users
         try {
-            if (this._stmts) this._stmts.updateUser.run(userId, username, displayName, userId)
+            if (this._stmts) this._stmts.updateUser.run(userId, username, displayName)
             else
                 this.db
                     .prepare(
                         `
                 INSERT INTO users (user_id, username, display_name, conversation_count, last_interaction, updated_at)
-                VALUES (?,?,?,COALESCE((SELECT conversation_count FROM users WHERE user_id=?),0)+1,CURRENT_TIMESTAMP,CURRENT_TIMESTAMP)
+                VALUES (?,?,?,1,CURRENT_TIMESTAMP,CURRENT_TIMESTAMP)
                 ON CONFLICT(user_id) DO UPDATE SET
                     username=excluded.username, display_name=excluded.display_name,
-                    conversation_count=conversation_count+1,
+                    conversation_count=users.conversation_count+1,
                     last_interaction=CURRENT_TIMESTAMP, updated_at=CURRENT_TIMESTAMP
             `,
                     )
-                    .run(userId, username, displayName, userId)
+                    .run(userId, username, displayName)
         } catch (e) {
             console.error('[DB] updateUser error:', e)
         }
@@ -368,7 +578,7 @@ class AIMemoryManager {
 
     // Full-text search over conversation contents (FTS5 mirror, triggers keep
     // it synced). userId null = whole server. Returns newest first. Terms are
-    // matched with AND semantics; garbage queries return [] instead of throwing.
+    // quoted so FTS5 operators (AND/OR/NOT/NEAR) never throw syntax errors.
     searchConversations(terms, userId = null, limit = 3) {
         try {
             const q = String(terms ?? '')
@@ -377,24 +587,26 @@ class AIMemoryManager {
                 .filter((w) => w.length >= 3)
                 .slice(0, 5)
             if (!q.length) return []
-            const match = q.join(' AND ')
+            const match = q.map((w) => `"${w.replace(/"/g, '""')}"`).join(' AND ')
             const rows = userId
-                ? this.db
-                      .prepare(
+                ? (
+                      this._stmts?.searchConvUser ??
+                      this.db.prepare(
                           `SELECT c.user_id, c.message_content, c.timestamp FROM conversations_fts f
                            JOIN conversations c ON c.id = f.rowid
                            WHERE conversations_fts MATCH ? AND c.user_id = ?
                            ORDER BY c.id DESC LIMIT ?`,
                       )
-                      .all(match, userId, limit)
-                : this.db
-                      .prepare(
+                  ).all(match, userId, limit)
+                : (
+                      this._stmts?.searchConvAll ??
+                      this.db.prepare(
                           `SELECT c.user_id, c.message_content, c.timestamp FROM conversations_fts f
                            JOIN conversations c ON c.id = f.rowid
                            WHERE conversations_fts MATCH ?
                            ORDER BY c.id DESC LIMIT ?`,
                       )
-                      .all(match, limit)
+                  ).all(match, limit)
             return rows ?? []
         } catch {
             return []
@@ -424,8 +636,10 @@ class AIMemoryManager {
     getSummary(userId) {
         try {
             return (
-                this.db.prepare('SELECT summary FROM user_summaries WHERE user_id=?').get(userId)?.summary ??
-                null
+                (this._stmts
+                    ? this._stmts.getSummary.get(userId)
+                    : this.db.prepare('SELECT summary FROM user_summaries WHERE user_id=?').get(userId)
+                )?.summary ?? null
             )
         } catch {
             return null
@@ -459,9 +673,7 @@ class AIMemoryManager {
             .replace(/^\[(Summary as of )?[^\]]+\]\s*/, '')
             .slice(0, 1500)}`
         try {
-            const prev =
-                this.db.prepare('SELECT summary FROM user_summaries WHERE user_id=?').get(userId)?.summary ??
-                ''
+            const prev = this.getSummary(userId) ?? ''
             let combined = prev ? `${prev}\n${stamped}` : stamped
             if (combined.length > 4000) {
                 // Trim oldest snapshots from the front, keep the tail.
@@ -499,85 +711,8 @@ class AIMemoryManager {
             for (const [k, v] of this._interestsThrottle)
                 if (now - v > 120_000) this._interestsThrottle.delete(k)
         }
-        const stop = new Set([
-            'that',
-            'this',
-            'with',
-            'have',
-            'they',
-            'will',
-            'been',
-            'from',
-            'were',
-            'said',
-            'each',
-            'what',
-            'just',
-            'like',
-            'more',
-            'about',
-            'time',
-            'very',
-            'when',
-            'come',
-            'could',
-            'know',
-            'into',
-            'over',
-            'think',
-            'also',
-            'back',
-            'after',
-            'first',
-            'well',
-            'good',
-            'where',
-            'much',
-            'some',
-            'only',
-            'make',
-            'work',
-            'still',
-            'should',
-            'your',
-            'want',
-            'because',
-            'through',
-            'being',
-            'before',
-            'here',
-            'then',
-            'than',
-            'any',
-            'may',
-            'say',
-            'use',
-            'all',
-            'there',
-            'which',
-            'their',
-            'has',
-            'had',
-            'two',
-            'go',
-            'way',
-            'user',
-            'replying',
-            'message',
-            'channel',
-            'activity',
-            'recent',
-            'server',
-            'context',
-            'said',
-            'content',
-            'system',
-            'replyed',
-            'replied',
-            'response',
-        ])
         const kw = (messageContent.toLowerCase().match(/\b[a-zA-Z]{4,}\b/g) ?? [])
-            .filter((w) => !stop.has(w))
+            .filter((w) => !INTEREST_STOPWORDS.has(w))
             .slice(0, 3)
         if (!kw.length) return
         this._deferWrite(() => {
@@ -585,10 +720,10 @@ class AIMemoryManager {
                 this._stmts?.upsertInterest ??
                 this.db.prepare(`
                 INSERT INTO interests (user_id, topic, frequency, last_mentioned)
-                VALUES (?,?,COALESCE((SELECT frequency FROM interests WHERE user_id=? AND topic=?),0)+1,CURRENT_TIMESTAMP)
-                ON CONFLICT(user_id, topic) DO UPDATE SET frequency=frequency+1, last_mentioned=CURRENT_TIMESTAMP
+                VALUES (?,?,1,CURRENT_TIMESTAMP)
+                ON CONFLICT(user_id, topic) DO UPDATE SET frequency=interests.frequency+1, last_mentioned=CURRENT_TIMESTAMP
             `)
-            for (const topic of kw) upsert.run(userId, topic, userId, topic)
+            for (const topic of kw) upsert.run(userId, topic)
         })
     }
 
@@ -621,26 +756,23 @@ class AIMemoryManager {
                 if (now - v > 600_000) this._personalityThrottle.delete(k)
         }
         const lower = messageContent.toLowerCase()
-        const patterns = {
-            direct: ['just', 'simply', 'exactly', 'straight up'],
-            analytical: ['because', 'therefore', 'analyze', 'consider'],
-            casual: ['lol', 'lmao', 'bruh', 'dude', 'nah', 'yeah', 'tbh'],
-            formal: ['please', 'thank you', 'would you kindly', 'appreciate'],
-            emotional: ['feel', 'love', 'hate', 'excited', 'frustrated'],
-            technical: ['function', 'algorithm', 'database', 'api', 'debug'],
-            creative: ['imagine', 'create', 'design', 'art', 'music'],
-            helpful: ['help', 'assist', 'support', 'guide', 'teach'],
+        const detected = []
+        for (const [trait, kw] of PERSONALITY_PATTERNS) {
+            let hits = 0
+            for (const w of kw) {
+                if (lower.includes(w) && ++hits >= 2) {
+                    detected.push(trait)
+                    break
+                }
+            }
         }
-        const detected = Object.entries(patterns)
-            .filter(([, kw]) => kw.filter((w) => lower.includes(w)).length >= 2)
-            .map(([trait]) => trait)
         if (!detected.length) return
         const existing = this.getPersonality(userId)
-        const traitMap = {}
+        const traitMap = new Map()
         if (existing?.traits)
-            for (const t of existing.traits.split(', ')) traitMap[t] = (traitMap[t] ?? 0) + 1
-        for (const t of detected) traitMap[t] = (traitMap[t] ?? 0) + 2
-        const traits = Object.entries(traitMap)
+            for (const t of existing.traits.split(', ')) traitMap.set(t, (traitMap.get(t) ?? 0) + 1)
+        for (const t of detected) traitMap.set(t, (traitMap.get(t) ?? 0) + 2)
+        const traits = [...traitMap.entries()]
             .sort((a, b) => b[1] - a[1])
             .slice(0, 5)
             .map(([t]) => t)
@@ -657,9 +789,12 @@ class AIMemoryManager {
     }
 
     setAlias(userId, alias, setBy) {
-        this.db
-            .prepare('INSERT OR REPLACE INTO user_aliases (user_id, alias, set_by_user_id) VALUES (?,?,?)')
-            .run(userId, alias, setBy)
+        ;(
+            this._stmts?.setAlias ??
+            this.db.prepare(
+                'INSERT OR REPLACE INTO user_aliases (user_id, alias, set_by_user_id) VALUES (?,?,?)',
+            )
+        ).run(userId, alias, setBy)
     }
 
     // Reverse lookup for agent name resolution ("tony" -> user_id). Exact match
@@ -669,9 +804,10 @@ class AIMemoryManager {
         try {
             const a = String(alias ?? '').trim()
             if (!a) return null
-            const row =
-                this.db.prepare('SELECT user_id FROM user_aliases WHERE alias=?').get(a) ??
-                this.db.prepare('SELECT user_id FROM user_aliases WHERE alias=?').get(a.toLowerCase())
+            const stmt =
+                this._stmts?.getUserIdByAlias ??
+                this.db.prepare('SELECT user_id FROM user_aliases WHERE alias=?')
+            const row = stmt.get(a) ?? stmt.get(a.toLowerCase())
             return row?.user_id ?? null
         } catch {
             return null
@@ -684,10 +820,10 @@ class AIMemoryManager {
                 this._stmts?.upsertRelationship ??
                 this.db.prepare(`
                 INSERT INTO relationships (user_id, related_user_id, relationship_type, strength, last_interaction)
-                VALUES (?,?,'interaction',COALESCE((SELECT strength FROM relationships WHERE user_id=? AND related_user_id=?),0)+1,CURRENT_TIMESTAMP)
-                ON CONFLICT(user_id, related_user_id) DO UPDATE SET strength=strength+1, last_interaction=CURRENT_TIMESTAMP
+                VALUES (?,?,'interaction',1,CURRENT_TIMESTAMP)
+                ON CONFLICT(user_id, related_user_id) DO UPDATE SET strength=relationships.strength+1, last_interaction=CURRENT_TIMESTAMP
             `)
-            stmt.run(userId, relatedId, userId, relatedId)
+            stmt.run(userId, relatedId)
         })
     }
 
@@ -793,11 +929,12 @@ class AIMemoryManager {
     }
 
     vacuum() {
-        // Deleted rows only mark pages free, VACUUM is what actually shrinks the file
+        // Non-blocking incremental vacuum: frees pages without freezing the event loop
         if (this.db._stub) return false
         try {
             this.db.pragma('wal_checkpoint(TRUNCATE)')
-            this.db.exec('VACUUM')
+            this.db.pragma('incremental_vacuum(200)')
+            this._lastVacuum = Date.now()
             return true
         } catch (e) {
             console.error('[DB] vacuum error:', e.message)
@@ -806,24 +943,31 @@ class AIMemoryManager {
     }
 
     wipeUser(userId) {
-        for (const table of [
-            'conversations',
-            'interests',
-            'personality',
-            'relationships',
-            'user_aliases',
-            'user_summaries',
-        ]) {
+        const tx = this.db.transaction(() => {
+            for (const table of [
+                'conversations',
+                'interests',
+                'personality',
+                'relationships',
+                'user_aliases',
+                'user_summaries',
+            ]) {
+                try {
+                    this.db.prepare(`DELETE FROM ${table} WHERE user_id=?`).run(userId)
+                } catch {}
+            }
             try {
-                this.db.prepare(`DELETE FROM ${table} WHERE user_id=?`).run(userId)
+                this.db.prepare('DELETE FROM relationships WHERE related_user_id=?').run(userId)
             } catch {}
+            try {
+                this.db.prepare('DELETE FROM users WHERE user_id=?').run(userId)
+            } catch {}
+        })
+        try {
+            tx()
+        } catch (e) {
+            console.error('[DB] wipeUser error:', e)
         }
-        try {
-            this.db.prepare('DELETE FROM relationships WHERE related_user_id=?').run(userId)
-        } catch {}
-        try {
-            this.db.prepare('DELETE FROM users WHERE user_id=?').run(userId)
-        } catch {}
     }
 
     cleanupOld(days = 30) {
@@ -866,42 +1010,48 @@ class AIMemoryManager {
         })
         prune()
         this.cleanupLore()
-        // Gated VACUUM, defaults to once per 7 days to avoid 3-5s blocking ops
+        // Gated incremental vacuum, defaults to once per 7 days to avoid blocking ops
         const now = Date.now()
         const gapMs = PERF.maintenance.vacuumEveryDays * 86400_000
         this._lastVacuum ??= 0
         if (now - this._lastVacuum > gapMs) {
-            try {
-                this.db.prepare('VACUUM').run()
-                this._lastVacuum = now
-            } catch {}
+            this.vacuum()
         }
     }
 
     // Server lore
     addLore(fact, source = 'manual') {
         if (containsDisallowedHate(fact)) return false
-        if (!fact?.trim() || fact.length > 120) return false
+        const trimmed = fact?.trim()
+        if (!trimmed || trimmed.length > 120) return false
         try {
-            const existing = this.db.prepare('SELECT id FROM server_lore WHERE fact=?').get(fact.trim())
+            const existing = (
+                this._stmts?.getLoreByFact ?? this.db.prepare('SELECT id FROM server_lore WHERE fact=?')
+            ).get(trimmed)
             if (existing) {
-                this.db
-                    .prepare(
+                ;(
+                    this._stmts?.bumpLore ??
+                    this.db.prepare(
                         'UPDATE server_lore SET frequency=frequency+1, last_seen=CURRENT_TIMESTAMP WHERE id=?',
                     )
-                    .run(existing.id)
+                ).run(existing.id)
             } else {
-                const count = this.db.prepare('SELECT COUNT(*) as c FROM server_lore').get()?.c ?? 0
+                const count =
+                    (
+                        this._stmts?.countLore ?? this.db.prepare('SELECT COUNT(*) as c FROM server_lore')
+                    ).get()?.c ?? 0
                 if (count >= 50) {
-                    this.db
-                        .prepare(
+                    ;(
+                        this._stmts?.pruneOldestLore ??
+                        this.db.prepare(
                             'DELETE FROM server_lore WHERE id=(SELECT id FROM server_lore ORDER BY frequency ASC, last_seen ASC LIMIT 1)',
                         )
-                        .run()
+                    ).run()
                 }
-                this.db
-                    .prepare('INSERT INTO server_lore (fact, source) VALUES (?,?)')
-                    .run(fact.trim(), source)
+                ;(
+                    this._stmts?.insertLore ??
+                    this.db.prepare('INSERT INTO server_lore (fact, source) VALUES (?,?)')
+                ).run(trimmed, source)
             }
             return true
         } catch {
@@ -911,11 +1061,12 @@ class AIMemoryManager {
 
     getLore(limit = 12) {
         try {
-            return this.db
-                .prepare(
+            return (
+                this._stmts?.getLore ??
+                this.db.prepare(
                     'SELECT id, fact, source, frequency FROM server_lore ORDER BY frequency DESC, last_seen DESC LIMIT ?',
                 )
-                .all(limit)
+            ).all(limit)
         } catch {
             return []
         }
@@ -940,11 +1091,10 @@ class AIMemoryManager {
                 .run()
         } catch {}
     }
+
     autoExtractLore(entries) {
         if (!entries || entries.length < 4) return
-        const LORE_SIGNALS =
-            /\b(our thing|server rule|inside joke|we always|we call|everyone knows|classic|tradition|always happens|server lore)\b/i
-        const phraseUsers = new Map()
+        const cleanEntries = []
         for (const e of entries) {
             const text = (e.content ?? '').trim()
             if (containsDisallowedHate(text)) continue
@@ -953,19 +1103,11 @@ class AIMemoryManager {
                 this.addLore(text.slice(0, 120), 'auto')
                 continue
             }
-            const words = text.toLowerCase().match(/\b[a-zA-Z]{3,}\b/g) ?? []
-            for (let i = 0; i < words.length - 2; i++) {
-                const phrase = words.slice(i, i + 3).join(' ')
-                if (!phraseUsers.has(phrase)) phraseUsers.set(phrase, new Set())
-                phraseUsers.get(phrase).add(e.userId)
-            }
+            cleanEntries.push({ userId: e.userId, content: text })
         }
-        // Skip URL fragments, domain names, and generic web noise, these pollute context badly
-        const LORE_URL_JUNK =
-            /https?|www\b|\.com|\.net|\.org|\.gg|tenor|giphy|imgur|discord|youtube|twitch|twitter|tiktok/i
-        for (const [phrase, users] of phraseUsers) {
-            if (users.size >= 3 && !LORE_URL_JUNK.test(phrase))
-                this.addLore(`"${phrase}" is a recurring phrase here`, 'auto')
+        const candidates = extractLoreCandidates(cleanEntries)
+        for (const phrase of candidates) {
+            this.addLore(`"${phrase}" is a recurring phrase here`, 'auto')
         }
     }
 }

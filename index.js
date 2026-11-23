@@ -1,13 +1,16 @@
 import {
     ActionRowBuilder,
     ActivityType,
+    ApplicationIntegrationType,
     ButtonBuilder,
     ButtonStyle,
+    ChannelType,
     Client,
     Collection,
     ComponentType,
     EmbedBuilder,
     GatewayIntentBits,
+    InteractionContextType,
     MessageFlags,
     Options,
     PermissionFlagsBits,
@@ -28,6 +31,7 @@ import { forceEphemeral, guildBlockedReason, resolveTarget } from './extensions/
 import { loadSqlite, openDb } from './extensions/db.js'
 
 const PERF = loadPerformance()
+const CPU_COUNT = os.cpus().length
 
 setGlobalDispatcher(_undiciAgent)
 process.setMaxListeners(30)
@@ -61,9 +65,17 @@ const _tsFormatter = new Intl.DateTimeFormat('en-GB', {
     minute: '2-digit',
     hour12: true,
 })
+let _tsMinute = -1
+let _tsCached = ''
 function getTs() {
-    const parts = Object.fromEntries(_tsFormatter.formatToParts(new Date()).map((p) => [p.type, p.value]))
-    return `[${parts.day}/${parts.month}/${parts.year} ${parts.hour}:${parts.minute} ${parts.dayPeriod?.toUpperCase() ?? ''}]`
+    const now = Date.now()
+    const minute = Math.floor(now / 60_000)
+    if (minute !== _tsMinute) {
+        _tsMinute = minute
+        const parts = Object.fromEntries(_tsFormatter.formatToParts(new Date(now)).map((p) => [p.type, p.value]))
+        _tsCached = `[${parts.day}/${parts.month}/${parts.year} ${parts.hour}:${parts.minute} ${parts.dayPeriod?.toUpperCase() ?? ''}]`
+    }
+    return _tsCached
 }
 const origLog = console.log,
     origError = console.error,
@@ -74,6 +86,7 @@ const origLog = console.log,
 const LOG_LEVEL = (process.env.LOG_LEVEL ?? 'info').toLowerCase()
 const _LVL = { error: 0, warn: 1, info: 2, debug: 3 }
 const _showLvl = (l) => globalThis._medusaDebug === true || (_LVL[l] ?? 2) <= (_LVL[LOG_LEVEL] ?? 2)
+const CF_521_RE = /(?:HTTP|status|response|Cloudflare)\D{0,10}521\b|\b521\s+Web Server Is Down/i
 console.log = (...a) => {
     if (_showLvl('info')) origLog(`${clr.cyan}${getTs()}${clr.reset}`, ...a)
 }
@@ -87,7 +100,7 @@ console.error = (...a) => {
     const m = typeof a[0] === 'string' ? a[0] : a[0]?.message || a[0]?.code || String(a[0])
     if (m && m.includes('No libpcap provider')) return
     const allArgs = a.map((x) => (typeof x === 'string' ? x : x?.message || x?.code || String(x))).join(' ')
-    if (allArgs.includes('521') || allArgs.includes('Unexpected server response')) return
+    if (CF_521_RE.test(allArgs) || allArgs.includes('Unexpected server response')) return
     origError(`${clr.light_red}${getTs()} [ERROR]${clr.reset}`, ...a)
 }
 
@@ -99,10 +112,34 @@ const config = loadConfig()
 const BOT_OWNER_ID = config.ownerId ? BigInt(config.ownerId) : 0n
 const PREFIX = config.prefix
 const PREFIXES = config.prefixes
+const PREFIXES_LOWER = PREFIXES.map((p) => p.toLowerCase())
+function matchPrefix(content) {
+    for (let i = 0; i < PREFIXES_LOWER.length; i++) {
+        const p = PREFIXES_LOWER[i]
+        if (content.length >= p.length && content.slice(0, p.length).toLowerCase() === p) {
+            return PREFIXES[i]
+        }
+    }
+    return null
+}
 const ALLOWED_GUILDS = new Set(config.guildIds.map(BigInt))
 // Standalone personal-pref commands that run in DMs/GCs too (no guild
 // needed, keyed by user id). Everything else still requires a server.
 const DM_SAFE_PREFIX = new Set(['mode', 'stream', 'billing'])
+
+function safePragmaInt(val, fallback, min = 0) {
+    const n = Number(val)
+    return Number.isInteger(n) && n >= min ? n : fallback
+}
+
+function isValidHttpUrl(str) {
+    try {
+        const u = new URL(str)
+        return u.protocol === 'http:' || u.protocol === 'https:'
+    } catch {
+        return false
+    }
+}
 
 // Database
 let db
@@ -140,34 +177,36 @@ while (true) {
         }
         db.pragma('synchronous = NORMAL')
         db.pragma('temp_store = MEMORY')
-        db.pragma(`journal_size_limit = ${PERF.sqlite.journalSizeLimit}`)
+        const journalSizeLimit = safePragmaInt(PERF.sqlite.journalSizeLimit, 4096000, 0)
+        const mmapSizeBytes = safePragmaInt(PERF.sqlite.mmapSizeBytes, 67108864, 0)
+        const cacheSizeKB = safePragmaInt(PERF.sqlite.cacheSizeKB, 20000, 1)
+        const walAutocheckpoint = safePragmaInt(PERF.sqlite.walAutocheckpoint, 5000, 1)
+        db.pragma(`journal_size_limit = ${journalSizeLimit}`)
         try {
-            db.pragma(`mmap_size = ${PERF.sqlite.mmapSizeBytes}`)
+            db.pragma(`mmap_size = ${mmapSizeBytes}`)
         } catch (e) {}
-        db.pragma(`cache_size = -${PERF.sqlite.cacheSizeKB}`)
-        db.pragma(`wal_autocheckpoint = ${PERF.sqlite.walAutocheckpoint}`)
+        db.pragma(`cache_size = -${cacheSizeKB}`)
+        db.pragma(`wal_autocheckpoint = ${walAutocheckpoint}`)
+        try {
+            db.pragma('auto_vacuum = INCREMENTAL')
+        } catch {}
 
+        // Single consolidated maintenance timer: passive WAL checkpoint,
+        // prune old mod logs / inactive warnings, and incremental vacuum.
         let _vacuumEligible = false
         setInterval(() => {
             try {
                 if (!db.open) return
-                db.pragma('wal_checkpoint(TRUNCATE)')
-                // Prune old mod logs and resolved warnings monthly
+                db.pragma('wal_checkpoint(PASSIVE)')
                 const cutoff = new Date(Date.now() - 180 * 86400000).toISOString().slice(0, 10)
                 const r1 = db.prepare('DELETE FROM mod_logs WHERE timestamp < ?').run(cutoff)
                 const r2 = db
                     .prepare('DELETE FROM warnings WHERE active = FALSE AND timestamp < ?')
                     .run(cutoff)
-                const r3 = db
-                    .prepare(
-                        'DELETE FROM server_data WHERE guild_id NOT IN (SELECT DISTINCT guild_id FROM mod_logs UNION SELECT DISTINCT guild_id FROM warnings)',
-                    )
-                    .run()
-                const deleted = (r1.changes ?? 0) + (r2.changes ?? 0) + (r3.changes ?? 0)
+                const deleted = (r1.changes ?? 0) + (r2.changes ?? 0)
                 if (deleted > 100) _vacuumEligible = true
-                // Only pay the VACUUM cost when a real amount of data was actually removed
                 if (_vacuumEligible) {
-                    db.prepare('VACUUM').run()
+                    db.pragma('incremental_vacuum(100)')
                     _vacuumEligible = false
                 }
             } catch {}
@@ -259,11 +298,12 @@ client.rest.on('rateLimited', (info) => {
     if (now - _lastRestWarn < 30_000) return
     _lastRestWarn = now
     console.warn(
-        `[REST] 429 on ${info.route ?? info.path ?? '?'} — retry in ${info.retryAfter ?? '?'}ms (global=${info.global === true})`,
+        `[REST] 429 on ${info.route || info.url || info.path || '?'} — retry in ${info.retryAfter ?? '?'}ms (global=${info.global === true})`,
     )
 })
 
 const heart = attachHeart(client)
+heart.onShutdown(() => client.destroy())
 
 // Prefix command map, must exist before extensions load
 client.commands = new Collection()
@@ -401,7 +441,7 @@ async function cmdStats(ctx) {
             },
             {
                 name: '⚙️ Resource Usage',
-                value: `RAM: \`${memMB}MB\`\nCPU: \`${cpu}%\` (\`${os.cpus().length}\` cores)`,
+                value: `RAM: \`${memMB}MB\`\nCPU: \`${cpu}%\` (\`${CPU_COUNT}\` cores)`,
                 inline: true,
             },
             {
@@ -471,13 +511,16 @@ async function cmdMav(ctx, args) {
 
 async function cmdBn(ctx, args) {
     let member = Array.isArray(args) ? await resolveTarget(ctx, args) : (args ?? ctx.member)
+    if (!member) return ctx.reply({ content: '❌ Could not find that user.' }).catch(() => {})
     let bannerUrl = null,
         isFallback = false
-    try {
-        const data = await client.rest.get(`/guilds/${ctx.guild.id}/members/${member.id}`)
-        if (data.banner)
-            bannerUrl = `https://cdn.discordapp.com/guilds/${ctx.guild.id}/users/${member.id}/banners/${data.banner}.${data.banner.startsWith('a_') ? 'gif' : 'png'}?size=2048`
-    } catch {}
+    if (ctx.guild) {
+        try {
+            const data = await client.rest.get(`/guilds/${ctx.guild.id}/members/${member.id}`)
+            if (data.banner)
+                bannerUrl = `https://cdn.discordapp.com/guilds/${ctx.guild.id}/users/${member.id}/banners/${data.banner}.${data.banner.startsWith('a_') ? 'gif' : 'png'}?size=2048`
+        } catch {}
+    }
     const user = !bannerUrl ? await client.users.fetch(member.id, { force: true }).catch(() => null) : null
     if (!bannerUrl && user) {
         bannerUrl = user.bannerURL({ size: 2048, forceStatic: false })
@@ -502,9 +545,14 @@ async function cmdBn(ctx, args) {
 }
 
 async function cmdMbn(ctx, args) {
-    let member = Array.isArray(args) ? await resolveTarget(ctx, args) : (args ?? ctx.member)
+    let member = Array.isArray(args) ? await resolveTarget(ctx, args) : (args ?? ctx.member ?? ctx.user)
+    if (!member) return ctx.reply({ content: '❌ Could not find that user.' }).catch(() => {})
     if (ctx.isChatInputCommand?.() && !ctx.deferred) await ctx.deferReply().catch(() => {})
-    const user = await client.users.fetch(member.id, { force: true })
+    const user = await client.users.fetch(member.id, { force: true }).catch(() => null)
+    if (!user) {
+        const msg = { content: '❌ Could not fetch that user.' }
+        return ctx.deferred ? ctx.editReply(msg).catch(() => {}) : ctx.reply(msg).catch(() => {})
+    }
     const embed = new EmbedBuilder().setTitle(`🎌 Main Banner - ${user.username}`).setColor(0x378add)
     if (user.bannerURL()) {
         embed.setImage(user.bannerURL({ size: 1024, forceStatic: false }))
@@ -523,8 +571,24 @@ async function cmdEmbed(interaction) {
     const ftText = interaction.options.getString('footer-text') ?? null
     const ftIcon = interaction.options.getString('footer-icon') ?? null
     const embed = new EmbedBuilder().setTitle(title).setDescription(desc).setColor(0x378add)
-    if (image) embed.setImage(image)
-    if (ftText) embed.setFooter({ text: ftText, iconURL: ftIcon ?? undefined })
+    if (image) {
+        if (!isValidHttpUrl(image))
+            return interaction.reply({ content: '❌ Invalid image URL.', flags: MessageFlags.Ephemeral })
+        try {
+            embed.setImage(image)
+        } catch {
+            return interaction.reply({ content: '❌ Invalid image URL.', flags: MessageFlags.Ephemeral })
+        }
+    }
+    if (ftText) {
+        if (ftIcon && !isValidHttpUrl(ftIcon))
+            return interaction.reply({ content: '❌ Invalid footer icon URL.', flags: MessageFlags.Ephemeral })
+        try {
+            embed.setFooter({ text: ftText, iconURL: ftIcon ?? undefined })
+        } catch {
+            return interaction.reply({ content: '❌ Invalid footer options.', flags: MessageFlags.Ephemeral })
+        }
+    }
     await interaction.reply({ embeds: [embed] })
 }
 
@@ -568,8 +632,15 @@ async function cmdMenu(ctx) {
                 .setDisabled(p >= pages.length - 1),
             new ButtonBuilder().setCustomId('mn_close').setLabel('❌').setStyle(ButtonStyle.Danger),
         )
-    const resp = await ctx.reply({ embeds: [mkEmbed(0)], components: [mkRow(0)], withResponse: true })
-    const send = resp.resource?.message ?? (await ctx.fetchReply().catch(() => null))
+    const isInteraction = typeof ctx.isChatInputCommand === 'function' && ctx.isChatInputCommand()
+    let send
+    if (isInteraction) {
+        const resp = await ctx.reply({ embeds: [mkEmbed(0)], components: [mkRow(0)], withResponse: true })
+        send = resp?.resource?.message ?? (await ctx.fetchReply().catch(() => null))
+    } else {
+        send = await ctx.reply({ embeds: [mkEmbed(0)], components: [mkRow(0)] })
+    }
+    if (!send) return
     const auth = ctx.user ?? ctx.author
     const col = send.createMessageComponentCollector({ componentType: ComponentType.Button, time: 60_000 })
     col.on('collect', async (i) => {
@@ -588,58 +659,75 @@ async function cmdMenu(ctx) {
 // Slash command definitions
 const SLASH_CMDS = [
     // Server-only utility commands, the profile pair below covers DMs
-    new SlashCommandBuilder().setName('ping').setDescription('Check latency').setContexts(0),
-    new SlashCommandBuilder().setName('stats').setDescription('Live performance stats').setContexts(0),
+    new SlashCommandBuilder()
+        .setName('ping')
+        .setDescription('Check latency')
+        .setContexts(InteractionContextType.Guild),
+    new SlashCommandBuilder()
+        .setName('stats')
+        .setDescription('Live performance stats')
+        .setContexts(InteractionContextType.Guild),
     new SlashCommandBuilder()
         .setName('avatar')
         .setDescription("User's server avatar")
-        .setContexts(0)
+        .setContexts(InteractionContextType.Guild)
         .addUserOption((o) => o.setName('member').setDescription('Target user')),
     // User-installable + DM-capable
     new SlashCommandBuilder()
         .setName('mav')
         .setDescription("User's main profile avatar")
-        .setIntegrationTypes(0, 1)
-        .setContexts(0, 1, 2)
+        .setIntegrationTypes(ApplicationIntegrationType.GuildInstall, ApplicationIntegrationType.UserInstall)
+        .setContexts(
+            InteractionContextType.Guild,
+            InteractionContextType.BotDM,
+            InteractionContextType.PrivateChannel,
+        )
         .addUserOption((o) => o.setName('member').setDescription('Target user')),
     new SlashCommandBuilder()
         .setName('banner')
         .setDescription("User's server banner")
-        .setContexts(0)
+        .setContexts(InteractionContextType.Guild)
         .addUserOption((o) => o.setName('member').setDescription('Target user')),
     new SlashCommandBuilder()
         .setName('mbanner')
         .setDescription("User's main profile banner")
-        .setIntegrationTypes(0, 1)
-        .setContexts(0, 1, 2)
+        .setIntegrationTypes(ApplicationIntegrationType.GuildInstall, ApplicationIntegrationType.UserInstall)
+        .setContexts(
+            InteractionContextType.Guild,
+            InteractionContextType.BotDM,
+            InteractionContextType.PrivateChannel,
+        )
         .addUserOption((o) => o.setName('member').setDescription('Target user')),
 
     // Guild-only commands
-    new SlashCommandBuilder().setName('menu').setDescription("Open Medusa's system menu").setContexts(0),
+    new SlashCommandBuilder()
+        .setName('menu')
+        .setDescription("Open Medusa's system menu")
+        .setContexts(InteractionContextType.Guild),
     new SlashCommandBuilder()
         .setName('ban')
         .setDescription('Ban a user')
-        .setContexts(0)
+        .setContexts(InteractionContextType.Guild)
         .addUserOption((o) => o.setName('member').setDescription('Member to ban').setRequired(true))
         .addStringOption((o) => o.setName('reason').setDescription('Reason'))
         .setDefaultMemberPermissions(PermissionFlagsBits.BanMembers),
     new SlashCommandBuilder()
         .setName('unban')
         .setDescription('Unban a user by ID')
-        .setContexts(0)
+        .setContexts(InteractionContextType.Guild)
         .addStringOption((o) => o.setName('user-id').setDescription('User ID').setRequired(true))
         .setDefaultMemberPermissions(PermissionFlagsBits.BanMembers),
     new SlashCommandBuilder()
         .setName('kick')
         .setDescription('Kick a user')
-        .setContexts(0)
+        .setContexts(InteractionContextType.Guild)
         .addUserOption((o) => o.setName('member').setDescription('Member to kick').setRequired(true))
         .addStringOption((o) => o.setName('reason').setDescription('Reason'))
         .setDefaultMemberPermissions(PermissionFlagsBits.KickMembers),
     new SlashCommandBuilder()
         .setName('mute')
         .setDescription('Timeout a user')
-        .setContexts(0)
+        .setContexts(InteractionContextType.Guild)
         .addUserOption((o) => o.setName('member').setDescription('Member to mute').setRequired(true))
         .addStringOption((o) => o.setName('duration').setDescription('e.g. 15m, 2h, 1d').setRequired(true))
         .addStringOption((o) => o.setName('reason').setDescription('Reason'))
@@ -647,43 +735,44 @@ const SLASH_CMDS = [
     new SlashCommandBuilder()
         .setName('unmute')
         .setDescription('Remove timeout')
-        .setContexts(0)
+        .setContexts(InteractionContextType.Guild)
         .addUserOption((o) => o.setName('member').setDescription('Member to unmute').setRequired(true))
         .setDefaultMemberPermissions(PermissionFlagsBits.ModerateMembers),
     new SlashCommandBuilder()
         .setName('warn')
         .setDescription('Warn a user')
-        .setContexts(0)
+        .setContexts(InteractionContextType.Guild)
         .addUserOption((o) => o.setName('member').setDescription('Member to warn').setRequired(true))
         .addStringOption((o) => o.setName('reason').setDescription('Reason'))
         .setDefaultMemberPermissions(PermissionFlagsBits.ModerateMembers),
     new SlashCommandBuilder()
         .setName('warnings')
         .setDescription('View warnings')
-        .setContexts(0)
+        .setContexts(InteractionContextType.Guild)
         .addUserOption((o) => o.setName('member').setDescription('Target user').setRequired(true))
         .setDefaultMemberPermissions(PermissionFlagsBits.ModerateMembers),
     new SlashCommandBuilder()
         .setName('modlog')
         .setDescription('View moderation logs')
-        .setContexts(0)
+        .setContexts(InteractionContextType.Guild)
         .addUserOption((o) => o.setName('user').setDescription('Filter by user'))
         .setDefaultMemberPermissions(PermissionFlagsBits.ModerateMembers),
     new SlashCommandBuilder()
         .setName('clear')
         .setDescription('Delete the last few messages in this channel (default 10)')
-        .setContexts(0)
+        .setContexts(InteractionContextType.Guild)
         .addIntegerOption((o) =>
             o
                 .setName('amount')
                 .setDescription('How many recent messages to delete (up to 500)')
                 .setMinValue(1)
                 .setMaxValue(500),
-        ),
+        )
+        .setDefaultMemberPermissions(PermissionFlagsBits.ManageMessages),
     new SlashCommandBuilder()
         .setName('erase')
         .setDescription('Wipe every recent message a member sent')
-        .setContexts(0)
+        .setContexts(InteractionContextType.Guild)
         .addUserOption((o) =>
             o.setName('user').setDescription('The member whose messages get wiped').setRequired(true),
         )
@@ -699,7 +788,7 @@ const SLASH_CMDS = [
     new SlashCommandBuilder()
         .setName('sweep')
         .setDescription('Hunt down and delete recent messages that contain a word or phrase')
-        .setContexts(0)
+        .setContexts(InteractionContextType.Guild)
         .addStringOption((o) =>
             o
                 .setName('text')
@@ -728,7 +817,7 @@ const SLASH_CMDS = [
     new SlashCommandBuilder()
         .setName('embed')
         .setDescription('Post a custom embed with your own title, text and images')
-        .setContexts(0)
+        .setContexts(InteractionContextType.Guild)
         .addStringOption((o) => o.setName('title').setDescription('Embed title').setRequired(true))
         .addStringOption((o) =>
             o.setName('description').setDescription('Embed description').setRequired(true),
@@ -789,12 +878,13 @@ addCmd('setbotname', async (msg, args) => {
     }
 })
 addCmd('setbotavatar', async (msg, args) => {
-    if (!msg.guild || !msg.member?.permissions.has(PermissionFlagsBits.Administrator)) return
+    if (BigInt(msg.author.id) !== BOT_OWNER_ID) return
     let url = args[0] || msg.attachments.first()?.url
     if (!url && msg.reference?.messageId) {
         const ref = await msg.channel.messages.fetch(msg.reference.messageId).catch(() => null)
         url = ref?.attachments.first()?.url
     }
+    if (!url) return msg.reply('❌ Provide an image URL or attach/reply to an image.')
     try {
         await client.user.setAvatar(url)
         await msg.reply(`✅ Global avatar updated.`)
@@ -804,7 +894,7 @@ addCmd('setbotavatar', async (msg, args) => {
 })
 addCmd('setnickname', async (msg, args) => {
     if (!msg.member || !msg.guild.members.me) return
-    if (!msg.member.permissions.has(PermissionFlagsBits.ManageNicknames)) return
+    if (!msg.member?.permissions?.has(PermissionFlagsBits.ManageNicknames)) return
     if (
         msg.author.id !== msg.guild.ownerId &&
         msg.member.roles.highest.position <= msg.guild.members.me.roles.highest.position
@@ -818,8 +908,8 @@ addCmd('setnickname', async (msg, args) => {
     }
 })
 addCmd('createchan', async (msg, args) => {
-    if (!msg.member.permissions.has(PermissionFlagsBits.ManageChannels)) return
-    const type = args[0]?.toLowerCase() === 'voice' ? 2 : 0
+    if (!msg.member?.permissions?.has(PermissionFlagsBits.ManageChannels)) return
+    const type = args[0]?.toLowerCase() === 'voice' ? ChannelType.GuildVoice : ChannelType.GuildText
     try {
         const ch = await msg.guild.channels.create({ name: args.slice(1).join('-') || 'new-channel', type })
         await msg.reply(`✅ Created <#${ch.id}>.`)
@@ -828,7 +918,7 @@ addCmd('createchan', async (msg, args) => {
     }
 })
 addCmd('delchan', async (msg, args) => {
-    if (!msg.member.permissions.has(PermissionFlagsBits.ManageChannels)) return
+    if (!msg.member?.permissions?.has(PermissionFlagsBits.ManageChannels)) return
     const ch = msg.mentions.channels.first() || msg.guild.channels.cache.get(args[0]?.replace(/[<#>]/g, ''))
     if (!ch) return msg.reply('❌ Channel not found.')
     try {
@@ -839,7 +929,7 @@ addCmd('delchan', async (msg, args) => {
     }
 })
 addCmd('renameserver', async (msg, args) => {
-    if (!msg.member.permissions.has(PermissionFlagsBits.ManageGuild)) return
+    if (!msg.member?.permissions?.has(PermissionFlagsBits.ManageGuild)) return
     try {
         await msg.guild.setName(args.join(' '))
         await msg.reply(`✅ Server renamed.`)
@@ -848,7 +938,7 @@ addCmd('renameserver', async (msg, args) => {
     }
 })
 addCmd('addemoji', async (msg, args) => {
-    if (!msg.member.permissions.has(PermissionFlagsBits.ManageGuildExpressions)) return
+    if (!msg.member?.permissions?.has(PermissionFlagsBits.ManageGuildExpressions)) return
     const name = args[0]
     let url = args[1] || msg.attachments.first()?.url
     if (!url && msg.reference?.messageId) {
@@ -864,7 +954,7 @@ addCmd('addemoji', async (msg, args) => {
     }
 })
 addCmd('lockchannel', async (msg, args) => {
-    if (!msg.member.permissions.has(PermissionFlagsBits.ManageChannels)) return
+    if (!msg.member?.permissions?.has(PermissionFlagsBits.ManageChannels)) return
     const ch = msg.mentions.channels.first() || msg.channel
     const roleId =
         args.find((a) => a.startsWith('<@&'))?.replace(/[<@&>]/g, '') || msg.guild.roles.everyone.id
@@ -876,7 +966,7 @@ addCmd('lockchannel', async (msg, args) => {
     }
 })
 addCmd('unlockchannel', async (msg, args) => {
-    if (!msg.member.permissions.has(PermissionFlagsBits.ManageChannels)) return
+    if (!msg.member?.permissions?.has(PermissionFlagsBits.ManageChannels)) return
     const ch = msg.mentions.channels.first() || msg.channel
     const roleId =
         args.find((a) => a.startsWith('<@&'))?.replace(/[<@&>]/g, '') || msg.guild.roles.everyone.id
@@ -888,10 +978,13 @@ addCmd('unlockchannel', async (msg, args) => {
     }
 })
 addCmd('auditlogs', async (msg, args) => {
-    if (!msg.member.permissions.has(PermissionFlagsBits.ViewAuditLog)) return
+    if (!msg.member?.permissions?.has(PermissionFlagsBits.ViewAuditLog)) return
     try {
-        const fetchOpts = { limit: !isNaN(args[0]) ? Math.min(20, parseInt(args[0])) : 5 }
-        if (args[1] && !isNaN(args[1])) fetchOpts.type = parseInt(args[1])
+        const parsedLimit = parseInt(args[0], 10)
+        const fetchOpts = {
+            limit: Number.isFinite(parsedLimit) ? Math.max(1, Math.min(20, parsedLimit)) : 5,
+        }
+        if (args[1] && !isNaN(args[1])) fetchOpts.type = parseInt(args[1], 10)
         const logs = await msg.guild.fetchAuditLogs(fetchOpts)
         const entries = logs.entries.map(
             (e) =>
@@ -911,11 +1004,16 @@ addCmd('auditlogs', async (msg, args) => {
     }
 })
 addCmd('addrole', async (msg, args) => {
-    if (!msg.member.permissions.has(PermissionFlagsBits.ManageRoles)) return
+    if (!msg.member?.permissions?.has(PermissionFlagsBits.ManageRoles)) return
     const target = await resolveTarget(msg, args, false)
-    if (!target) return msg.reply('Member not found.')
+    if (!target?.roles) return msg.reply('❌ Member not found in this server.')
     const role = msg.guild.roles.cache.get(args[1]?.replace(/[<@&>]/g, ''))
     if (!role) return msg.reply('Role not found.')
+    if (
+        msg.author.id !== msg.guild.ownerId &&
+        !(role.position < msg.member.roles.highest.position)
+    )
+        return msg.reply('❌ You cannot assign a role equal to or higher than your highest role.')
     try {
         await target.roles.add(role)
         await msg.reply(`✅ Added **${role.name}** to ${target.user.username}.`)
@@ -924,11 +1022,16 @@ addCmd('addrole', async (msg, args) => {
     }
 })
 addCmd('removerole', async (msg, args) => {
-    if (!msg.member.permissions.has(PermissionFlagsBits.ManageRoles)) return
+    if (!msg.member?.permissions?.has(PermissionFlagsBits.ManageRoles)) return
     const target = await resolveTarget(msg, args, false)
-    if (!target) return msg.reply('Member not found.')
+    if (!target?.roles) return msg.reply('❌ Member not found in this server.')
     const role = msg.guild.roles.cache.get(args[1]?.replace(/[<@&>]/g, ''))
     if (!role) return msg.reply('Role not found.')
+    if (
+        msg.author.id !== msg.guild.ownerId &&
+        !(role.position < msg.member.roles.highest.position)
+    )
+        return msg.reply('❌ You cannot remove a role equal to or higher than your highest role.')
     try {
         await target.roles.remove(role)
         await msg.reply(`✅ Removed **${role.name}** from ${target.user.username}.`)
@@ -937,14 +1040,14 @@ addCmd('removerole', async (msg, args) => {
     }
 })
 addCmd('listroles', async (msg) => {
-    const roles = msg.guild.roles.cache
+    const roles = [...msg.guild.roles.cache.values()]
         .sort((a, b) => b.position - a.position)
-        .map((r) => r.name)
         .slice(0, 30)
+        .map((r) => r.name)
     await msg.reply(`🎭 **Server Roles:**\n${roles.join(', ')}`)
 })
 addCmd('createrole', async (msg, args) => {
-    if (!msg.member.permissions.has(PermissionFlagsBits.ManageRoles)) return
+    if (!msg.member?.permissions?.has(PermissionFlagsBits.ManageRoles)) return
     // Split a trailing hex color off the name when present.
     let roleName = args.join(' ').trim()
     let color = null
@@ -1006,16 +1109,6 @@ client.once('clientReady', async () => {
         console.log(`[Slash] ${allCmds.length} commands (Cache match, skipped sync)`)
     }
 
-    // main db upkeep: fold the wal + reclaim free pages, same idea as the ai memory dbs
-    const compactMainDb = () => {
-        try {
-            db.pragma('wal_checkpoint(TRUNCATE)')
-            db.exec('VACUUM')
-        } catch {}
-    }
-    setTimeout(compactMainDb, 60_000).unref()
-    setInterval(compactMainDb, (24 + Math.random() * 2) * 3600 * 1000).unref()
-
     try {
         const { registerAI } = await import('./extensions/ai.js')
         await registerAI(client, db, config)
@@ -1030,7 +1123,8 @@ client.once('clientReady', async () => {
     })
 
     try {
-        http.createServer((_, res) => {
+        const healthPort = process.env.HEALTH_PORT || 1350
+        const healthServer = http.createServer((_, res) => {
             res.writeHead(200, { 'Content-Type': 'application/json' })
             res.end(
                 JSON.stringify({
@@ -1042,9 +1136,17 @@ client.once('clientReady', async () => {
                 }),
             )
         })
-            .listen(process.env.HEALTH_PORT || 1350)
-            .unref()
-        console.log(`[Health] Listening on port ${process.env.HEALTH_PORT || 1350}`)
+        healthServer.on('error', (err) => {
+            console.warn('[Health] Server error:', err?.message ?? err)
+        })
+        healthServer.listen(healthPort).unref()
+        heart.onShutdown(
+            () =>
+                new Promise((resolve) => {
+                    healthServer.close(() => resolve())
+                }),
+        )
+        console.log(`[Health] Listening on port ${healthPort}`)
     } catch {}
 
     console.log(
@@ -1054,65 +1156,69 @@ client.once('clientReady', async () => {
 
 // interactionCreate
 client.on('interactionCreate', async (interaction) => {
-    // Blocked servers hear nothing public (covers core, moderation, and
-    // dynamic-extension commands alike).
-    if (guildBlockedReason(client, interaction.guild)) forceEphemeral(interaction)
-    // Let dynamic extensions handle buttons / commands they own
-    for (const ext of client.extensions.values()) {
-        if (ext.handleInteraction) {
-            try {
-                const handled = await ext.handleInteraction(interaction)
-                if (handled === true) return
-            } catch (e) {
-                console.error('[Ext handleInteraction]', e)
+    try {
+        // Blocked servers hear nothing public (covers core, moderation, and
+        // dynamic-extension commands alike).
+        if (guildBlockedReason(client, interaction.guild)) forceEphemeral(interaction)
+        // Let dynamic extensions handle buttons / commands they own
+        for (const ext of client.extensions.values()) {
+            if (ext.handleInteraction) {
+                try {
+                    const handled = await ext.handleInteraction(interaction)
+                    if (handled === true) return
+                } catch (e) {
+                    console.error('[Ext handleInteraction]', e)
+                }
             }
         }
+
+        if (!interaction.isChatInputCommand()) return
+
+        // Let core extensions claim the interaction first
+        if (client.moderation && (await client.moderation.handleInteraction(interaction))) return
+
+        const { commandName } = interaction
+
+        // Core commands
+        if (commandName === 'ping') return await cmdPing(interaction)
+        if (commandName === 'stats') return await cmdStats(interaction)
+        if (commandName === 'menu') return await cmdMenu(interaction)
+        if (commandName === 'avatar' || commandName === 'av')
+            return await cmdAv(
+                interaction,
+                interaction.options.getMember('member') ??
+                    interaction.options.getUser('member') ??
+                    interaction.member ??
+                    interaction.user,
+            )
+        if (commandName === 'mav')
+            return await cmdMav(
+                interaction,
+                interaction.options.getMember('member') ??
+                    interaction.options.getUser('member') ??
+                    interaction.member ??
+                    interaction.user,
+            )
+        if (commandName === 'banner' || commandName === 'bn')
+            return await cmdBn(
+                interaction,
+                interaction.options.getMember('member') ??
+                    interaction.options.getUser('member') ??
+                    interaction.member ??
+                    interaction.user,
+            )
+        if (commandName === 'mbanner' || commandName === 'mbn')
+            return await cmdMbn(
+                interaction,
+                interaction.options.getMember('member') ??
+                    interaction.options.getUser('member') ??
+                    interaction.member ??
+                    interaction.user,
+            )
+        if (commandName === 'embed') return await cmdEmbed(interaction)
+    } catch (e) {
+        console.error('[Interaction] Error:', e)
     }
-
-    if (!interaction.isChatInputCommand()) return
-
-    // Let core extensions claim the interaction first
-    if (client.moderation && (await client.moderation.handleInteraction(interaction))) return
-
-    const { commandName } = interaction
-
-    // Core commands
-    if (commandName === 'ping') return cmdPing(interaction)
-    if (commandName === 'stats') return cmdStats(interaction)
-    if (commandName === 'menu') return cmdMenu(interaction)
-    if (commandName === 'avatar' || commandName === 'av')
-        return cmdAv(
-            interaction,
-            interaction.options.getMember('member') ??
-                interaction.options.getUser('member') ??
-                interaction.member ??
-                interaction.user,
-        )
-    if (commandName === 'mav')
-        return cmdMav(
-            interaction,
-            interaction.options.getMember('member') ??
-                interaction.options.getUser('member') ??
-                interaction.member ??
-                interaction.user,
-        )
-    if (commandName === 'banner' || commandName === 'bn')
-        return cmdBn(
-            interaction,
-            interaction.options.getMember('member') ??
-                interaction.options.getUser('member') ??
-                interaction.member ??
-                interaction.user,
-        )
-    if (commandName === 'mbanner' || commandName === 'mbn')
-        return cmdMbn(
-            interaction,
-            interaction.options.getMember('member') ??
-                interaction.options.getUser('member') ??
-                interaction.member ??
-                interaction.user,
-        )
-    if (commandName === 'embed') return cmdEmbed(interaction)
 })
 
 // Message Creation
@@ -1124,7 +1230,7 @@ client.on('messageCreate', async (message) => {
         // to dispatch. Guild-only handlers (afk, moderation, extensions) stay
         // server-side below.
         if (!message.guild) {
-            const mp = PREFIXES.find((prefix) => content.toLowerCase().startsWith(prefix.toLowerCase()))
+            const mp = matchPrefix(content)
             const mcmd = mp ? content.slice(mp.length).trim().split(/\s+/)[0]?.toLowerCase() : null
             const mhandler = mcmd ? client.commands.get(mcmd) : null
             if (!mcmd || !DM_SAFE_PREFIX.has(mcmd) || !mhandler) return
@@ -1157,15 +1263,17 @@ client.on('messageCreate', async (message) => {
         // Dynamic Extension Message Handlers
         for (const ext of client.extensions.values()) {
             if (ext.handleMessage) {
-                const handled = await ext.handleMessage(message)
-                if (handled === true) return // Stop if extension wants to 'sink' the message
+                try {
+                    const handled = await ext.handleMessage(message)
+                    if (handled === true) return // Stop if extension wants to 'sink' the message
+                } catch (e) {
+                    console.error('[Ext handleMessage]', e)
+                }
             }
         }
 
         // Prefix commands
-        const matchedPrefix = PREFIXES.find((prefix) =>
-            content.toLowerCase().startsWith(prefix.toLowerCase()),
-        )
+        const matchedPrefix = matchPrefix(content)
         if (!matchedPrefix) return
         const withoutPrefix = content.slice(matchedPrefix.length).trim()
         const [cmdName, ...args] = withoutPrefix.split(/\s+/)
@@ -1192,4 +1300,7 @@ if (!token) {
     console.error('No token found in config.json or TOKEN env')
     process.exit(1)
 }
-client.login(token)
+client.login(token).catch((e) => {
+    console.error('[System] Discord login failed:', e)
+    process.exit(1)
+})

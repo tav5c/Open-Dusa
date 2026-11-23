@@ -1,9 +1,12 @@
-import { statfsSync } from 'fs'
+import { statfs } from 'node:fs/promises'
 import { cpus, loadavg } from 'os'
 import { monitorEventLoopDelay } from 'perf_hooks'
 import { loadPerformance } from './performance.js'
 
 const PERF = loadPerformance()
+const CPU_CORES = cpus()?.length || 1
+const VIOLATION_TTL_MS = 60_000
+const SHUTDOWN_TASK_TIMEOUT_MS = 5_000
 
 class GlobalRateLimiter {
     constructor() {
@@ -38,8 +41,9 @@ class GlobalRateLimiter {
         while (dq.length && now - dq[0] > window) dq.shift()
         if (dq.length >= limit) {
             if (!ctx.isStaff) {
-                const v = (this.violations.get(userId) || 0) + 1
-                this.violations.set(userId, v)
+                const prev = this.violations.get(userId)
+                const v = (prev && now - prev.lastAt <= VIOLATION_TTL_MS ? prev.count : 0) + 1
+                this.violations.set(userId, { count: v, lastAt: now })
                 if (v >= 3) this.cooldowns.set(userId, now + 30_000)
             }
             return { ok: false, reason: 'rate_limited' }
@@ -50,13 +54,23 @@ class GlobalRateLimiter {
 
     cleanup() {
         const now = Date.now()
+        const maxWindow = Math.max(this.window, this.staffWindow)
         for (const [k, v] of this.cooldowns) {
             if (now > v) {
                 this.cooldowns.delete(k)
                 this.violations.delete(k)
             }
         }
-        for (const [k, dq] of this.windows) if (!dq.length) this.windows.delete(k)
+        for (const [k, v] of this.violations) {
+            const lastAt = typeof v === 'object' && v !== null ? v.lastAt : 0
+            if (now - lastAt > VIOLATION_TTL_MS && !this.cooldowns.has(k)) {
+                this.violations.delete(k)
+            }
+        }
+        for (const [k, dq] of this.windows) {
+            while (dq.length && now - dq[0] > maxWindow) dq.shift()
+            if (!dq.length) this.windows.delete(k)
+        }
     }
 }
 
@@ -66,6 +80,7 @@ export class MedusaHeart {
         this.startTime = Date.now()
         this._closed = false
         this._tasks = new Set()
+        this._shutdownCallbacks = []
         this._stats = { commands: 0, errors: 0, rateLimited: 0, firedTasks: 0 }
 
         this.rateLimiter = new GlobalRateLimiter()
@@ -92,6 +107,10 @@ export class MedusaHeart {
         this._startMonitor()
         this._startCleanup()
         this._registerExitHandlers()
+    }
+
+    onShutdown(fn) {
+        if (typeof fn === 'function') this._shutdownCallbacks.push(fn)
     }
 
     fire(promise, name = 'task', timeout = 300_000) {
@@ -163,22 +182,20 @@ export class MedusaHeart {
             if (histResetCount >= 30) {
                 histResetCount = 0
                 try {
-                    this.loopHistogram.disable()
+                    this.loopHistogram?.reset()
                 } catch {}
-                this.loopHistogram = monitorEventLoopDelay({ resolution: 20 })
-                this.loopHistogram.enable()
             }
-            this.monitor.loopLag = this.loopHistogram.mean / 1e6
+            this.monitor.loopLag = (this.loopHistogram?.mean ?? 0) / 1e6
             if (this.monitor.loopLag > PERF.maintenance.loopLagWarnMs) {
                 console.warn(
                     `[Heart] EVENT LOOP LAG: ${this.monitor.loopLag.toFixed(0)}ms, possible blocking operation`,
                 )
             }
 
-            // Disk check (critical for Pterodactyl/ephemeral hosts). Native
-            // statfs: no subprocess, no dependency. '/' is the container rootfs.
+            // Disk check (critical for Pterodactyl/ephemeral hosts). Async
+            // statfs: non-blocking, no subprocess, no dependency.
             try {
-                const st = statfsSync('/')
+                const st = await statfs('/')
                 const size = st.blocks * st.bsize
                 const used = (st.blocks - st.bfree) * st.bsize
                 if (size > 0) {
@@ -195,8 +212,7 @@ export class MedusaHeart {
             // point-in-time reading, but close enough for a warning threshold —
             // and it's a syscall, not a subprocess spawn.
             try {
-                const cores = cpus()?.length || 1
-                this.monitor.cpu = (loadavg()[0] / cores) * 100
+                this.monitor.cpu = (loadavg()[0] / CPU_CORES) * 100
             } catch {
                 // Restricted env: keep last known, don't block
                 this.monitor.cpu = this.monitor.cpu || 0
@@ -227,7 +243,11 @@ export class MedusaHeart {
             try {
                 this.client?.aiCog?._saveUsersNow?.()
             } catch {}
-            if (this.loopHistogram) this.loopHistogram.disable()
+            if (this.loopHistogram) {
+                try {
+                    this.loopHistogram.disable()
+                } catch {}
+            }
             clearInterval(this._monitorInterval)
             clearInterval(this._cleanupInterval)
             if (globalThis._aiMemManagers) {
@@ -243,19 +263,36 @@ export class MedusaHeart {
                     }
                 }
             }
-            if (this._tasks.size) await Promise.allSettled([...this._tasks])
+            if (this._shutdownCallbacks.length) {
+                await Promise.allSettled(
+                    this._shutdownCallbacks.map((fn) =>
+                        Promise.resolve()
+                            .then(() => fn(sig))
+                            .catch((e) => console.error('[Heart] Shutdown callback error:', e)),
+                    ),
+                )
+            }
+            if (this._tasks.size) {
+                let timer
+                await Promise.race([
+                    Promise.allSettled([...this._tasks]),
+                    new Promise((resolve) => {
+                        timer = setTimeout(resolve, SHUTDOWN_TASK_TIMEOUT_MS).unref()
+                    }),
+                ])
+                if (timer) clearTimeout(timer)
+            }
         }
-        process.once('SIGINT', () =>
+
+        this._onSigint = () =>
             shutdown('SIGINT').then(() => {
                 process.exitCode = 0
-            }),
-        )
-        process.once('SIGTERM', () =>
+            })
+        this._onSigterm = () =>
             shutdown('SIGTERM').then(() => {
                 process.exitCode = 0
-            }),
-        )
-        process.on('uncaughtException', (e) => {
+            })
+        this._onUncaughtException = (e) => {
             // Discord API errors bubble up as uncaughts from floating promises.
             // Most are non-fatal (token expired, DM blocked, unknown message), log and continue.
             // Only bail on genuine runtime crashes.
@@ -276,17 +313,26 @@ export class MedusaHeart {
             console.error('[Heart] FATAL Uncaught:', e)
             process.exitCode = 1
             setTimeout(() => process.exit(1), 2000).unref()
-        })
-        process.on('unhandledRejection', (r) => {
+        }
+        this._onUnhandledRejection = (r) => {
             console.error('[Heart] Unhandled rejection:', r)
             this._stats.errors++
-        })
+        }
+
+        process.once('SIGINT', this._onSigint)
+        process.once('SIGTERM', this._onSigterm)
+        process.on('uncaughtException', this._onUncaughtException)
+        process.on('unhandledRejection', this._onUnhandledRejection)
     }
 
     close() {
         this._closed = true
         clearInterval(this._monitorInterval)
         clearInterval(this._cleanupInterval)
+        if (this._onSigint) process.off('SIGINT', this._onSigint)
+        if (this._onSigterm) process.off('SIGTERM', this._onSigterm)
+        if (this._onUncaughtException) process.off('uncaughtException', this._onUncaughtException)
+        if (this._onUnhandledRejection) process.off('unhandledRejection', this._onUnhandledRejection)
         if (this.loopHistogram) {
             try {
                 this.loopHistogram.disable()
